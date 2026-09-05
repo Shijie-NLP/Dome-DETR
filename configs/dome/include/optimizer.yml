@@ -1,0 +1,34 @@
+# Default optimization recipe (D-FINE's). Model configs override the parts that depend on the
+# model and dataset: the learning rates, the milestones and the number of epochs.
+
+use_amp: True
+use_ema: True
+
+epoches: 72
+clip_max_norm: 0.1
+
+
+optimizer:
+  type: AdamW
+  # parameter groups by regex over the parameter names; what no group matches gets the
+  # top-level settings. The backbone trains at a lower rate; norm layers get no weight decay.
+  params:
+    -
+      params: '^(?=.*backbone)(?!.*(?:norm|bn)).*$'
+      lr: 0.0000125
+    -
+      params: '^(?=.*(?:encoder|decoder))(?=.*(?:norm|bn)).*$'
+      weight_decay: 0.
+
+  lr: 0.00025
+  betas: [0.9, 0.999]
+  weight_decay: 0.000125
+
+lr_scheduler:
+  type: MultiStepLR
+  milestones: [140]
+  gamma: 0.8
+
+lr_warmup_scheduler:
+  type: LinearWarmup
+  warmup_duration: 500

@@ -1,0 +1,45 @@
+# Training and validation pipelines at 800 px.
+# This include comes after the dataset file, so its `ops` lists replace the dataset file's:
+# the augmentations that actually run are the ones here.
+
+train_dataloader:
+  dataset:
+    transforms:
+      ops:
+        - {type: RandomPhotometricDistort, p: 0.5}
+        - {type: RandomZoomOut, fill: 0}
+        - {type: RandomIoUCrop, p: 0.8}
+        - {type: SanitizeBoundingBoxes, min_size: 1}
+        - {type: RandomHorizontalFlip}
+        - {type: Resize, size: [800, 800], }
+        - {type: SanitizeBoundingBoxes, min_size: 1}
+        - {type: ConvertPILImage, dtype: 'float32', scale: True}
+        - {type: ConvertBoxes, fmt: 'cxcywh', normalize: True}
+      policy:
+        # from this epoch on the listed augmentations are switched off
+        name: stop_epoch
+        epoch: 72
+        ops: ['RandomPhotometricDistort', 'RandomZoomOut', 'RandomIoUCrop']
+
+  collate_fn:
+    type: BatchImageCollateFunction
+    # multi-scale training: each batch is resized to a random scale around base_size, with
+    # base_size itself repeated base_size_repeat times in the draw; off from stop_epoch on
+    base_size: 800
+    base_size_repeat: 2
+    stop_epoch: 72
+
+  shuffle: True
+  total_batch_size: 8
+  num_workers: 4
+
+
+val_dataloader:
+  dataset:
+    transforms:
+      ops:
+        - {type: Resize, size: [800, 800], }
+        - {type: ConvertPILImage, dtype: 'float32', scale: True}
+  shuffle: False
+  total_batch_size: 16
+  num_workers: 4
