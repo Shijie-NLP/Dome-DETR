@@ -10,6 +10,7 @@ ignore = [
     "E501",   # line length is handled by the formatter
     "E741",   # ambiguous variable names (l, I, O) are common in math-heavy code
     "N802", "N803", "N806",  # allow CamelCase / upper-case in tensor & config names
+    "N817",   # `import DistributedDataParallel as DDP` style aliases are the torch convention
     "B905",   # zip() without strict= (torch code zips unequal-length lists deliberately)
     "SIM108", # ternary rewrites often hurt readability
 ]
