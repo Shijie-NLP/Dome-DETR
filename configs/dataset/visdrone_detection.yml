@@ -1,0 +1,60 @@
+task: detection
+
+# VisDrone2019-DET, read from https://huggingface.co/datasets/shijli/visdrone2019-det
+# (official annotations; 'others' dropped, 'ignored regions' kept as ignore boxes)
+
+evaluator:
+  type: VisDroneEvaluator
+  iou_types: ['bbox', ]
+  ignore_iof_threshold: 0.5
+
+num_classes: 12  # labels are the official VisDrone ids 1..10; 0 and 11 are never predicted
+remap_mscoco_category: False
+
+eval_spatial_size: [800, 800] # h w
+
+train_dataloader:
+  type: DataLoader
+  dataset:
+    type: VisDroneDetection
+    split: train
+    transforms:
+      type: Compose
+      ops:
+        - {type: Mosaic, size: [800, 800], p: 1.0}
+        - {type: MixUp, alpha: 1.5, p: 0.2}
+        - {type: RandomPhotometricDistort, p: 0.5}
+        - {type: RandomZoomOut, fill: 0}
+        - {type: RandomIoUCrop, p: 0.8}
+        - {type: SanitizeBoundingBoxes, min_size: 1}
+        - {type: RandomHorizontalFlip}
+        - {type: Resize, size: [800, 800], }
+        - {type: SanitizeBoundingBoxes, min_size: 1}
+        - {type: ConvertPILImage, dtype: 'float32', scale: True}
+        - {type: ConvertBoxes, fmt: 'cxcywh', normalize: True}
+      policy:
+        name: stop_epoch
+        epoch: 72 # epoch in [71, ~) stop `ops`
+        ops: ['Mosaic', 'MixUp', 'RandomPhotometricDistort', 'RandomZoomOut', 'RandomIoUCrop']
+  collate_fn:
+    type: BatchImageCollateFunction
+    base_size: 800
+    base_size_repeat: 2
+    stop_epoch: 72 # epoch in [72, ~) stop `multiscales`
+  shuffle: True
+  num_workers: 4
+
+val_dataloader:
+  type: DataLoader
+  dataset:
+    type: VisDroneDetection
+    split: validation
+    transforms:
+      type: Compose
+      ops:
+        - {type: Resize, size: [800, 800], }
+        - {type: ConvertPILImage, dtype: 'float32', scale: True}
+  collate_fn:
+    type: BatchImageCollateFunction
+  shuffle: False
+  num_workers: 4
