@@ -1,0 +1,23 @@
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+extend-exclude = ["weight", "logs", "static", "output", "reference"]
+
+[tool.ruff.lint]
+# E/W pycodestyle, F pyflakes, I isort, UP pyupgrade, B bugbear, SIM simplify, N naming
+select = ["E", "W", "F", "I", "UP", "B", "SIM", "N"]
+ignore = [
+    "E501",   # line length is handled by the formatter
+    "E741",   # ambiguous variable names (l, I, O) are common in math-heavy code
+    "N802", "N803", "N806",  # allow CamelCase / upper-case in tensor & config names
+    "B905",   # zip() without strict= (torch code zips unequal-length lists deliberately)
+    "SIM108", # ternary rewrites often hurt readability
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["src"]
+combine-as-imports = true
+
+[tool.ruff.format]
+quote-style = "double"
+docstring-code-format = true
