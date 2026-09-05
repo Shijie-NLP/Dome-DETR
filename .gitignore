@@ -20,3 +20,6 @@ weight/
 *.onnx
 *.engine
 events.out.tfevents.*
+
+# local dumping ground for upstream files we do not use; never committed
+.legacy/
