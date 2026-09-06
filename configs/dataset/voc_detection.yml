@@ -8,7 +8,6 @@ evaluator:
   iou_types: ['bbox', ]
 
 num_classes: 20
-remap_mscoco_category: False
 
 eval_spatial_size: [640, 640] # h w
 

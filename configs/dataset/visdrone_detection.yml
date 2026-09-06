@@ -9,7 +9,6 @@ evaluator:
   ignore_iof_threshold: 0.5
 
 num_classes: 12  # labels are the official VisDrone ids 1..10; 0 and 11 are never predicted
-remap_mscoco_category: False
 
 train_dataloader:
   type: DataLoader
