@@ -26,6 +26,11 @@ Columns:
 | `other>own` | queries closer to some other GT than to their own source |
 | `beats pos` | negatives only: take the other GT the negative overlaps most; the negative's IoU with it beats that GT's own positive in the same CDN group |
 
+The second table is a Hungarian check: each group's positives *and* negatives are matched to
+the GT with the training matcher's box cost (5 L1 + 2 GIoU; no class term, dn queries carry no
+scores), and the columns say what each GT was given: its own positive (the assignment CDN
+hard-codes), its own negative, or another GT's positive / negative.
+
 ### VisDrone2019-DET train, full split
 
 6465 of 6471 images (6 have fewer than two boxes), 2 draws each, `box_noise_scale=1.0`,
@@ -39,11 +44,24 @@ Columns:
 | >500 | 2 | 15.9px | 24.2% | 15.0% | 8.8% | 12.4% | 42.8% | 10.4% |
 | all | 6465 | 28.5px | 11.4% | 9.3% | 5.2% | 7.3% | 31.2% | 6.1% |
 
+| GT per image | GT x groups | own pos | own neg | other pos | other neg |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1-50 | 685186 | 89.5% | 4.4% | 2.4% | 3.7% |
+| 51-200 | 435626 | 84.5% | 4.4% | 4.6% | 6.5% |
+| 201-500 | 38546 | 80.7% | 4.4% | 6.2% | 8.7% |
+| >500 | 2828 | 80.6% | 4.3% | 6.2% | 8.9% |
+| all | 1162186 | 87.3% | 4.4% | 3.4% | 4.9% |
+
 Over the whole split 6.1% of CDN negatives are a better box for some other GT than that GT's
 own positive, yet are trained as background; the share grows with density (4.7% in sparse images,
 10.3% at 201-500 GT; the `>500` row is two images). A third of the negatives are closer to
 another GT than to their source, but most of those overlap neither (only 7.3% reach IoU 0.3).
 Positives are ambiguous too: 5.2% sit closer to another GT than to the one they regress to.
+
+Let the matcher choose and 12.7% of the GT would not get the positive CDN assigns them: 4.4%
+prefer their own negative (a property of the noise, flat across density), 8.3% a query made from
+another GT, of which more than half are negatives. In the dense buckets one GT in five is
+assigned a query that is not the matcher's choice.
 
 ### AI-TOD-v2 train, full split
 
@@ -58,9 +76,21 @@ Positives are ambiguous too: 5.2% sit closer to another GT than to the one they 
 | >500 | 29 | 10.0px | 4.2% | 14.5% | 7.9% | 22.3% | 59.8% | 16.6% |
 | all | 7819 | 11.8px | 1.1% | 2.3% | 1.3% | 4.0% | 16.3% | 3.3% |
 
+| GT per image | GT x groups | own pos | own neg | other pos | other neg |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1-50 | 1179922 | 93.1% | 5.0% | 0.4% | 1.4% |
+| 51-200 | 270096 | 89.5% | 4.8% | 1.2% | 4.6% |
+| 201-500 | 116756 | 86.2% | 4.5% | 1.7% | 7.6% |
+| >500 | 51336 | 76.9% | 4.0% | 4.6% | 14.5% |
+| all | 1618110 | 91.5% | 4.9% | 0.8% | 2.8% |
+
 AI-TOD is tinier (median 12px against 28px) but far less crowded: only 1.1% of its boxes overlap
 another box at IoU 0.3, against 11.4% on VisDrone, and 3.3% of its negatives beat another GT's
 positive, about half the VisDrone rate. The dense tail behaves like VisDrone and worse: at
 201-500 boxes the two datasets match (8.8% vs 10.3%), and the 29 images above 500 boxes reach
 16.6%, with six negatives in ten closer to another GT than to their own source. The effect is a
 function of crowding, not of object size.
+
+The Hungarian check says the same: 91.5% of the GT keep their assigned positive overall, but
+only 76.9% above 500 boxes, where 14.5% of the GT would rather have another GT's negative. The
+own-negative share sits at 4 to 5% on both datasets whatever the density.
