@@ -22,6 +22,7 @@ from .._misc import (
     _boxes_keys,
     convert_to_tv_tensor,
 )
+from ._utils import unpack_inputs
 
 torchvision.disable_beta_transforms_warning()
 
@@ -42,7 +43,7 @@ Normalize = register()(T.Normalize)
 @register()
 class EmptyTransform(T.Transform):
     def forward(self, *inputs):
-        return inputs if len(inputs) > 1 else inputs[0]
+        return unpack_inputs(inputs)
 
 
 @register()
@@ -98,7 +99,7 @@ class RandomIoUCrop(T.RandomIoUCrop):
 
     def __call__(self, *inputs: Any) -> Any:
         if torch.rand(1) >= self.p:
-            return inputs if len(inputs) > 1 else inputs[0]
+            return unpack_inputs(inputs)
         return super().forward(*inputs)
 
 

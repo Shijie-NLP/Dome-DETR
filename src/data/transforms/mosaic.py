@@ -11,13 +11,9 @@ import torchvision.transforms.v2 as T  # noqa: N812
 from PIL import Image
 
 from ...core import register
-from .._misc import convert_to_tv_tensor
+from ._utils import PER_OBJECT_KEYS, restore_tv_tensors, unpack_inputs
 
 torchvision.disable_beta_transforms_warning()
-
-# target entries with one row per object, which are concatenated when samples are combined;
-# everything else (image_id, idx, orig_size) is per image and taken from the first sample
-PER_OBJECT_KEYS = ("boxes", "labels", "area", "iscrowd", "masks")
 
 
 @register()
@@ -36,8 +32,7 @@ class Mosaic(T.Transform):
         self.random_affine = T.RandomAffine(degrees=0, translate=(0.1, 0.1), scale=(0.5, 1.5), fill=114)
 
     def forward(self, *inputs):
-        inputs = inputs if len(inputs) > 1 else inputs[0]
-        image, target, dataset = inputs
+        image, target, dataset = unpack_inputs(inputs)
 
         if random.random() > self.p:
             return image, target, dataset
@@ -62,12 +57,7 @@ class Mosaic(T.Transform):
                 v = torch.cat([t[k] for t in targets], dim=0)
             target[k] = v
 
-        if "boxes" in target:
-            target["boxes"] = convert_to_tv_tensor(
-                target["boxes"], "boxes", box_format="xyxy", spatial_size=[h * 2, w * 2]
-            )
-        if "masks" in target:
-            target["masks"] = convert_to_tv_tensor(target["masks"], "masks")
+        restore_tv_tensors(target, spatial_size=[h * 2, w * 2])
 
         image, target = self.random_affine(image, target)
         image, target = self.crop(image, target)

@@ -13,8 +13,7 @@ import torchvision.transforms.v2 as T  # noqa: N812
 from PIL import Image
 
 from ...core import register
-from .._misc import convert_to_tv_tensor
-from .mosaic import PER_OBJECT_KEYS
+from ._utils import PER_OBJECT_KEYS, restore_tv_tensors, unpack_inputs
 
 torchvision.disable_beta_transforms_warning()
 
@@ -32,8 +31,7 @@ class MixUp(T.Transform):
         self.p = p
 
     def forward(self, *inputs):
-        inputs = inputs if len(inputs) > 1 else inputs[0]
-        image, target, dataset = inputs
+        image, target, dataset = unpack_inputs(inputs)
 
         if random.random() > self.p:
             return image, target, dataset
@@ -58,12 +56,5 @@ class MixUp(T.Transform):
                 v[:, 1::2] *= h / h2
             mixed_target[k] = torch.cat([target[k], v], dim=0)
 
-        # torch.cat drops the tv_tensor subclasses, and the transforms after this one need them
-        if "boxes" in mixed_target:
-            mixed_target["boxes"] = convert_to_tv_tensor(
-                mixed_target["boxes"], "boxes", box_format="xyxy", spatial_size=[h, w]
-            )
-        if "masks" in mixed_target:
-            mixed_target["masks"] = convert_to_tv_tensor(mixed_target["masks"], "masks")
-
+        restore_tv_tensors(mixed_target, spatial_size=[h, w])
         return mixed_image, mixed_target, dataset
