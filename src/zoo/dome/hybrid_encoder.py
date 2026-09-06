@@ -17,7 +17,6 @@ across levels) with the two Dome additions on the stride-4 / stride-8 levels:
 
 import copy
 import os
-import random
 from collections import OrderedDict
 from math import ceil
 
@@ -26,9 +25,10 @@ import torch.nn as nn
 import torch.nn.functional as F  # noqa: N812
 
 from ...core import register
-from .defe import GaussHeatmapGenerator, LiteDeFE
+from ...nn.blocks import ConvNormLayerFuse, RepNCSPELAN4, SCDown
+from ...nn.position_encoding import build_2d_sincos_position_embedding
+from .defe import GaussHeatmapGenerator, LiteDeFE, adaptive_defe_filter
 from .get_roi_features import TransformerEncoder, TransformerEncoderLayer, WindowProcessor
-from .utils import get_activation
 
 SAVE_INTERMEDIATE_VISUALIZE_RESULT = os.environ.get("SAVE_INTERMEDIATE_VISUALIZE_RESULT", "False") == "True"
 
@@ -41,151 +41,6 @@ def _visualize(name: str, feature: torch.Tensor):
         from tools.visualize_src_flatten import visualize_src_flatten
 
         visualize_src_flatten(feature.permute(0, 2, 3, 1), [tuple(feature.shape[2:4])], name, False)
-
-
-def _fuse_conv_bn(conv: nn.Conv2d, bn: nn.BatchNorm2d):
-    """The kernel and bias of the single conv equivalent to ``conv`` followed by ``bn``."""
-    std = (bn.running_var + bn.eps).sqrt()
-    scale = bn.weight / std
-    return conv.weight * scale.reshape(-1, 1, 1, 1), bn.bias - bn.running_mean * scale
-
-
-class ConvNormLayer_fuse(nn.Module):  # noqa: N801
-    """Conv -> BN -> act, foldable into a single conv for deployment."""
-
-    def __init__(self, ch_in, ch_out, kernel_size, stride, g=1, padding=None, bias=False, act=None):
-        super().__init__()
-        padding = (kernel_size - 1) // 2 if padding is None else padding
-        self.conv = nn.Conv2d(ch_in, ch_out, kernel_size, stride, groups=g, padding=padding, bias=bias)
-        self.norm = nn.BatchNorm2d(ch_out)
-        self.act = nn.Identity() if act is None else get_activation(act)
-        self.ch_in, self.ch_out, self.kernel_size, self.stride, self.g, self.padding, self.bias = (
-            ch_in,
-            ch_out,
-            kernel_size,
-            stride,
-            g,
-            padding,
-            bias,
-        )
-
-    def forward(self, x):
-        if hasattr(self, "conv_bn_fused"):
-            return self.act(self.conv_bn_fused(x))
-        return self.act(self.norm(self.conv(x)))
-
-    def convert_to_deploy(self):
-        if not hasattr(self, "conv_bn_fused"):
-            self.conv_bn_fused = nn.Conv2d(
-                self.ch_in, self.ch_out, self.kernel_size, self.stride, groups=self.g, padding=self.padding, bias=True
-            )
-        kernel, bias = _fuse_conv_bn(self.conv, self.norm)
-        self.conv_bn_fused.weight.data = kernel
-        self.conv_bn_fused.bias.data = bias
-        self.__delattr__("conv")
-        self.__delattr__("norm")
-
-
-class ConvNormLayer(nn.Module):
-    """Conv -> BN -> act."""
-
-    def __init__(self, ch_in, ch_out, kernel_size, stride, g=1, padding=None, bias=False, act=None):
-        super().__init__()
-        padding = (kernel_size - 1) // 2 if padding is None else padding
-        self.conv = nn.Conv2d(ch_in, ch_out, kernel_size, stride, groups=g, padding=padding, bias=bias)
-        self.norm = nn.BatchNorm2d(ch_out)
-        self.act = nn.Identity() if act is None else get_activation(act)
-
-    def forward(self, x):
-        return self.act(self.norm(self.conv(x)))
-
-
-class SCDown(nn.Module):
-    """Spatial-channel decoupled downsampling: a 1x1 pointwise conv then a strided depthwise conv."""
-
-    def __init__(self, c1, c2, k, s):
-        super().__init__()
-        self.cv1 = ConvNormLayer_fuse(c1, c2, 1, 1)
-        self.cv2 = ConvNormLayer_fuse(c2, c2, k, s, c2)
-
-    def forward(self, x):
-        return self.cv2(self.cv1(x))
-
-
-class VGGBlock(nn.Module):
-    """RepVGG block: parallel 3x3 and 1x1 conv-BN branches, foldable into one 3x3 conv for deployment."""
-
-    def __init__(self, ch_in, ch_out, act="relu"):
-        super().__init__()
-        self.ch_in = ch_in
-        self.ch_out = ch_out
-        self.conv1 = ConvNormLayer(ch_in, ch_out, 3, 1, padding=1, act=None)
-        self.conv2 = ConvNormLayer(ch_in, ch_out, 1, 1, padding=0, act=None)
-        self.act = nn.Identity() if act is None else act
-
-    def forward(self, x):
-        if hasattr(self, "conv"):
-            return self.act(self.conv(x))
-        return self.act(self.conv1(x) + self.conv2(x))
-
-    def convert_to_deploy(self):
-        if not hasattr(self, "conv"):
-            self.conv = nn.Conv2d(self.ch_in, self.ch_out, 3, 1, padding=1)
-        kernel, bias = self.get_equivalent_kernel_bias()
-        self.conv.weight.data = kernel
-        self.conv.bias.data = bias
-        self.__delattr__("conv1")
-        self.__delattr__("conv2")
-
-    def get_equivalent_kernel_bias(self):
-        kernel3x3, bias3x3 = _fuse_conv_bn(self.conv1.conv, self.conv1.norm)
-        kernel1x1, bias1x1 = _fuse_conv_bn(self.conv2.conv, self.conv2.norm)
-        return kernel3x3 + F.pad(kernel1x1, [1, 1, 1, 1]), bias3x3 + bias1x1
-
-
-class CSPLayer(nn.Module):
-    """Cross-stage partial layer: a stack of bottlenecks on one 1x1 branch, summed with a plain 1x1 branch."""
-
-    def __init__(
-        self, in_channels, out_channels, num_blocks=3, expansion=1.0, bias=False, act="silu", bottletype=VGGBlock
-    ):
-        super().__init__()
-        hidden_channels = int(out_channels * expansion)
-        self.conv1 = ConvNormLayer_fuse(in_channels, hidden_channels, 1, 1, bias=bias, act=act)
-        self.conv2 = ConvNormLayer_fuse(in_channels, hidden_channels, 1, 1, bias=bias, act=act)
-        self.bottlenecks = nn.Sequential(
-            *[bottletype(hidden_channels, hidden_channels, act=get_activation(act)) for _ in range(num_blocks)]
-        )
-        if hidden_channels != out_channels:
-            self.conv3 = ConvNormLayer_fuse(hidden_channels, out_channels, 1, 1, bias=bias, act=act)
-        else:
-            self.conv3 = nn.Identity()
-
-    def forward(self, x):
-        return self.conv3(self.bottlenecks(self.conv1(x)) + self.conv2(x))
-
-
-class RepNCSPELAN4(nn.Module):
-    """The GELAN fusion block (from YOLOv9): split, two chained CSP stages, concat everything, 1x1 out."""
-
-    def __init__(self, c1, c2, c3, c4, n=3, bias=False, act="silu"):
-        super().__init__()
-        self.c = c3 // 2
-        self.cv1 = ConvNormLayer_fuse(c1, c3, 1, 1, bias=bias, act=act)
-        self.cv2 = nn.Sequential(
-            CSPLayer(c3 // 2, c4, n, 1, bias=bias, act=act, bottletype=VGGBlock),
-            ConvNormLayer_fuse(c4, c4, 3, 1, bias=bias, act=act),
-        )
-        self.cv3 = nn.Sequential(
-            CSPLayer(c4, c4, n, 1, bias=bias, act=act, bottletype=VGGBlock),
-            ConvNormLayer_fuse(c4, c4, 3, 1, bias=bias, act=act),
-        )
-        self.cv4 = ConvNormLayer_fuse(c3 + (2 * c4), c2, 1, 1, bias=bias, act=act)
-
-    def forward(self, x):
-        y = list(self.cv1(x).split((self.c, self.c), 1))
-        y.extend(m(y[-1]) for m in [self.cv2, self.cv3])
-        return self.cv4(torch.cat(y, 1))
 
 
 @register()
@@ -285,7 +140,7 @@ class HybridEncoder(nn.Module):
             self.lateral_convs = nn.ModuleList()
             self.fpn_blocks = nn.ModuleList()
             for _ in range(len(in_channels) - 1):
-                self.lateral_convs.append(ConvNormLayer_fuse(hidden_dim, hidden_dim, 1, 1))
+                self.lateral_convs.append(ConvNormLayerFuse(hidden_dim, hidden_dim, 1, 1))
                 self.fpn_blocks.append(RepNCSPELAN4(hidden_dim * 2, hidden_dim, **fusion))
             # bottom-up: downsample the finer level, fuse with the coarser one
             self.downsample_convs = nn.ModuleList()
@@ -313,53 +168,13 @@ class HybridEncoder(nn.Module):
         for idx in self.use_encoder_idx:
             stride = self.feat_strides[idx]
             self.pos_embeds.append(
-                self.build_2d_sincos_position_embedding(
+                build_2d_sincos_position_embedding(
                     ceil(self.eval_spatial_size[1] / stride),
                     ceil(self.eval_spatial_size[0] / stride),
                     self.hidden_dim,
                     self.pe_temperature,
                 )
             )
-
-    @staticmethod
-    def build_2d_sincos_position_embedding(w, h, embed_dim=256, temperature=10000.0):
-        """[1, w*h, embed_dim] sin/cos embedding of a w x h grid (D-FINE's layout, kept for its checkpoints)."""
-        grid_w = torch.arange(int(w), dtype=torch.float32)
-        grid_h = torch.arange(int(h), dtype=torch.float32)
-        grid_w, grid_h = torch.meshgrid(grid_w, grid_h, indexing="ij")
-        assert embed_dim % 4 == 0, "Embed dimension must be divisible by 4 for 2D sin-cos position embedding"
-        pos_dim = embed_dim // 4
-        omega = torch.arange(pos_dim, dtype=torch.float32) / pos_dim
-        omega = 1.0 / (temperature**omega)
-
-        out_w = grid_w.flatten()[..., None] @ omega[None]
-        out_h = grid_h.flatten()[..., None] @ omega[None]
-
-        return torch.concat([out_w.sin(), out_w.cos(), out_h.sin(), out_h.cos()], dim=1)[None, :, :]
-
-    @staticmethod
-    def adaptive_defe_filter(defe_feature, init_thresh=0.05, step=0.01):
-        """
-        Binarize a density map [B, 1, H, W] per image, lowering the threshold from ``init_thresh``
-        in steps of ``step`` until something passes. An all-zero map gets one random cell so that
-        the window attention always has a window to work on.
-        """
-        final_mask = torch.zeros_like(defe_feature, dtype=torch.bool)
-        for b in range(defe_feature.shape[0]):
-            single_feat = defe_feature[b : b + 1]
-            current_thresh = init_thresh
-            while current_thresh >= 0:
-                mask = single_feat > current_thresh
-                if mask.any():
-                    final_mask[b : b + 1] = mask
-                    break
-                current_thresh = round(current_thresh - step, 2)
-            else:
-                final_mask[
-                    b, :, random.randint(0, single_feat.shape[2] - 1), random.randint(0, single_feat.shape[3] - 1)
-                ] = True
-                print(f"Batch {b}: No valid region found, use random point enhancement")
-        return final_mask
 
     def _defe(self, proj_feats, img_inputs, targets):
         """Run DeFE (and MWAS, in place on the stride-8 level); returns the ``defe`` output dict."""
@@ -371,11 +186,11 @@ class HybridEncoder(nn.Module):
         defe = {"reg_value": reg_value, "defe_feature": defe_feature, "density_map_pooled": defe_feature_pooled}
 
         if self.use_mwas:
-            defe_feature_filtered = self.adaptive_defe_filter(
+            defe_feature_filtered = adaptive_defe_filter(
                 F.interpolate(defe_feature_pooled, size=(H, W), mode="bilinear", align_corners=True)
             ).float()
             glob_pos_embed = (
-                self.build_2d_sincos_position_embedding(W, H, embed_dim=self.hidden_dim)
+                build_2d_sincos_position_embedding(W, H, embed_dim=self.hidden_dim)
                 .permute(0, 2, 1)
                 .view(-1, H, W)
                 .to(proj_feats[1].device)
@@ -421,7 +236,7 @@ class HybridEncoder(nn.Module):
                 h, w = proj_feats[enc_ind].shape[2:]
                 src_flatten = proj_feats[enc_ind].flatten(2).permute(0, 2, 1)  # [B, HW, C]
                 if self.training or self.eval_spatial_size is None:
-                    pos_embed = self.build_2d_sincos_position_embedding(w, h, self.hidden_dim, self.pe_temperature)
+                    pos_embed = build_2d_sincos_position_embedding(w, h, self.hidden_dim, self.pe_temperature)
                 else:
                     pos_embed = self.pos_embeds[i]
                 memory = self.encoder[i](src_flatten, pos_embed=pos_embed.to(src_flatten.device))
