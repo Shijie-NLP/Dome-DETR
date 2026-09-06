@@ -8,7 +8,7 @@ import torch
 from faster_coco_eval import COCOeval_faster
 
 from ...core import register
-from .coco_eval import CocoEvaluator, convert_to_xywh
+from .coco_eval import CocoEvaluator
 
 __all__ = ["VisDroneEvaluator"]
 
@@ -88,32 +88,14 @@ class VisDroneEvaluator(CocoEvaluator):
                 ignore_regions[image_id] = torch.tensor(boxes, dtype=torch.float32)
         return ignore_regions
 
-    def prepare_for_coco_detection(self, predictions):
-        coco_results = []
-        for original_id, prediction in predictions.items():
-            if len(prediction) == 0:
-                continue
-
-            boxes = prediction["boxes"]
-            scores = prediction["scores"]
-            labels = prediction["labels"]
-
-            ignore_boxes = self.ignore_regions.get(original_id)
-            if ignore_boxes is not None and len(boxes) > 0:
-                keep = ~detections_in_ignore_regions(boxes, ignore_boxes.to(boxes.device), self.ignore_iof_threshold)
-                boxes, scores, labels = boxes[keep], scores[keep], labels[keep]
-
-            if len(boxes) == 0:
-                continue
-
-            boxes = convert_to_xywh(boxes).tolist()
-            scores = scores.tolist()
-            labels = labels.tolist()
-            coco_results.extend(
-                {"image_id": original_id, "category_id": labels[k], "bbox": box, "score": scores[k]}
-                for k, box in enumerate(boxes)
-            )
-        return coco_results
+    def filter_prediction(self, image_id, prediction):
+        """Drop the detections that fall inside one of the image's ignored regions."""
+        boxes = prediction["boxes"]
+        ignore_boxes = self.ignore_regions.get(image_id)
+        if ignore_boxes is None or len(boxes) == 0:
+            return prediction
+        keep = ~detections_in_ignore_regions(boxes, ignore_boxes.to(boxes.device), self.ignore_iof_threshold)
+        return {k: v[keep] if k in ("boxes", "scores", "labels") else v for k, v in prediction.items()}
 
 
 def detections_in_ignore_regions(boxes, ignore_boxes, iof_threshold):

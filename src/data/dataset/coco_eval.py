@@ -30,7 +30,7 @@ class CocoEvaluator:
     (boxes xyxy in original-image pixels); ``synchronize_between_processes`` gathers the
     per-image results across ranks; ``accumulate`` and ``summarize`` produce the usual table.
     Dataset-specific evaluators subclass this and override ``_build_coco_eval`` for other
-    COCOeval parameters, or ``prepare_for_coco_detection`` to filter the detections first.
+    COCOeval parameters, or ``filter_prediction`` to drop detections before scoring.
     """
 
     def __init__(self, coco_gt: COCO, iou_types):
@@ -99,10 +99,17 @@ class CocoEvaluator:
             raise ValueError(f"Unknown iou type {iou_type}")
         return prepare[iou_type](predictions)
 
+    def filter_prediction(self, image_id, prediction: dict) -> dict:
+        """One image's ``{"boxes", "scores", "labels", ...}`` with whatever should not be scored removed."""
+        return prediction
+
     def prepare_for_coco_detection(self, predictions):
         coco_results = []
         for original_id, prediction in predictions.items():
             if len(prediction) == 0:
+                continue
+            prediction = self.filter_prediction(original_id, prediction)
+            if len(prediction["boxes"]) == 0:
                 continue
 
             boxes = convert_to_xywh(prediction["boxes"]).tolist()
