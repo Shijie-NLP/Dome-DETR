@@ -18,8 +18,8 @@ import torch.nn as nn
 import torch.nn.functional as F  # noqa: N812
 import torch.nn.init as init
 
+from ...misc.box_ops import box_xyxy_to_cxcywh
 from ...nn.transformer import MLP
-from .box_ops import box_xyxy_to_cxcywh
 
 __all__ = ["LQE", "Integral", "bbox2distance", "distance2bbox", "translate_gt", "weighting_function"]
 

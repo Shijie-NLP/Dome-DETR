@@ -22,10 +22,10 @@ import torch.nn.functional as F  # noqa: N812
 import torch.nn.init as init
 
 from ...core import register
+from ...misc.box_ops import box_cxcywh_to_xyxy
 from ...misc.visualizer import SAVE_INTERMEDIATE_VISUALIZE_RESULT, dump_boxes
 from ...nn.functional import bias_init_with_prob, inverse_sigmoid
 from ...nn.transformer import MLP, TransformerDecoderLayer
-from .box_ops import box_cxcywh_to_xyxy
 from .denoising import get_contrastive_denoising_training_group
 from .dynamic_nms import dynamic_nms
 from .fdr import LQE, Integral, distance2bbox, weighting_function

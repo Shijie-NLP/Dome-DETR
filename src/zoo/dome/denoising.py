@@ -8,8 +8,8 @@ Copyright (c) 2024 The D-FINE Authors. All Rights Reserved.
 
 import torch
 
+from ...misc.box_ops import box_cxcywh_to_xyxy, box_xyxy_to_cxcywh
 from ...nn.functional import inverse_sigmoid
-from .box_ops import box_cxcywh_to_xyxy, box_xyxy_to_cxcywh
 
 __all__ = ["get_contrastive_denoising_training_group"]
 

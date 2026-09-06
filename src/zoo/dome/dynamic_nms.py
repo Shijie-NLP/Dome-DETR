@@ -5,7 +5,7 @@ Copyright (c) 2025 The Dome-DETR Authors. All Rights Reserved.
 
 import torch
 
-from .box_ops import box_iou
+from ...misc.box_ops import box_iou
 
 __all__ = ["dynamic_nms"]
 
