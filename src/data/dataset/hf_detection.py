@@ -55,18 +55,41 @@ class HFDetection(DetDataset):
         revision: str | None = None,
         cache_dir: str | None = None,
     ):
-        from datasets import load_dataset
-
         self.repo = repo or self.REPO
         self.config = config or self.CONFIG
         self.split = split
         self.revision = revision
-        self.hf = load_dataset(self.repo, self.config, split=split, revision=revision, cache_dir=cache_dir)
+        self.hf = self._load_split(self.repo, self.config, split, revision, cache_dir)
         # every column but the pixels: what the COCO ground truth is built from, without decoding
         # a single image
         self.hf_meta = self.hf.remove_columns("image")
         self.transforms = transforms
         self._coco = None
+
+    @staticmethod
+    def _load_split(repo, config, split, revision, cache_dir):
+        """
+        The rows of ``split`` (a name, or names joined with ``+``), downloading only the parquet
+        files of the splits it names. ``load_dataset(repo, split=...)`` would fetch every split
+        of the config first and select afterwards, which for a 27 GB dataset is the difference
+        between a test set and the whole thing. A repo that is not parquet-backed falls back to
+        the plain call.
+        """
+        import re
+
+        from datasets import load_dataset, load_dataset_builder
+
+        builder = load_dataset_builder(repo, config, revision=revision, cache_dir=cache_dir)
+        data_files = builder.config.data_files  # split name -> resolved file paths (revision pinned)
+        if not data_files:
+            return load_dataset(repo, config, split=split, revision=revision, cache_dir=cache_dir)
+
+        names = [re.match(r"[^\[\s]+", part.strip()).group(0) for part in split.split("+")]
+        unknown = [name for name in names if name not in data_files]
+        if unknown:
+            raise ValueError(f"{repo} has no split {unknown}; available: {list(data_files)}")
+        files = {name: [str(f) for f in data_files[name]] for name in dict.fromkeys(names)}
+        return load_dataset("parquet", data_files=files, split=split, cache_dir=cache_dir)
 
     def parse_objects(self, objects: dict[str, list]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
