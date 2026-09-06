@@ -8,14 +8,11 @@ MixUp for detection: blend the sample with a random other and keep the boxes of 
 import random
 
 import torch
-import torchvision
 import torchvision.transforms.v2 as T  # noqa: N812
 from PIL import Image
 
 from ...core import register
 from ._utils import PER_OBJECT_KEYS, restore_tv_tensors, unpack_inputs
-
-torchvision.disable_beta_transforms_warning()
 
 
 @register()

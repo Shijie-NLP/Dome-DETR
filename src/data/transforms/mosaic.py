@@ -6,14 +6,11 @@ Copyright(c) 2024 The D-FINE Authors. All Rights Reserved.
 import random
 
 import torch
-import torchvision
 import torchvision.transforms.v2 as T  # noqa: N812
 from PIL import Image
 
 from ...core import register
 from ._utils import PER_OBJECT_KEYS, restore_tv_tensors, unpack_inputs
-
-torchvision.disable_beta_transforms_warning()
 
 
 @register()

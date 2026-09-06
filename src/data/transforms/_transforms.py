@@ -13,29 +13,15 @@ import torchvision.transforms.v2 as T  # noqa: N812
 import torchvision.transforms.v2.functional as F  # noqa: N812
 
 from ...core import register
-from .._misc import (
-    BoundingBoxes,
-    Image,
-    Mask,
-    SanitizeBoundingBoxes,
-    Video,
-    _boxes_keys,
-    convert_to_tv_tensor,
-)
+from .._misc import BoundingBoxes, Image, Mask, Video, convert_to_tv_tensor
 from ._utils import unpack_inputs
-
-torchvision.disable_beta_transforms_warning()
-
-# torchvision renamed get_spatial_size to get_size in 0.17; requirements.txt allows both
-get_size = getattr(F, "get_size", None) or F.get_spatial_size
-
 
 # torchvision transforms exposed to the yaml configs under their own names
 RandomPhotometricDistort = register()(T.RandomPhotometricDistort)
 RandomZoomOut = register()(T.RandomZoomOut)
 RandomHorizontalFlip = register()(T.RandomHorizontalFlip)
 Resize = register()(T.Resize)
-SanitizeBoundingBoxes = register(name="SanitizeBoundingBoxes")(SanitizeBoundingBoxes)
+SanitizeBoundingBoxes = register()(T.SanitizeBoundingBoxes)
 RandomCrop = register()(T.RandomCrop)
 Normalize = register()(T.Normalize)
 
@@ -65,7 +51,7 @@ class PadToSize(T.Pad):
         super().__init__(0, fill, padding_mode)
 
     def _get_params(self, flat_inputs: list[Any]) -> dict[str, Any]:
-        h, w = get_size(flat_inputs[0])
+        h, w = F.get_size(flat_inputs[0])
         self.padding = [0, 0, self.size[0] - w, self.size[1] - h]
         return dict(padding=self.padding)
 
@@ -118,7 +104,7 @@ class ConvertBoxes(T.Transform):
         return self._transform(inpt, params)
 
     def _transform(self, inpt: Any, params: dict[str, Any]) -> Any:
-        spatial_size = getattr(inpt, _boxes_keys[1])
+        spatial_size = inpt.canvas_size
         if self.fmt:
             in_fmt = inpt.format.value.lower()
             inpt = torchvision.ops.box_convert(inpt, in_fmt=in_fmt, out_fmt=self.fmt.lower())
