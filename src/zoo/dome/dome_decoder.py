@@ -119,7 +119,7 @@ class DomeTransformer(DFINETransformer):
         scores, class_ids = logits.max(dim=1)
         return dynamic_nms(box_cxcywh_to_xyxy(boxes_cxcywh), scores, class_ids, iou_thresholds)
 
-    def _get_decoder_input(self, memory, spatial_shapes, encoder_out):
+    def _get_decoder_input(self, memory, spatial_shapes, encoder_out, targets=None):
         """
         PAQI. Returns the initial query contents and boxes (as logits, both detached and padded
         to the largest query count in the batch), the encoder-side predictions for the auxiliary

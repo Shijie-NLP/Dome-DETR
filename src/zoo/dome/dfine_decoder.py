@@ -383,12 +383,13 @@ class DFINETransformer(nn.Module):
 
         return gather(memory), gather(outputs_logits), gather(outputs_anchors_unact)
 
-    def _get_decoder_input(self, memory, spatial_shapes, encoder_out):
+    def _get_decoder_input(self, memory, spatial_shapes, encoder_out, targets=None):
         """
         The initial queries: the ``num_queries`` best encoder tokens. Returns their contents and
         boxes (as logits, both detached), the encoder-side predictions for the auxiliary loss,
         and the query count of every image (the same for all here). A subclass with a
         per-image query count pads its queries to the largest and reports the real counts.
+        ``targets`` (training only) lets a subclass choose queries by ground truth.
         """
         anchors, valid_mask = self._generate_anchors(spatial_shapes, device=memory.device)
         if memory.shape[0] > 1:
@@ -423,7 +424,7 @@ class DFINETransformer(nn.Module):
         _, memory, spatial_shapes = self._get_encoder_input(feats)
 
         init_ref_contents, init_ref_points_unact, enc_topk_bboxes_list, enc_topk_logits_list, batch_queries_num = (
-            self._get_decoder_input(memory, spatial_shapes, encoder_out)
+            self._get_decoder_input(memory, spatial_shapes, encoder_out, targets)
         )
         num_queries = max(batch_queries_num)
 
