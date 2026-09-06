@@ -23,7 +23,6 @@ HGNetv2:
 # four feature levels, strides 4 to 32: the stride-4 level is what makes tiny objects reachable
 HybridEncoder:
   feat_strides: [4, 8, 16, 32]
-  num_feature_levels: 4
   hidden_dim: 256
 
   # intra-scale attention, on the last level only
@@ -33,11 +32,9 @@ HybridEncoder:
   dim_feedforward: 1024
   dropout: 0.
   enc_act: 'gelu'
-  use_hybrid: True
-  use_deformable: False  # plain attention; enc_n_points only matters when True
-  enc_n_points: 6
 
   # cross-scale fusion
+  use_hybrid: True
   act: 'silu'
 
   # DeFE (density-focused encoder) with MWAS (masked window attention), the Dome additions
