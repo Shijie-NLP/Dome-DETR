@@ -95,8 +95,9 @@ class MaskedWindowAttention(nn.Module):
                 raise RuntimeError(f"image {i}: the density mask selects no window")
             encoded = self._encode(windows[i][rows, cols], rel_pos_embed, pos_windows[rows, cols])
             # add the encoded windows back at their places
+            # under autocast the features are half while the encoder (LayerNorm) returns float
             delta = torch.zeros_like(windows[i])
-            delta[rows, cols] = encoded
+            delta[rows, cols] = encoded.to(delta.dtype)
             out[i] += delta.permute(2, 0, 3, 1, 4).reshape(c, h, w)
         return out, window_mask
 
