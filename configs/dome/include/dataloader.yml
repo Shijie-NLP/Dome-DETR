@@ -28,6 +28,9 @@ train_dataloader:
     base_size: 800
     base_size_repeat: 2
     stop_epoch: 72
+    # every drawn size is a multiple of 4 * mwas_window_size, so the stride-4 map tiles into
+    # whole MWAS windows; keep it equal to HybridEncoder.mwas_window_size
+    mwas_window_size: 10
 
   shuffle: True
   total_batch_size: 8
