@@ -15,16 +15,83 @@ from torch.optim.lr_scheduler import LRScheduler
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
-__all__ = ["BaseConfig"]
+__all__ = ["BaseConfig", "Component"]
+
+
+class Component:
+    """
+    A training component held by a config: stored under ``_<name>``, type-checked when set from
+    outside, and, when ``factory`` is given, built from the config the first time it is read while
+    still ``None``. ``YAMLConfig`` overrides these as properties that build the object from the
+    yaml, and falls back on this through ``super()``.
+    """
+
+    def __init__(self, expected: type | tuple[type, ...] | None = None, factory: Callable[[Any], Any] | None = None):
+        self.expected = expected
+        self.factory = factory
+
+    def __set_name__(self, owner, name):
+        self.name = name
+        self.attr = "_" + name
+
+    def __get__(self, obj, objtype=None):
+        if obj is None:
+            return self
+        value = getattr(obj, self.attr)
+        if value is None and self.factory is not None:
+            value = self.factory(obj)
+            setattr(obj, self.attr, value)
+        return value
+
+    def __set__(self, obj, value):
+        if self.expected is not None and not isinstance(value, self.expected):
+            raise TypeError(f"{self.name}: expected {self.expected}, got {type(value)}")
+        setattr(obj, self.attr, value)
+
+
+def _default_ema(cfg):
+    if cfg.use_ema and cfg.model is not None:
+        from ..optim import ModelEMA
+
+        return ModelEMA(cfg.model, cfg.ema_decay, cfg.ema_warmups)
+    return None
+
+
+def _default_scaler(cfg):
+    if cfg.use_amp and torch.cuda.is_available():
+        return GradScaler("cuda")
+    return None
+
+
+def _default_writer(cfg):
+    if cfg.summary_dir:
+        return SummaryWriter(cfg.summary_dir)
+    if cfg.output_dir:
+        return SummaryWriter(Path(cfg.output_dir) / "summary")
+    return None
 
 
 class BaseConfig:
     """
     Everything a solver reads: the runtime settings as plain attributes, and the training
-    components (model, criterion, loaders, optimizer, ...) as properties. Here the components are
-    just held; ``YAMLConfig`` overrides the properties to build each one from the yaml the first
-    time it is asked for. Public attribute names double as the yaml keys ``YAMLConfig`` copies in.
+    components (model, criterion, loaders, optimizer, ...) as ``Component`` descriptors. Here the
+    components are just held (the EMA, scaler and writer get a default built from the runtime
+    settings); ``YAMLConfig`` overrides them to build each one from the yaml the first time it is
+    asked for. Public attribute names double as the yaml keys ``YAMLConfig`` copies in.
     """
+
+    model = Component(nn.Module)
+    postprocessor = Component(nn.Module)
+    criterion = Component(nn.Module)
+    optimizer = Component(Optimizer)
+    lr_scheduler = Component(LRScheduler)
+    lr_warmup_scheduler = Component()
+    train_dataloader = Component()
+    val_dataloader = Component()
+    ema = Component(factory=_default_ema)
+    scaler = Component(factory=_default_scaler)
+    evaluator = Component(Callable)
+    writer = Component(SummaryWriter, factory=_default_writer)
 
     def __init__(self) -> None:
         super().__init__()
@@ -66,120 +133,6 @@ class BaseConfig:
         self.output_dir: str = None
         self.summary_dir: str = None
         self.device: str = ""
-
-    @property
-    def model(self) -> nn.Module:
-        return self._model
-
-    @model.setter
-    def model(self, m):
-        assert isinstance(m, nn.Module), f"{type(m)} != nn.Module, please check your model class"
-        self._model = m
-
-    @property
-    def postprocessor(self) -> nn.Module:
-        return self._postprocessor
-
-    @postprocessor.setter
-    def postprocessor(self, m):
-        assert isinstance(m, nn.Module), f"{type(m)} != nn.Module, please check your postprocessor class"
-        self._postprocessor = m
-
-    @property
-    def criterion(self) -> nn.Module:
-        return self._criterion
-
-    @criterion.setter
-    def criterion(self, m):
-        assert isinstance(m, nn.Module), f"{type(m)} != nn.Module, please check your criterion class"
-        self._criterion = m
-
-    @property
-    def optimizer(self) -> Optimizer:
-        return self._optimizer
-
-    @optimizer.setter
-    def optimizer(self, m):
-        assert isinstance(m, Optimizer), f"{type(m)} != optim.Optimizer, please check your optimizer class"
-        self._optimizer = m
-
-    @property
-    def lr_scheduler(self) -> LRScheduler:
-        return self._lr_scheduler
-
-    @lr_scheduler.setter
-    def lr_scheduler(self, m):
-        assert isinstance(m, LRScheduler), f"{type(m)} != LRScheduler, please check your scheduler class"
-        self._lr_scheduler = m
-
-    @property
-    def lr_warmup_scheduler(self) -> LRScheduler:
-        return self._lr_warmup_scheduler
-
-    @lr_warmup_scheduler.setter
-    def lr_warmup_scheduler(self, m):
-        self._lr_warmup_scheduler = m
-
-    @property
-    def train_dataloader(self) -> DataLoader:
-        return self._train_dataloader
-
-    @train_dataloader.setter
-    def train_dataloader(self, loader):
-        self._train_dataloader = loader
-
-    @property
-    def val_dataloader(self) -> DataLoader:
-        return self._val_dataloader
-
-    @val_dataloader.setter
-    def val_dataloader(self, loader):
-        self._val_dataloader = loader
-
-    @property
-    def ema(self) -> nn.Module:
-        if self._ema is None and self.use_ema and self.model is not None:
-            from ..optim import ModelEMA
-
-            self._ema = ModelEMA(self.model, self.ema_decay, self.ema_warmups)
-        return self._ema
-
-    @ema.setter
-    def ema(self, obj):
-        self._ema = obj
-
-    @property
-    def scaler(self) -> GradScaler:
-        if self._scaler is None and self.use_amp and torch.cuda.is_available():
-            self._scaler = GradScaler("cuda")
-        return self._scaler
-
-    @scaler.setter
-    def scaler(self, obj: GradScaler):
-        self._scaler = obj
-
-    @property
-    def evaluator(self):
-        return self._evaluator
-
-    @evaluator.setter
-    def evaluator(self, fn):
-        assert isinstance(fn, Callable), f"{type(fn)} must be Callable"
-        self._evaluator = fn
-
-    @property
-    def writer(self) -> SummaryWriter:
-        if self._writer is None:
-            if self.summary_dir:
-                self._writer = SummaryWriter(self.summary_dir)
-            elif self.output_dir:
-                self._writer = SummaryWriter(Path(self.output_dir) / "summary")
-        return self._writer
-
-    @writer.setter
-    def writer(self, m):
-        assert isinstance(m, SummaryWriter), f"{type(m)} must be SummaryWriter"
-        self._writer = m
 
     def __repr__(self):
         return "".join(f"{k}: {v}\n" for k, v in self.__dict__.items() if not k.startswith("_"))

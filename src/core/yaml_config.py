@@ -41,42 +41,52 @@ class YAMLConfig(BaseConfig):
     def global_cfg(self):
         return merge_config(self.yaml_cfg, inplace=False, overwrite=False)
 
+    def _build(self, name: str, *, class_entry: bool = False, when: bool = True, **kwargs):
+        """
+        The component ``name``, built from the yaml on first use. ``class_entry`` means the yaml
+        value under ``name`` is a class name whose own entry holds the arguments (``model: DOME``);
+        otherwise ``name`` is an alias entry (``optimizer: {type: AdamW, ...}``). Nothing is built
+        when the yaml has no ``name`` key or ``when`` is false.
+        """
+        attr = "_" + name
+        if getattr(self, attr) is None and when and name in self.yaml_cfg:
+            key = self.yaml_cfg[name] if class_entry else name
+            setattr(self, attr, create(key, self.global_cfg, **kwargs))
+        return getattr(self, attr)
+
     @property
     def model(self) -> torch.nn.Module:
-        if self._model is None and "model" in self.yaml_cfg:
-            self._model = create(self.yaml_cfg["model"], self.global_cfg)
+        self._build("model", class_entry=True)
         return super().model
 
     @property
     def postprocessor(self) -> torch.nn.Module:
-        if self._postprocessor is None and "postprocessor" in self.yaml_cfg:
-            self._postprocessor = create(self.yaml_cfg["postprocessor"], self.global_cfg)
+        self._build("postprocessor", class_entry=True)
         return super().postprocessor
 
     @property
     def criterion(self) -> torch.nn.Module:
-        if self._criterion is None and "criterion" in self.yaml_cfg:
-            self._criterion = create(self.yaml_cfg["criterion"], self.global_cfg)
+        self._build("criterion", class_entry=True)
         return super().criterion
 
     @property
     def optimizer(self) -> optim.Optimizer:
         if self._optimizer is None and "optimizer" in self.yaml_cfg:
             params = self.get_optim_params(self.yaml_cfg["optimizer"], self.model)
-            self._optimizer = create("optimizer", self.global_cfg, params=params)
+            self._build("optimizer", params=params)
         return super().optimizer
 
     @property
     def lr_scheduler(self) -> optim.lr_scheduler.LRScheduler:
         if self._lr_scheduler is None and "lr_scheduler" in self.yaml_cfg:
-            self._lr_scheduler = create("lr_scheduler", self.global_cfg, optimizer=self.optimizer)
+            self._build("lr_scheduler", optimizer=self.optimizer)
             print(f"Initial lr: {self._lr_scheduler.get_last_lr()}")
         return super().lr_scheduler
 
     @property
     def lr_warmup_scheduler(self) -> optim.lr_scheduler.LRScheduler:
         if self._lr_warmup_scheduler is None and "lr_warmup_scheduler" in self.yaml_cfg:
-            self._lr_warmup_scheduler = create("lr_warmup_scheduler", self.global_cfg, lr_scheduler=self.lr_scheduler)
+            self._build("lr_warmup_scheduler", lr_scheduler=self.lr_scheduler)
         return super().lr_warmup_scheduler
 
     @property
@@ -94,13 +104,12 @@ class YAMLConfig(BaseConfig):
     @property
     def ema(self) -> torch.nn.Module:
         if self._ema is None and self.yaml_cfg.get("use_ema", False):
-            self._ema = create("ema", self.global_cfg, model=self.model)
+            self._build("ema", model=self.model)
         return super().ema
 
     @property
     def scaler(self):
-        if self._scaler is None and self.yaml_cfg.get("use_amp", False):
-            self._scaler = create("scaler", self.global_cfg)
+        self._build("scaler", when=self.yaml_cfg.get("use_amp", False))
         return super().scaler
 
     @property
@@ -112,7 +121,7 @@ class YAMLConfig(BaseConfig):
             from ..data import get_coco_api_from_dataset
 
             coco_gt = get_coco_api_from_dataset(self.val_dataloader.dataset)
-            self._evaluator = create("evaluator", self.global_cfg, coco_gt=coco_gt)
+            self._build("evaluator", coco_gt=coco_gt)
         return super().evaluator
 
     @staticmethod
