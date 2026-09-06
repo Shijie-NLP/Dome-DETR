@@ -19,7 +19,9 @@ from .backbone.common import ConvNormLayer, get_activation
 
 __all__ = [
     "CSPLayer",
+    "ChannelAttention",
     "ConvNormLayerFuse",
+    "DepthwiseSeparableConv",
     "RepNCSPELAN4",
     "SCDown",
     "VGGBlock",
@@ -68,6 +70,37 @@ class ConvNormLayerFuse(nn.Module):
         self.conv_bn_fused.bias.data = bias
         self.__delattr__("conv")
         self.__delattr__("norm")
+
+
+class DepthwiseSeparableConv(nn.Module):
+    """A depthwise 3x3 conv (with ``dilation``), a pointwise 1x1 conv, and a ReLU."""
+
+    def __init__(self, in_ch, out_ch, dilation=1):
+        super().__init__()
+        self.depthwise = nn.Conv2d(in_ch, in_ch, kernel_size=3, padding=dilation, dilation=dilation, groups=in_ch)
+        self.pointwise = nn.Conv2d(in_ch, out_ch, kernel_size=1)
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        return self.relu(self.pointwise(self.depthwise(x)))
+
+
+class ChannelAttention(nn.Module):
+    """Squeeze-and-excitation: rescale every channel by a sigmoid gate predicted from the channels' global averages."""
+
+    def __init__(self, channels, reduction=8):
+        super().__init__()
+        self.gap = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channels, channels // reduction),
+            nn.ReLU(inplace=True),
+            nn.Linear(channels // reduction, channels),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x):
+        b, c = x.shape[:2]
+        return x * self.fc(self.gap(x).view(b, c)).view(b, c, 1, 1)
 
 
 class SCDown(nn.Module):

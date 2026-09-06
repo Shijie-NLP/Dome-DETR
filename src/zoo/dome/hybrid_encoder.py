@@ -27,7 +27,7 @@ from ...core import register
 from ...misc.visualizer import SAVE_INTERMEDIATE_VISUALIZE_RESULT, dump_feature_map
 from ...nn.blocks import ConvNormLayerFuse, RepNCSPELAN4, SCDown
 from ...nn.position_encoding import build_2d_sincos_position_embedding
-from .defe import GaussHeatmapGenerator, LiteDeFE, adaptive_defe_filter
+from .defe import LiteDeFE, adaptive_defe_filter, render_density_map
 from .get_roi_features import TransformerEncoder, TransformerEncoderLayer, WindowProcessor
 
 __all__ = ["HybridEncoder"]
@@ -198,7 +198,6 @@ class HybridEncoder(nn.Module):
         defe["gt_density_map"] = []
         if targets is not None and (self.training or SAVE_INTERMEDIATE_VISUALIZE_RESULT):
             B, _, img_h, img_w = img_inputs.shape
-            heatmap_generator = GaussHeatmapGenerator(img_size=(img_h, img_w))
             heatmaps = []
             for b in range(B):
                 boxes = targets[b]["boxes"]
@@ -206,7 +205,7 @@ class HybridEncoder(nn.Module):
                     # validation targets are xyxy pixels; the generator wants normalized cxcywh
                     boxes = boxes / boxes.new_tensor([img_w, img_h, img_w, img_h])
                     boxes = torch.cat([(boxes[:, :2] + boxes[:, 2:]) / 2, boxes[:, 2:] - boxes[:, :2]], dim=1)
-                heatmaps.append(heatmap_generator(boxes))
+                heatmaps.append(render_density_map(boxes, (img_h, img_w)))
             defe["gt_density_map"] = torch.stack(heatmaps).to(img_inputs.device)
             dump_feature_map("heatmap_gt", defe["gt_density_map"])
         return defe
