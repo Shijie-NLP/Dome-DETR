@@ -47,7 +47,9 @@ DomeHybridEncoder:
   use_mwas: True
   mwas_window_size: 10
 
-DomeTransformer:
+# DFINETransformer is the D-FINE decoder (fixed top-k queries); DomeTransformer merges its settings
+# and replaces the query selection with PAQI. A model config picks one with `DOME: {decoder: ...}`.
+DFINETransformer: &dfine_transformer
   feat_channels: [256, 256, 256, 256]
   feat_strides: [4, 8, 16, 32]
   hidden_dim: 256
@@ -85,3 +87,6 @@ DomeCriterion:
     weight_dict: {cost_class: 2, cost_bbox: 5, cost_giou: 2}
     alpha: 0.25
     gamma: 2.0
+
+DomeTransformer:
+  <<: *dfine_transformer
