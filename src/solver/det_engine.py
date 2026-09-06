@@ -20,6 +20,29 @@ from ..misc.visualizer import SAVE_TEST_VISUALIZE_RESULT, PredictionDumper, dump
 from ..optim import ModelEMA, Warmup
 
 
+def to_device(targets: list[dict], device) -> list[dict]:
+    """The per-image target dicts with every tensor moved to ``device``."""
+    return [{k: v.to(device) for k, v in t.items()} for t in targets]
+
+
+def optimizer_step(loss: torch.Tensor, model, optimizer, scaler: GradScaler | None, max_norm: float) -> None:
+    """Backward, optional gradient clipping and the optimizer step, through the GradScaler when there is one."""
+    optimizer.zero_grad()
+    if scaler is None:
+        loss.backward()
+        if max_norm > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
+        optimizer.step()
+        return
+
+    scaler.scale(loss).backward()
+    if max_norm > 0:
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
+    scaler.step(optimizer)
+    scaler.update()
+
+
 def train_one_epoch(
     model: torch.nn.Module,
     criterion: torch.nn.Module,
@@ -28,65 +51,43 @@ def train_one_epoch(
     device: torch.device,
     epoch: int,
     max_norm: float = 0,
-    **kwargs,
+    *,
+    print_freq: int = 10,
+    writer: SummaryWriter | None = None,
+    ema: ModelEMA | None = None,
+    scaler: GradScaler | None = None,
+    lr_warmup_scheduler: Warmup | None = None,
 ):
+    """One epoch over ``data_loader``; mixed precision when a ``scaler`` is given. Returns the averaged meters."""
     model.train()
     criterion.train()
     metric_logger = MetricLogger(delimiter="  ")
     metric_logger.add_meter("lr", SmoothedValue(window_size=1, fmt="{value:.6f}"))
     header = f"Epoch: [{epoch}]"
-
-    print_freq = kwargs.get("print_freq", 10)
-    writer: SummaryWriter = kwargs.get("writer")
-
-    ema: ModelEMA = kwargs.get("ema")
-    scaler: GradScaler = kwargs.get("scaler")
-    lr_warmup_scheduler: Warmup = kwargs.get("lr_warmup_scheduler")
+    use_amp = scaler is not None
+    device_type = torch.device(device).type
 
     for i, (samples, targets) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
         samples = samples.to(device)
-        targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+        targets = to_device(targets, device)
         global_step = epoch * len(data_loader) + i
         metas = dict(epoch=epoch, step=i, global_step=global_step, epoch_step=len(data_loader))
 
         dump_training_targets(samples, targets)
 
-        if scaler is not None:
-            with torch.autocast(device_type=str(device), cache_enabled=True):
-                outputs = model(samples, targets=targets)
-
-            if not torch.isfinite(outputs["pred_boxes"]).all():
-                # keep the weights that produced the non-finite boxes, for a post-mortem
-                print(outputs["pred_boxes"])
-                state = dist_utils.remove_module_prefix(model.state_dict())
-                dist_utils.save_on_master({"model": state}, "./NaN.pth")
-
-            with torch.autocast(device_type=str(device), enabled=False):
-                loss_dict = criterion(outputs, targets, **metas)
-
-            loss = sum(loss_dict.values())
-            scaler.scale(loss).backward()
-
-            if max_norm > 0:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
-
-            scaler.step(optimizer)
-            scaler.update()
-            optimizer.zero_grad()
-
-        else:
+        with torch.autocast(device_type=device_type, enabled=use_amp, cache_enabled=True):
             outputs = model(samples, targets=targets)
-            loss_dict = criterion(outputs, targets, **metas)
 
-            loss: torch.Tensor = sum(loss_dict.values())
-            optimizer.zero_grad()
-            loss.backward()
+        if not torch.isfinite(outputs["pred_boxes"]).all():
+            # keep the weights that produced the non-finite boxes, for a post-mortem
+            print(outputs["pred_boxes"])
+            state = dist_utils.remove_module_prefix(model.state_dict())
+            dist_utils.save_on_master({"model": state}, "./NaN.pth")
 
-            if max_norm > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
-
-            optimizer.step()
+        # the loss is always computed in full precision
+        loss_dict = criterion(outputs, targets, **metas)
+        loss: torch.Tensor = sum(loss_dict.values())
+        optimizer_step(loss, model, optimizer, scaler, max_norm)
 
         if ema is not None:
             ema.update(model)
@@ -143,7 +144,7 @@ def evaluate(
     with PredictionDumper(SAVE_TEST_VISUALIZE_RESULT) as dumper:
         for samples, targets in metric_logger.log_every(data_loader, 10, header):
             samples = samples.to(device)
-            targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+            targets = to_device(targets, device)
 
             outputs = model(samples, targets=targets)
             orig_target_sizes = torch.stack([t["orig_size"] for t in targets], dim=0)
