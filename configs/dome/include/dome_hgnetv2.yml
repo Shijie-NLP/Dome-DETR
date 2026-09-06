@@ -14,15 +14,17 @@ use_focal_loss: True
 
 DOME:
   backbone: HGNetv2
-  encoder: HybridEncoder
+  encoder: DomeHybridEncoder
   decoder: DomeTransformer
 
 HGNetv2:
   pretrained: True
   local_model_dir: weight/hgnetv2/
 
-# four feature levels, strides 4 to 32: the stride-4 level is what makes tiny objects reachable
-HybridEncoder:
+# four feature levels, strides 4 to 32: the stride-4 level is what makes tiny objects reachable.
+# HybridEncoder is the D-FINE baseline encoder; DomeHybridEncoder merges its settings (the yaml
+# anchor) and adds DeFE / MWAS. A model config picks one with `DOME: {encoder: ...}`.
+HybridEncoder: &hybrid_encoder
   feat_strides: [4, 8, 16, 32]
   hidden_dim: 256
 
@@ -38,8 +40,9 @@ HybridEncoder:
   use_hybrid: True
   act: 'silu'
 
-  # DeFE (density-focused encoder) with MWAS (masked window attention), the Dome additions
-  use_defe: True
+# DeFE (density-focused encoder) with MWAS (masked window attention), the Dome additions
+DomeHybridEncoder:
+  <<: *hybrid_encoder
   defe_type: 'light'
   use_mwas: True
   mwas_window_size: 10

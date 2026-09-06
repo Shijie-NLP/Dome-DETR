@@ -1,6 +1,6 @@
-# D-FINE-S baseline on VisDrone2019-DET: Dome-S with DeFE and MWAS switched off, everything else
-# unchanged (four-level pyramid, 800 px pipeline, schedule). Without a density map the decoder takes
-# a fixed max_num_select queries per image, as D-FINE does.
+# D-FINE-S baseline on VisDrone2019-DET: the Dome-S recipe on the plain HybridEncoder (no DeFE, no
+# MWAS), everything else unchanged (four-level pyramid, 800 px pipeline, schedule). Without a
+# density map the decoder takes a fixed max_num_select queries per image, as D-FINE does.
 
 __include__: [
   '../dataset/visdrone_detection.yml',
@@ -12,6 +12,8 @@ __include__: [
 
 output_dir: ./outputs/dfine_s_visdrone
 
+DOME:
+  encoder: HybridEncoder
 
 HGNetv2:
   name: 'B0'
@@ -24,8 +26,6 @@ HybridEncoder:
   in_channels: [64, 256, 512, 1024]
   depth_mult: .34
   expansion: 0.5
-  use_defe: False
-  use_mwas: False
 
 DomeTransformer:
   num_layers: 3

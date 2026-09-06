@@ -35,7 +35,7 @@ train_dataloader:
     base_size_repeat: 2
     stop_epoch: 72
     # every drawn size is a multiple of 8 * mwas_window_size, so the stride-8 map (where MWAS runs)
-    # tiles into whole windows; keep it equal to HybridEncoder.mwas_window_size
+    # tiles into whole windows; keep it equal to DomeHybridEncoder.mwas_window_size
     mwas_window_size: 10
 
   shuffle: True

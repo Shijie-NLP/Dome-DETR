@@ -147,7 +147,7 @@ def evaluate(
     header = "Test:"
 
     # DeFE statistics: how often the predicted query budget covers the ground truth, and its mean
-    use_defe = dist_utils.de_parallel(model).encoder.use_defe
+    use_defe = getattr(dist_utils.de_parallel(model).encoder, "use_defe", False)
     total_defe_samples = 0
     ample_defe_predictions = 0
     total_anchor_num = 0
