@@ -85,6 +85,12 @@ def is_dist_available_and_initialized():
     return torch.distributed.is_available() and torch.distributed.is_initialized()
 
 
+def barrier():
+    """Wait for every rank; a no-op outside distributed mode."""
+    if is_dist_available_and_initialized():
+        torch.distributed.barrier()
+
+
 @atexit.register
 def cleanup():
     """cleanup distributed environment"""
@@ -174,6 +180,11 @@ def is_parallel(model) -> bool:
 def de_parallel(model) -> nn.Module:
     # De-parallelize a model: returns single-GPU model if model is of type DP or DDP
     return model.module if is_parallel(model) else model
+
+
+def remove_module_prefix(state_dict: dict) -> dict:
+    """A state dict saved from a DataParallel / DDP wrapper, with the ``module.`` prefix stripped."""
+    return {k.removeprefix("module."): v for k, v in state_dict.items()}
 
 
 def reduce_dict(data, avg=True):

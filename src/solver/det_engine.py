@@ -77,7 +77,7 @@ def train_one_epoch(
             if not torch.isfinite(outputs["pred_boxes"]).all():
                 # keep the weights that produced the non-finite boxes, for a post-mortem
                 print(outputs["pred_boxes"])
-                state = {k.replace("module.", ""): v for k, v in model.state_dict().items()}
+                state = dist_utils.remove_module_prefix(model.state_dict())
                 dist_utils.save_on_master({"model": state}, "./NaN.pth")
 
             with torch.autocast(device_type=str(device), enabled=False):

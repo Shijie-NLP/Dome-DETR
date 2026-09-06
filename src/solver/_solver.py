@@ -13,11 +13,6 @@ from ..core import BaseConfig
 from ..misc import dist_utils
 
 
-def remove_module_prefix(state_dict):
-    """A state dict saved from a DataParallel / DDP wrapper, with the ``module.`` prefix stripped."""
-    return {k.removeprefix("module."): v for k, v in state_dict.items()}
-
-
 def load_checkpoint(path: str):
     """A checkpoint from a local path or a URL, on the CPU."""
     if path.startswith("http"):
@@ -137,7 +132,7 @@ class BaseSolver:
                 print(f"Load {k}.state_dict")
             elif k == "ema" and getattr(self, "model", None) is not None:
                 # a model-only checkpoint: start the average from the loaded weights
-                model_state_dict = remove_module_prefix(self.model.state_dict())
+                model_state_dict = dist_utils.remove_module_prefix(self.model.state_dict())
                 dist_utils.de_parallel(v).load_state_dict({"module": model_state_dict})
                 print(f"Load {k}.state_dict from model.state_dict")
             else:
@@ -155,7 +150,7 @@ class BaseSolver:
         """
         state = load_checkpoint(path)
         pretrained = state["ema"]["module"] if "ema" in state else state["model"]
-        pretrained = remove_module_prefix(pretrained)
+        pretrained = dist_utils.remove_module_prefix(pretrained)
 
         module = dist_utils.de_parallel(self.model)
         matched, infos = self._matched_state(module.state_dict(), pretrained)

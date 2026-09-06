@@ -10,22 +10,14 @@ Copyright (c) 2025 The Dome-DETR Authors. All Rights Reserved.
 import os
 
 import torch
-import torch.distributed
 import torch.nn as nn
 import torch.nn.functional as F  # noqa: N812
 
 from ...core import register
+from ...misc import dist_utils
 from .common import freeze_batch_norm2d
 
 __all__ = ["HGNetv2"]
-
-
-def _is_distributed() -> bool:
-    return torch.distributed.is_available() and torch.distributed.is_initialized()
-
-
-def _rank() -> int:
-    return torch.distributed.get_rank() if _is_distributed() else 0
 
 
 class LearnableAffineBlock(nn.Module):
@@ -362,13 +354,12 @@ class HGNetv2(nn.Module):
         url = self._PRETRAINED_URL.format(name=name)
         try:
             if not os.path.exists(model_path):
-                if _rank() == 0:
+                if dist_utils.is_main_process():
                     print(f"Downloading the pretrained HGNetV2 {name} from {url} to {local_model_dir}")
                     torch.hub.load_state_dict_from_url(
                         url, map_location="cpu", model_dir=local_model_dir, file_name=filename
                     )
-                if _is_distributed():
-                    torch.distributed.barrier()
+                dist_utils.barrier()
             state = torch.load(model_path, map_location="cpu")
         except Exception as e:
             raise RuntimeError(

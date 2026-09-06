@@ -156,8 +156,7 @@ class DetSolver(BaseSolver):
         path = self.output_dir / "best_stg1.pth"
         if not path.exists():
             raise FileNotFoundError(f"stage 2 starts at epoch {epoch} but there is no {path} to reload")
-        if dist_utils.is_dist_available_and_initialized():
-            torch.distributed.barrier()
+        dist_utils.barrier()
         self.load_resume_state(str(path))
         if self.ema is not None and ema_decay is not None:
             self.ema.decay = ema_decay
