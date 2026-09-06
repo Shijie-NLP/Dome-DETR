@@ -9,6 +9,9 @@ and one evaluator per dataset protocol.
 __all__ = [
     "HFDetection",
     "get_coco_api_from_dataset",
+    "AITOD_CLASSES",
+    "AITODDetection",
+    "AITODEvaluator",
     "VOC_CLASSES",
     "VOCDetection",
     "VOCEvaluator",
@@ -17,6 +20,8 @@ __all__ = [
     "VisDroneEvaluator",
 ]
 
+from .aitod_detection import AITOD_CLASSES, AITODDetection
+from .aitod_eval import AITODEvaluator
 from .hf_detection import HFDetection, get_coco_api_from_dataset
 from .visdrone_detection import VISDRONE_CLASSES, VisDroneDetection
 from .visdrone_eval import VisDroneEvaluator

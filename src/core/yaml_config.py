@@ -16,7 +16,7 @@ from .workspace import create
 from .yaml_utils import load_config, merge_config, merge_dict
 
 # evaluators that score against the COCO ground truth their validation dataset builds
-COCO_STYLE_EVALUATORS = ("VOCEvaluator", "VisDroneEvaluator", "CocoEvaluator")
+COCO_STYLE_EVALUATORS = ("VOCEvaluator", "VisDroneEvaluator", "AITODEvaluator", "CocoEvaluator")
 
 
 class YAMLConfig(BaseConfig):
