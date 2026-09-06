@@ -8,10 +8,13 @@ negatives, compared with their own source GT and with the other GT they overlap 
 * ``beats pos``: negatives only; take the other GT the negative overlaps most and compare with
   that GT's own positive in the same CDN group. The negative is the better box for it.
 
+Ground truth comes from the Hub through the repo's dataset classes, filtered exactly like a
+training target (ignore regions and degenerate boxes out).
+
 Single image (bucketed by object size, optional IoU histograms):
-    python tools/analysis/cdn_negative_overlap.py --image 0000059_01886_d_0000114 --repeat 20 --plot out.png
+    python tools/analysis/cdn_negative_overlap.py visdrone --image 0000059_01886_d_0000114 --plot out.png
 Dataset sample (bucketed by the number of GT boxes per image, with the GT-GT overlap baseline):
-    python tools/analysis/cdn_negative_overlap.py --num-images 500 --repeat 2
+    python tools/analysis/cdn_negative_overlap.py aitod --split train --num-images 500
 """
 
 import argparse
@@ -20,42 +23,43 @@ import sys
 
 import numpy as np
 import torch
-from PIL import Image
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 
+from src.data.dataset import AITODDetection, VisDroneDetection, VOCDetection  # noqa: E402
 from src.misc.box_ops import box_cxcywh_to_xyxy, box_iou  # noqa: E402
 from src.zoo.dome.denoising import get_contrastive_denoising_training_group  # noqa: E402
 
-NUM_CLASSES = 12
+DATASETS = {"visdrone": VisDroneDetection, "aitod": AITODDetection, "voc": VOCDetection}
 SIZE_BUCKETS = [("tiny <16px", 0, 16), ("small 16-32px", 16, 32), ("medium 32-96px", 32, 96), ("large >96px", 96, 1e9)]
 COUNT_BUCKETS = [("1-50 GT", 1, 50), ("51-200 GT", 51, 200), ("201-500 GT", 201, 500), (">500 GT", 501, 10**9)]
 
 
-def load_visdrone(root, split, image_id):
-    """Boxes (normalized cxcywh), labels and pixel sizes of one VisDrone image; ignored regions and 'others' dropped."""
-    img_path = os.path.join(root, f"VisDrone2019-DET-{split}", "images", image_id + ".jpg")
-    ann_path = os.path.join(root, f"VisDrone2019-DET-{split}", "annotations", image_id + ".txt")
-    w_img, h_img = Image.open(img_path).size
-    rows = np.loadtxt(ann_path, delimiter=",", ndmin=2, usecols=range(8))
-    keep = (rows[:, 5] != 0) & (rows[:, 5] != 11)
-    rows = rows[keep]
-    x, y, w, h = rows[:, 0], rows[:, 1], rows[:, 2], rows[:, 3]
-    boxes = np.stack([(x + w / 2) / w_img, (y + h / 2) / h_img, w / w_img, h / h_img], axis=1)
-    return (
-        torch.tensor(boxes, dtype=torch.float32),
-        torch.tensor(rows[:, 5], dtype=torch.int64),
-        torch.tensor(np.sqrt(w * h), dtype=torch.float32),  # sqrt(area) in pixels
-    )
+def load_gt(dataset, index):
+    """
+    The training target of row ``index`` without decoding the image: boxes (normalized cxcywh),
+    labels, and sqrt(area) in pixels.
+    """
+    row = dataset.hf_meta[index]
+    w, h = row["width"], row["height"]
+    boxes, labels, iscrowd = dataset.parse_objects(row["objects"])
+    boxes = boxes.clone()
+    boxes[:, 0::2].clamp_(min=0, max=w)
+    boxes[:, 1::2].clamp_(min=0, max=h)
+    keep = (iscrowd == 0) & (boxes[:, 2] > boxes[:, 0]) & (boxes[:, 3] > boxes[:, 1])
+    boxes, labels = boxes[keep], labels[keep]
+    bw, bh = boxes[:, 2] - boxes[:, 0], boxes[:, 3] - boxes[:, 1]
+    cxcywh = torch.stack([(boxes[:, 0] + boxes[:, 2]) / 2 / w, (boxes[:, 1] + boxes[:, 3]) / 2 / h, bw / w, bh / h], 1)
+    return cxcywh, labels, torch.sqrt(bw * bh)
 
 
-def sample_cdn(boxes, labels, num_denoising, box_noise_scale, label_noise_ratio):
+def sample_cdn(boxes, labels, num_classes, num_denoising, box_noise_scale, label_noise_ratio):
     """One CDN draw. Returns dn boxes (xyxy, [N_dn, 4]), the source-GT index and is_negative of every dn query."""
     targets = [{"labels": labels, "boxes": boxes}]
-    class_embed = torch.nn.Embedding(NUM_CLASSES + 1, 8, padding_idx=NUM_CLASSES)
+    class_embed = torch.nn.Embedding(num_classes + 1, 8, padding_idx=num_classes)
     _, dn_bbox_unact, _, dn_meta = get_contrastive_denoising_training_group(
         targets,
-        NUM_CLASSES,
+        num_classes,
         300,
         class_embed,
         num_denoising=num_denoising,
@@ -70,7 +74,7 @@ def sample_cdn(boxes, labels, num_denoising, box_noise_scale, label_noise_ratio)
     return dn_boxes, source, is_negative
 
 
-def measure(boxes, labels, repeat, num_denoising, box_noise_scale):
+def measure(boxes, labels, num_classes, repeat, num_denoising, box_noise_scale):
     """
     ``repeat`` CDN draws on one image, concatenated. Per dn query: ``own`` (IoU with the source
     GT), ``other`` / ``other_arg`` (best IoU with any other GT and which), ``other_pos`` (the own
@@ -80,7 +84,7 @@ def measure(boxes, labels, repeat, num_denoising, box_noise_scale):
     n_gt = len(labels)
     cols = {k: [] for k in ("own", "other", "other_arg", "other_pos", "neg", "src")}
     for _ in range(repeat):
-        dn_boxes, source, is_negative = sample_cdn(boxes, labels, num_denoising, box_noise_scale, 0.0)
+        dn_boxes, source, is_negative = sample_cdn(boxes, labels, num_classes, num_denoising, box_noise_scale, 0.0)
         idx = torch.arange(len(source))
         iou, _ = box_iou(dn_boxes, gt_xyxy)  # [N_dn, N_gt]
         own = iou[idx, source]
@@ -117,11 +121,16 @@ def pct(num, den):
     return f"{num / den * 100:5.1f}%" if den else "    -"
 
 
-def run_image(args):
-    boxes, labels, sizes = load_visdrone(args.root, args.split, args.image)
+def run_image(dataset, num_classes, args):
+    ids = dataset.hf_meta["id"]
+    if args.image not in ids:
+        raise SystemExit(f"{args.image} is not in {dataset}")
+    boxes, labels, sizes = load_gt(dataset, ids.index(args.image))
     n_gt = len(labels)
+    if n_gt < 2:
+        raise SystemExit(f"{args.image} has {n_gt} GT boxes; nothing to overlap with")
     print(f"image {args.image}: {n_gt} GT boxes, sqrt(area) median {sizes.median():.1f}px")
-    m = measure(boxes, labels, args.repeat, args.num_denoising, args.box_noise_scale)
+    m = measure(boxes, labels, num_classes, args.repeat, args.num_denoising, args.box_noise_scale)
     neg, src_size = m["neg"], sizes[m["src"]]
     print(f"{int((~neg).sum())} positive and {int(neg.sum())} negative CDN queries over {args.repeat} draws\n")
 
@@ -181,26 +190,29 @@ def run_image(args):
         print(f"saved {args.plot}")
 
 
-def run_dataset(args):
+def run_dataset(dataset, num_classes, args):
     rng = np.random.default_rng(args.seed)
-    ann_dir = os.path.join(args.root, f"VisDrone2019-DET-{args.split}", "annotations")
-    ids = sorted(f[:-4] for f in os.listdir(ann_dir) if f.endswith(".txt"))
-    ids = [ids[i] for i in rng.choice(len(ids), size=min(args.num_images, len(ids)), replace=False)]
+    indices = rng.choice(len(dataset), size=min(args.num_images, len(dataset)), replace=False)
 
     rows = []  # per image: n_gt, median size, GT-GT baseline, positive counts, negative counts
-    for image_id in ids:
-        boxes, labels, sizes = load_visdrone(args.root, args.split, image_id)
-        if len(labels) == 0:
+    skipped = 0
+    for index in indices.tolist():
+        boxes, labels, sizes = load_gt(dataset, index)
+        if len(labels) < 2:  # no other GT to overlap with
+            skipped += 1
             continue
         gt_xyxy = box_cxcywh_to_xyxy(boxes)
         gg, _ = box_iou(gt_xyxy, gt_xyxy)
         gg.fill_diagonal_(-1)
         gt_overlap = (gg.max(dim=1).values >= args.thr).float().mean().item()
-        m = measure(boxes, labels, args.repeat, args.num_denoising, args.box_noise_scale)
+        m = measure(boxes, labels, num_classes, args.repeat, args.num_denoising, args.box_noise_scale)
         pos, neg = counts(m, ~m["neg"], args.thr), counts(m, m["neg"], args.thr)
         rows.append((len(labels), sizes.median().item(), gt_overlap, pos, neg))
 
-    print(f"{len(rows)} images, box_noise_scale={args.box_noise_scale}, thr={args.thr}, {args.repeat} draws each\n")
+    print(
+        f"{dataset}\n{len(rows)} images ({skipped} with fewer than 2 GT skipped), "
+        f"box_noise_scale={args.box_noise_scale}, thr={args.thr}, {args.repeat} draws each\n"
+    )
     print(
         f"{'bucket':12s} | imgs | med size | GT-GT>={args.thr} | pos other>={args.thr} | pos other>own | "
         f"neg other>={args.thr} | neg other>own | neg beats pos"
@@ -227,8 +239,8 @@ def run_dataset(args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--root", default=os.path.expanduser("~/Data/datasets/visdrone"))
-    parser.add_argument("--split", default="train")
+    parser.add_argument("dataset", choices=sorted(DATASETS))
+    parser.add_argument("--split", default="train", help="a Hub split, or splits joined with '+'")
     parser.add_argument("--image", default=None, help="one image id; omitted, a random sample of the split is used")
     parser.add_argument("--num-images", type=int, default=500, help="sample size in dataset mode")
     parser.add_argument(
@@ -242,12 +254,14 @@ def main():
     args = parser.parse_args()
     torch.manual_seed(args.seed)
 
+    dataset = DATASETS[args.dataset](split=args.split)
+    num_classes = max(i for i, _ in dataset.CATEGORIES) + 1  # labels index the class embedding
     if args.image:
         args.repeat = args.repeat or 20
-        run_image(args)
+        run_image(dataset, num_classes, args)
     else:
         args.repeat = args.repeat or 2
-        run_dataset(args)
+        run_dataset(dataset, num_classes, args)
 
 
 if __name__ == "__main__":

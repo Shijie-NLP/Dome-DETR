@@ -8,15 +8,16 @@ dataset conversion) are not on this branch yet; they come back one at a time onc
 
 Do the contrastive-denoising (CDN) negatives of one ground-truth box land on *another* GT box?
 CDN queries are sampled exactly as training does (`src/zoo/dome/denoising.py`) and each one is
-compared with its source GT and with the other GT it overlaps most.
+compared with its source GT and with the other GT it overlaps most. Ground truth comes from the
+Hub through the repo's dataset classes (`visdrone`, `aitod`, `voc`), filtered like a training
+target: ignore regions and degenerate boxes out. Images with fewer than two boxes are skipped.
 
 ```
-python tools/analysis/cdn_negative_overlap.py --image 0000059_01886_d_0000114 --plot out.png   # one image, by object size
-python tools/analysis/cdn_negative_overlap.py --num-images 500                                 # a sample, by GT count
+python tools/analysis/cdn_negative_overlap.py visdrone --image 0000059_01886_d_0000114 --plot out.png   # one image, by object size
+python tools/analysis/cdn_negative_overlap.py aitod --split train --num-images 500                       # a sample, by GT count
 ```
 
-Reads VisDrone from `--root` (default `~/Data/datasets/visdrone`, official layout); ignored
-regions and `others` are dropped. Columns:
+Columns:
 
 | column | meaning |
 | --- | --- |
@@ -27,18 +28,39 @@ regions and `others` are dropped. Columns:
 
 ### VisDrone2019-DET train, full split
 
-All 6471 images, 2 draws each, `box_noise_scale=1.0`, `thr=0.3`, seed 0 (commit d9dd387):
+6465 of 6471 images (6 have fewer than two boxes), 2 draws each, `box_noise_scale=1.0`,
+`thr=0.3`, seed 0:
 
 | GT per image | images | median size | GT-GT>=0.3 | pos other>=0.3 | pos other>own | neg other>=0.3 | neg other>own | neg beats pos |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1-50 | 3847 | 34.2px | 8.7% | 6.9% | 3.8% | 5.6% | 25.5% | 4.8% |
-| 51-200 | 2544 | 24.4px | 15.2% | 12.5% | 7.0% | 9.5% | 38.7% | 7.8% |
-| 201-500 | 78 | 20.3px | 19.9% | 15.9% | 9.1% | 13.1% | 47.6% | 10.5% |
-| >500 | 2 | 15.9px | 24.2% | 13.6% | 7.8% | 11.7% | 40.7% | 8.8% |
-| all | 6471 | 28.5px | 11.4% | 9.3% | 5.2% | 7.3% | 31.2% | 6.1% |
+| 1-50 | 3841 | 34.2px | 8.8% | 6.8% | 3.7% | 5.6% | 25.5% | 4.7% |
+| 51-200 | 2544 | 24.4px | 15.2% | 12.6% | 7.0% | 9.6% | 38.8% | 7.8% |
+| 201-500 | 78 | 20.3px | 19.9% | 16.2% | 9.3% | 12.6% | 47.1% | 10.3% |
+| >500 | 2 | 15.9px | 24.2% | 15.0% | 8.8% | 12.4% | 42.8% | 10.4% |
+| all | 6465 | 28.5px | 11.4% | 9.3% | 5.2% | 7.3% | 31.2% | 6.1% |
 
 Over the whole split 6.1% of CDN negatives are a better box for some other GT than that GT's
-own positive, yet are trained as background; the share grows with density (4.8% in sparse images,
-10.5% at 201-500 GT; the `>500` row is two images). A third of the negatives are closer to
+own positive, yet are trained as background; the share grows with density (4.7% in sparse images,
+10.3% at 201-500 GT; the `>500` row is two images). A third of the negatives are closer to
 another GT than to their source, but most of those overlap neither (only 7.3% reach IoU 0.3).
 Positives are ambiguous too: 5.2% sit closer to another GT than to the one they regress to.
+
+### AI-TOD-v2 train, full split
+
+7819 of 11214 images (10 are empty and 3385 hold a single box), 2 draws each,
+`box_noise_scale=1.0`, `thr=0.3`, seed 0:
+
+| GT per image | images | median size | GT-GT>=0.3 | pos other>=0.3 | pos other>own | neg other>=0.3 | neg other>own | neg beats pos |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1-50 | 6191 | 11.8px | 0.9% | 1.3% | 0.7% | 1.9% | 9.3% | 1.7% |
+| 51-200 | 1394 | 11.8px | 1.8% | 3.5% | 2.0% | 6.5% | 28.1% | 5.4% |
+| 201-500 | 205 | 11.3px | 1.7% | 5.2% | 3.0% | 10.9% | 40.7% | 8.8% |
+| >500 | 29 | 10.0px | 4.2% | 14.5% | 7.9% | 22.3% | 59.8% | 16.6% |
+| all | 7819 | 11.8px | 1.1% | 2.3% | 1.3% | 4.0% | 16.3% | 3.3% |
+
+AI-TOD is tinier (median 12px against 28px) but far less crowded: only 1.1% of its boxes overlap
+another box at IoU 0.3, against 11.4% on VisDrone, and 3.3% of its negatives beat another GT's
+positive, about half the VisDrone rate. The dense tail behaves like VisDrone and worse: at
+201-500 boxes the two datasets match (8.8% vs 10.3%), and the 29 images above 500 boxes reach
+16.6%, with six negatives in ten closer to another GT than to their own source. The effect is a
+function of crowding, not of object size.
