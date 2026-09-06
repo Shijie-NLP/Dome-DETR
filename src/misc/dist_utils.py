@@ -19,9 +19,6 @@ import torch.nn as nn
 from torch.nn.parallel import DataParallel as DP, DistributedDataParallel as DDP
 from torch.utils.data import DistributedSampler
 
-# from torch.utils.data.dataloader import DataLoader
-from ..data import DataLoader
-
 
 def setup_distributed(
     print_rank: int = 0,
@@ -155,7 +152,10 @@ def de_model(model):
 
 
 def warp_loader(loader, shuffle=False):
+    """The loader rebuilt around a DistributedSampler when running distributed; unchanged otherwise."""
     if is_dist_available_and_initialized():
+        from ..data import DataLoader  # here, not at module level: data imports misc
+
         sampler = DistributedSampler(loader.dataset, shuffle=shuffle)
         loader = DataLoader(
             loader.dataset,
