@@ -80,28 +80,18 @@ class DetSolver(BaseSolver):
 
             self.last_epoch = epoch
 
-            if self.output_dir and not stage2:
-                checkpoint_paths = [self.output_dir / "last.pth"]
-                if (epoch + 1) % cfg.checkpoint_freq == 0:
-                    checkpoint_paths.append(self.output_dir / f"checkpoint{epoch:04}.pth")
-                for checkpoint_path in checkpoint_paths:
-                    dist_utils.save_on_master(self.state_dict(), checkpoint_path)
+            if not stage2:
+                self._save_periodic_checkpoints(epoch)
 
             print("Evaluate state starting...")
             test_stats, coco_evaluator = self._evaluate()
             ap = test_stats[self.metric][0]
-
-            if self.writer and dist_utils.is_main_process():
-                for k, values in test_stats.items():
-                    for i, v in enumerate(values):
-                        self.writer.add_scalar(f"Test/{k}_{i}", v, epoch)
+            self._log_test_stats(test_stats, epoch)
 
             if ap > best_ap:
                 best_ap, best_epoch = ap, epoch
                 not_improved = 0
-                if self.output_dir:
-                    name = "best_stg2.pth" if stage2 else "best_stg1.pth"
-                    dist_utils.save_on_master(self.state_dict(), self.output_dir / name)
+                self._save_checkpoint("best_stg2.pth" if stage2 else "best_stg1.pth")
             else:
                 not_improved += 1
             print(f"current_stat: {ap}")
@@ -123,19 +113,8 @@ class DetSolver(BaseSolver):
                 "epoch": epoch,
                 "n_parameters": n_parameters,
             }
-
-            if self.output_dir and dist_utils.is_main_process():
-                with (self.output_dir / "log.txt").open("a") as f:
-                    f.write(json.dumps(log_stats) + "\n")
-
-                # the raw COCOeval results, for offline analysis
-                if "bbox" in coco_evaluator.coco_eval:
-                    (self.output_dir / "eval").mkdir(exist_ok=True)
-                    filenames = ["latest.pth"]
-                    if epoch % 50 == 0:
-                        filenames.append(f"{epoch:03}.pth")
-                    for name in filenames:
-                        torch.save(coco_evaluator.coco_eval["bbox"].eval, self.output_dir / "eval" / name)
+            self._append_log(log_stats)
+            self._dump_eval(coco_evaluator, epoch)
 
         total_time = time.time() - start_time
         print(f"Training time {datetime.timedelta(seconds=int(total_time))}")
@@ -145,6 +124,39 @@ class DetSolver(BaseSolver):
         _, coco_evaluator = self._evaluate()
         if self.output_dir:
             dist_utils.save_on_master(coco_evaluator.coco_eval["bbox"].eval, self.output_dir / "eval.pth")
+
+    def _save_checkpoint(self, name: str):
+        if self.output_dir:
+            dist_utils.save_on_master(self.state_dict(), self.output_dir / name)
+
+    def _save_periodic_checkpoints(self, epoch: int):
+        """``last.pth`` every epoch, plus a numbered copy every ``checkpoint_freq`` epochs."""
+        self._save_checkpoint("last.pth")
+        if (epoch + 1) % self.cfg.checkpoint_freq == 0:
+            self._save_checkpoint(f"checkpoint{epoch:04}.pth")
+
+    def _log_test_stats(self, test_stats: dict, epoch: int):
+        if self.writer and dist_utils.is_main_process():
+            for k, values in test_stats.items():
+                for i, v in enumerate(values):
+                    self.writer.add_scalar(f"Test/{k}_{i}", v, epoch)
+
+    def _append_log(self, log_stats: dict):
+        """One json line per epoch in ``log.txt``, written by the main process."""
+        if self.output_dir and dist_utils.is_main_process():
+            with (self.output_dir / "log.txt").open("a") as f:
+                f.write(json.dumps(log_stats) + "\n")
+
+    def _dump_eval(self, coco_evaluator, epoch: int):
+        """The raw COCOeval results of this epoch under ``eval/``, for offline analysis."""
+        if not (self.output_dir and dist_utils.is_main_process() and "bbox" in coco_evaluator.coco_eval):
+            return
+        (self.output_dir / "eval").mkdir(exist_ok=True)
+        filenames = ["latest.pth"]
+        if epoch % 50 == 0:
+            filenames.append(f"{epoch:03}.pth")
+        for name in filenames:
+            torch.save(coco_evaluator.coco_eval["bbox"].eval, self.output_dir / "eval" / name)
 
     def _evaluate(self):
         """Validation of the EMA weights when there are any, else of the model."""
