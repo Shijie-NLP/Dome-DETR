@@ -9,7 +9,8 @@ criterion: DomeCriterion
 postprocessor: DomePostProcessor
 
 use_focal_loss: True
-eval_spatial_size: [800, 800]  # h w; the anchor grid the encoder and decoder are built for
+# eval_spatial_size is left unset: validation images keep their aspect ratio, so the encoder builds
+# its position embeddings for whatever size arrives instead of caching them for one fixed size
 
 DOME:
   backbone: HGNetv2

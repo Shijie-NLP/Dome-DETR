@@ -11,8 +11,6 @@ evaluator:
 num_classes: 12  # labels are the official VisDrone ids 1..10; 0 and 11 are never predicted
 remap_mscoco_category: False
 
-eval_spatial_size: [800, 800] # h w
-
 train_dataloader:
   type: DataLoader
   dataset:

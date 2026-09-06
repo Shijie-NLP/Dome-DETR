@@ -119,6 +119,17 @@ def train_one_epoch(
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
 
+def prediction_scale(target):
+    """
+    The (w, h) that maps a prediction normalized to the network input back to the original image.
+    That is ``orig_size``, unless the collate function padded the image: then the input is larger
+    than the resized image by ``padded_size / resized_size``, and so must be the scale.
+    """
+    if "padded_size" in target:
+        return target["orig_size"] * target["padded_size"] / target["resized_size"]
+    return target["orig_size"]
+
+
 @torch.no_grad()
 def evaluate(
     model: torch.nn.Module,
@@ -147,7 +158,7 @@ def evaluate(
             targets = to_device(targets, device)
 
             outputs = model(samples, targets=targets)
-            orig_target_sizes = torch.stack([t["orig_size"] for t in targets], dim=0)
+            orig_target_sizes = torch.stack([prediction_scale(t) for t in targets], dim=0)
             results = postprocessor(outputs, orig_target_sizes)
 
             if dumper.enabled:

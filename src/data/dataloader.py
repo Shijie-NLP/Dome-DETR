@@ -85,11 +85,11 @@ def _axis_scales(size: int, repeat: int, step: int) -> list[int]:
 def generate_scales(base_size, base_size_repeat: int, window_size: int) -> list[tuple[int, int]]:
     """
     The ``(h, w)`` sizes a multi-scale batch is resized to. Every size is a multiple of
-    ``4 * window_size`` so that the stride-4 feature map divides into whole MWAS windows. A scalar
-    ``base_size`` gives square sizes; an ``(h, w)`` pair gives the cartesian product of the two
-    sides' scales.
+    ``8 * window_size`` so that the stride-8 feature map, where MWAS runs, divides into whole
+    windows. A scalar ``base_size`` gives square sizes; an ``(h, w)`` pair gives the cartesian
+    product of the two sides' scales.
     """
-    step = 4 * window_size
+    step = 8 * window_size
     if isinstance(base_size, (list, tuple)):
         h, w = base_size
         return list(product(_axis_scales(h, base_size_repeat, step), _axis_scales(w, base_size_repeat, step)))
@@ -104,10 +104,18 @@ class BatchImageCollateFunction(BaseCollateFunction):
     ``stop_epoch`` as the boundary between its two training stages.
 
     ``mwas_window_size`` should match the encoder's, so that every drawn size divides into whole
-    windows; the default is a multiple of the configured windows, which is also enough.
+    windows on the stride-8 map.
+
+    With ``pad_to_multiple``, images of different sizes are zero-padded on the bottom and right to
+    the largest height and width in the batch, rounded up to that multiple, so that a validation
+    batch of aspect-preserving resizes stacks and every side divides into whole MWAS windows. Each
+    target then records ``resized_size`` (its image before padding) and ``padded_size`` (after),
+    both as (w, h), which the postprocessor needs to map predictions back to the original image.
     """
 
-    def __init__(self, stop_epoch=None, base_size=(640, 640), base_size_repeat=None, mwas_window_size=20) -> None:
+    def __init__(
+        self, stop_epoch=None, base_size=(640, 640), base_size_repeat=None, mwas_window_size=20, pad_to_multiple=None
+    ) -> None:
         super().__init__()
         self.base_size = base_size
         self.window_size = mwas_window_size
@@ -115,10 +123,14 @@ class BatchImageCollateFunction(BaseCollateFunction):
             generate_scales(base_size, base_size_repeat, mwas_window_size) if base_size_repeat is not None else None
         )
         self.stop_epoch = stop_epoch if stop_epoch is not None else 100000000
+        self.pad_to_multiple = pad_to_multiple
 
     def __call__(self, items):
-        images = torch.cat([x[0][None] for x in items], dim=0)
         targets = [x[1] for x in items]
+        if self.pad_to_multiple:
+            images = self._pad_to_common_size([x[0] for x in items], targets)
+        else:
+            images = torch.cat([x[0][None] for x in items], dim=0)
 
         if self.scales is not None and self.epoch < self.stop_epoch:
             sz = random.choice(self.scales)
@@ -128,3 +140,15 @@ class BatchImageCollateFunction(BaseCollateFunction):
                     tg["masks"] = F.interpolate(tg["masks"], size=sz, mode="nearest")
 
         return images, targets
+
+    def _pad_to_common_size(self, images, targets):
+        m = self.pad_to_multiple
+        pad_h = -(-max(im.shape[-2] for im in images) // m) * m
+        pad_w = -(-max(im.shape[-1] for im in images) // m) * m
+        padded = []
+        for im, tg in zip(images, targets):
+            h, w = im.shape[-2:]
+            padded.append(F.pad(im, (0, pad_w - w, 0, pad_h - h)))
+            tg["resized_size"] = torch.tensor([w, h])
+            tg["padded_size"] = torch.tensor([pad_w, pad_h])
+        return torch.stack(padded, dim=0)
