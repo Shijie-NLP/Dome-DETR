@@ -1,0 +1,127 @@
+"""
+Dome-DETR: DETR with Density-Oriented Feature-Query Manipulation for Efficient Tiny Object Detection
+Copyright (c) 2025 The Dome-DETR Authors. All Rights Reserved.
+---------------------------------------------------------------------------------
+Modified from D-FINE (https://github.com/Peterande/D-FINE)
+Copyright (c) 2024 The D-FINE Authors. All Rights Reserved.
+"""
+
+import torch
+
+from ...nn.functional import inverse_sigmoid
+from .box_ops import box_cxcywh_to_xyxy, box_xyxy_to_cxcywh
+
+__all__ = ["get_contrastive_denoising_training_group"]
+
+
+def get_contrastive_denoising_training_group(
+    targets,
+    num_classes,
+    num_queries,
+    class_embed,
+    num_denoising=100,
+    label_noise_ratio=0.5,
+    box_noise_scale=1.0,
+    batch_queries_num=None,
+    num_heads=8,
+):
+    """
+    Contrastive denoising queries (DINO / RT-DETR): the ground-truth boxes of every image,
+    padded to the largest count in the batch and repeated in ``num_group`` groups of a positive
+    (lightly jittered) and a negative (heavily jittered) copy, with a share of the labels swapped
+    at random. Returns their class embeddings, their boxes as logits, the self-attention mask, and
+    a ``dn_meta`` dict (``dn_positive_idx``, ``dn_num_group``, ``dn_num_split``).
+
+    The attention mask has one row block per head and image (``[num_heads * bs, T, T]``): the
+    matching queries cannot see the denoising queries, denoising groups cannot see each other,
+    and, with ``batch_queries_num`` (the real query count of every image, the rest being
+    padding), padding queries and real queries are hidden from one another. Padding queries still
+    see themselves so their softmax stays finite.
+    """
+    if num_denoising <= 0:
+        return None, None, None, None
+
+    num_gts = [len(t["labels"]) for t in targets]
+    device = targets[0]["labels"].device
+    bs = len(num_gts)
+    max_gt_num = max(num_gts)
+
+    if max_gt_num == 0:
+        # no boxes in the whole batch: empty tensors, but still run class_embed so it stays in the graph
+        input_query_class = torch.full([bs, 0], num_classes, dtype=torch.int32, device=device)
+        input_query_logits = class_embed(input_query_class)
+        input_query_bbox_unact = inverse_sigmoid(torch.zeros([bs, 0, 4], device=device))
+        attn_mask = torch.zeros([num_queries, num_queries], dtype=torch.bool, device=device)
+        dn_meta = {"dn_positive_idx": None, "dn_num_group": 0, "dn_num_split": [0, num_queries]}
+        return input_query_logits, input_query_bbox_unact, attn_mask, dn_meta
+
+    num_group = max(num_denoising // max_gt_num, 1)
+
+    input_query_class = torch.full([bs, max_gt_num], num_classes, dtype=torch.int32, device=device)
+    input_query_bbox = torch.zeros([bs, max_gt_num, 4], device=device)
+    pad_gt_mask = torch.zeros([bs, max_gt_num], dtype=torch.bool, device=device)
+    for i, num_gt in enumerate(num_gts):
+        if num_gt > 0:
+            input_query_class[i, :num_gt] = targets[i]["labels"]
+            input_query_bbox[i, :num_gt] = targets[i]["boxes"]
+            pad_gt_mask[i, :num_gt] = 1
+
+    # each group has positive and negative queries
+    input_query_class = input_query_class.tile([1, 2 * num_group])
+    input_query_bbox = input_query_bbox.tile([1, 2 * num_group, 1])
+    pad_gt_mask = pad_gt_mask.tile([1, 2 * num_group])
+    negative_gt_mask = torch.zeros([bs, max_gt_num * 2, 1], device=device)
+    negative_gt_mask[:, max_gt_num:] = 1
+    negative_gt_mask = negative_gt_mask.tile([1, num_group, 1])
+    positive_gt_mask = (1 - negative_gt_mask).squeeze(-1) * pad_gt_mask
+    dn_positive_idx = torch.nonzero(positive_gt_mask)[:, 1]
+    dn_positive_idx = torch.split(dn_positive_idx, [n * num_group for n in num_gts])
+    num_denoising = int(max_gt_num * 2 * num_group)  # total denoising queries
+
+    if label_noise_ratio > 0:
+        mask = torch.rand_like(input_query_class, dtype=torch.float) < (label_noise_ratio * 0.5)
+        new_label = torch.randint_like(mask, 0, num_classes, dtype=input_query_class.dtype)
+        input_query_class = torch.where(mask & pad_gt_mask, new_label, input_query_class)
+
+    if box_noise_scale > 0:
+        known_bbox = box_cxcywh_to_xyxy(input_query_bbox)
+        diff = torch.tile(input_query_bbox[..., 2:] * 0.5, [1, 1, 2]) * box_noise_scale
+        rand_sign = torch.randint_like(input_query_bbox, 0, 2) * 2.0 - 1.0
+        rand_part = torch.rand_like(input_query_bbox)
+        # negatives are pushed at least a full step away, positives less than one
+        rand_part = (rand_part + 1.0) * negative_gt_mask + rand_part * (1 - negative_gt_mask)
+        known_bbox += rand_sign * rand_part * diff
+        known_bbox = torch.clip(known_bbox, min=0.0, max=1.0)
+        input_query_bbox = box_xyxy_to_cxcywh(known_bbox)
+        input_query_bbox[input_query_bbox < 0] *= -1
+        input_query_bbox_unact = inverse_sigmoid(input_query_bbox)
+
+    input_query_logits = class_embed(input_query_class)
+
+    tgt_size = num_denoising + num_queries
+    base_attn_mask = torch.full((tgt_size, tgt_size), False, device=device)
+    base_attn_mask[num_denoising:, :num_denoising] = True  # matching queries cannot see the denoising ones
+    for i in range(num_group):  # groups cannot see each other
+        group_start = max_gt_num * 2 * i
+        group_end = max_gt_num * 2 * (i + 1)
+        if i < num_group - 1:
+            base_attn_mask[group_start:group_end, group_end:num_denoising] = True
+        if i > 0:
+            base_attn_mask[group_start:group_end, :group_start] = True
+
+    attn_mask = base_attn_mask.unsqueeze(0).repeat(num_heads * bs, 1, 1)  # [num_heads * bs, T, T]
+
+    if batch_queries_num is not None:
+        for b, valid_queries in enumerate(batch_queries_num):
+            padding_start = num_denoising + valid_queries
+            if padding_start < tgt_size:
+                heads = slice(b * num_heads, (b + 1) * num_heads)
+                attn_mask[heads, :padding_start, padding_start:] = True  # real queries do not see padding
+                attn_mask[heads, padding_start:, :padding_start] = True  # padding does not see real queries
+
+    dn_meta = {
+        "dn_positive_idx": dn_positive_idx,
+        "dn_num_group": num_group,
+        "dn_num_split": [num_denoising, num_queries],
+    }
+    return input_query_logits, input_query_bbox_unact, attn_mask, dn_meta

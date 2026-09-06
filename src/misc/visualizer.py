@@ -30,6 +30,7 @@ __all__ = [
     "SAVE_TEST_VISUALIZE_RESULT",
     "PredictionDumper",
     "concatenate_images",
+    "dump_boxes",
     "dump_feature_map",
     "dump_training_targets",
     "show_sample",
@@ -230,6 +231,22 @@ def dump_training_targets(samples: torch.Tensor, targets: list[dict]) -> None:
         target_cpu = {k: v.cpu().detach().clone() for k, v in target.items()}
         target_cpu["boxes"] = target_cpu["boxes"] * torch.tensor([w, h, w, h])
         visualize_detection(image, target_cpu, "sample_gt", return_image=False, type="xywh")
+
+
+def dump_boxes(name, image, boxes, labels=None, scores=None) -> None:
+    """
+    Save the first image of ``image`` twice under ``visualize/``: with ``boxes`` (normalized
+    cxcywh, ``[N, 4]``) drawn as centre points (``<name>_point``) and as rectangles (``<name>``).
+    Predictions can pass ``labels`` and ``scores``; scores below 0.5 are left out.
+    """
+    _, h, w = image[0].shape
+    target = {"boxes": boxes.detach() * boxes.new_tensor([w, h, w, h])}
+    if labels is not None:
+        target["labels"] = labels.detach()
+    if scores is not None:
+        target["scores"] = scores.detach()
+    visualize_detection(image, target, f"{name}_point", point_mode=True, type="xywh")
+    visualize_detection(image, target, name, show_label=False, type="xywh")
 
 
 def save_prediction_pair(sample, target, result, filename, scale_factor):
