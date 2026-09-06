@@ -2,9 +2,12 @@
 Copied from D-FINE (https://github.com/Peterande/D-FINE)
 Copyright(c) 2024 The D-FINE Authors. All Rights Reserved.
 
-The building blocks of the D-FINE style decoder: a plain MLP head, the gated residual that
-replaces the post-cross-attention add-and-norm, and the decoder layer itself.
+The transformer building blocks of the D-FINE style detectors: a plain MLP head, the
+post-norm encoder layer and stack used for intra-scale and window attention, and the decoder
+layer with its gated residual.
 """
+
+import copy
 
 import torch
 import torch.nn as nn
@@ -14,7 +17,7 @@ from .backbone.common import get_activation
 from .deformable_attention import MSDeformableAttention
 from .functional import bias_init_with_prob
 
-__all__ = ["MLP", "Gate", "TransformerDecoderLayer"]
+__all__ = ["MLP", "Gate", "TransformerDecoderLayer", "TransformerEncoder", "TransformerEncoderLayer"]
 
 
 class MLP(nn.Module):
@@ -31,6 +34,76 @@ class MLP(nn.Module):
         for i, layer in enumerate(self.layers):
             x = self.act(layer(x)) if i < self.num_layers - 1 else layer(x)
         return x
+
+
+class TransformerEncoderLayer(nn.Module):
+    """
+    Self-attention then a feed-forward block, each with a residual and a LayerNorm (after, or
+    before with ``normalize_before``). ``forward`` attends a sequence to itself with an optional
+    position embedding added to queries and keys; ``attend`` takes queries and keys built by the
+    caller, for encoders that arrange them differently.
+    """
+
+    def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1, activation="relu", normalize_before=False):
+        super().__init__()
+        self.normalize_before = normalize_before
+
+        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout, batch_first=True)
+
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.dropout = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
+
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+        self.activation = get_activation(activation)
+
+    @staticmethod
+    def with_pos_embed(tensor, pos_embed):
+        return tensor if pos_embed is None else tensor + pos_embed
+
+    def forward(self, src, src_mask=None, pos_embed=None) -> torch.Tensor:
+        q = k = self.with_pos_embed(src, pos_embed)
+        return self.attend(q, k, src, src_mask)
+
+    def attend(self, q, k, v, attn_mask=None) -> torch.Tensor:
+        """The layer with given queries and keys; ``v`` is both the attention value and the residual stream."""
+        src = residual = v
+        if self.normalize_before:
+            src = self.norm1(src)
+        src, _ = self.self_attn(q, k, value=src, attn_mask=attn_mask)
+        src = residual + self.dropout1(src)
+        if not self.normalize_before:
+            src = self.norm1(src)
+
+        residual = src
+        if self.normalize_before:
+            src = self.norm2(src)
+        src = self.linear2(self.dropout(self.activation(self.linear1(src))))
+        src = residual + self.dropout2(src)
+        if not self.normalize_before:
+            src = self.norm2(src)
+        return src
+
+
+class TransformerEncoder(nn.Module):
+    """``num_layers`` copies of ``encoder_layer`` in sequence, with an optional final norm."""
+
+    def __init__(self, encoder_layer, num_layers, norm=None):
+        super().__init__()
+        self.layers = nn.ModuleList([copy.deepcopy(encoder_layer) for _ in range(num_layers)])
+        self.num_layers = num_layers
+        self.norm = norm
+
+    def forward(self, src, src_mask=None, pos_embed=None) -> torch.Tensor:
+        output = src
+        for layer in self.layers:
+            output = layer(output, src_mask=src_mask, pos_embed=pos_embed)
+        if self.norm is not None:
+            output = self.norm(output)
+        return output
 
 
 class Gate(nn.Module):

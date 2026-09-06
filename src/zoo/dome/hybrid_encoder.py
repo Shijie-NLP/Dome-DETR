@@ -27,8 +27,9 @@ from ...core import register
 from ...misc.visualizer import SAVE_INTERMEDIATE_VISUALIZE_RESULT, dump_feature_map
 from ...nn.blocks import ConvNormLayerFuse, RepNCSPELAN4, SCDown
 from ...nn.position_encoding import build_2d_sincos_position_embedding
+from ...nn.transformer import TransformerEncoder, TransformerEncoderLayer
 from .defe import LiteDeFE, adaptive_defe_filter, render_density_map
-from .get_roi_features import TransformerEncoder, TransformerEncoderLayer, WindowProcessor
+from .mwas import MaskedWindowAttention
 
 __all__ = ["HybridEncoder"]
 
@@ -142,7 +143,7 @@ class HybridEncoder(nn.Module):
         if self.use_defe:
             # MWAS is created before DeFE so the state-dict order matches the released checkpoints
             if self.use_mwas:
-                self.mwas_processor = WindowProcessor(
+                self.mwas_processor = MaskedWindowAttention(
                     embed_dim=hidden_dim, dim_feedforward=dim_feedforward, num_layers=1
                 )
             if self.defe_type != "light":
