@@ -6,9 +6,7 @@ Modified from D-FINE (https://github.com/Peterande/D-FINE)
 Copyright (c) 2024 The D-FINE Authors. All Rights Reserved.
 """
 
-import concurrent.futures
 import math
-import os
 import sys
 from collections.abc import Iterable
 
@@ -16,17 +14,10 @@ import torch
 from torch.amp import GradScaler
 from torch.utils.tensorboard import SummaryWriter
 
-from tools.concatenate_images import concatenate_images
-from tools.visualize_image_annotation import visualize_detection
-
 from ..data.dataset.coco_eval import CocoEvaluator
 from ..misc import MetricLogger, SmoothedValue, dist_utils
+from ..misc.visualizer import SAVE_TEST_VISUALIZE_RESULT, PredictionDumper, dump_training_targets
 from ..optim import ModelEMA, Warmup
-
-# set to "True" to dump every training sample with its boxes (train) or every prediction next to
-# its ground truth (test) as images, for eyeballing the pipeline
-SAVE_INTERMEDIATE_VISUALIZE_RESULT = os.environ.get("SAVE_INTERMEDIATE_VISUALIZE_RESULT", "False") == "True"
-SAVE_TEST_VISUALIZE_RESULT = os.environ.get("SAVE_TEST_VISUALIZE_RESULT", "False") == "True"
 
 
 def train_one_epoch(
@@ -58,17 +49,7 @@ def train_one_epoch(
         global_step = epoch * len(data_loader) + i
         metas = dict(epoch=epoch, step=i, global_step=global_step, epoch_step=len(data_loader))
 
-        if SAVE_INTERMEDIATE_VISUALIZE_RESULT:
-            for b, target in enumerate(targets):
-                image = samples[b].cpu()
-                _, H, W = image.shape
-                target_cpu = {}
-                for k, v in target.items():
-                    if k == "boxes":
-                        target_cpu[k] = v.cpu().detach().clone() * torch.tensor([W, H, W, H])
-                    else:
-                        target_cpu[k] = v.cpu().detach().clone()
-                visualize_detection(image, target_cpu, "sample_gt", return_image=False, type="xywh")
+        dump_training_targets(samples, targets)
 
         if scaler is not None:
             with torch.autocast(device_type=str(device), cache_enabled=True):
@@ -146,9 +127,6 @@ def evaluate(
     coco_evaluator: CocoEvaluator,
     device,
 ):
-    if SAVE_TEST_VISUALIZE_RESULT:
-        os.makedirs("visualize_all", exist_ok=True)
-        print("Saving visualize results to visualize_all/")
     model.eval()
     criterion.eval()
     coco_evaluator.cleanup()
@@ -162,10 +140,7 @@ def evaluate(
     ample_defe_predictions = 0
     total_anchor_num = 0
 
-    max_pending_tasks = 256
-    with concurrent.futures.ThreadPoolExecutor(max_workers=32) as executor:
-        pending_futures = set()
-
+    with PredictionDumper(SAVE_TEST_VISUALIZE_RESULT) as dumper:
         for samples, targets in metric_logger.log_every(data_loader, 10, header):
             samples = samples.to(device)
             targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
@@ -174,25 +149,11 @@ def evaluate(
             orig_target_sizes = torch.stack([t["orig_size"] for t in targets], dim=0)
             results = postprocessor(outputs, orig_target_sizes)
 
-            if SAVE_TEST_VISUALIZE_RESULT:
+            if dumper.enabled:
                 coco = data_loader.dataset.coco
                 file_names = [coco.loadImgs(t["image_id"].item())[0]["file_name"] for t in targets]
                 scale_factor = float(samples[0].shape[1] / orig_target_sizes[0][0])
-
-                # bound the backlog so the thread pool cannot outgrow memory
-                while len(pending_futures) >= max_pending_tasks:
-                    _, pending_futures = concurrent.futures.wait(
-                        pending_futures, return_when=concurrent.futures.FIRST_COMPLETED
-                    )
-                for i in range(len(targets)):
-                    args = (
-                        samples[i].cpu(),
-                        {k: v.cpu() for k, v in targets[i].items()},
-                        {k: v.cpu() for k, v in results[i].items()},
-                        file_names[i],
-                        scale_factor,
-                    )
-                    pending_futures.add(executor.submit(process_image_pair, args))
+                dumper.submit(samples, targets, results, file_names, scale_factor)
 
             res = {target["image_id"].item(): output for target, output in zip(targets, results)}
             coco_evaluator.update(res)
@@ -203,8 +164,6 @@ def evaluate(
                     ample_defe_predictions += 1
                 total_defe_samples += 1
                 total_anchor_num += pred_defe
-
-        concurrent.futures.wait(pending_futures)
 
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
@@ -225,10 +184,3 @@ def evaluate(
         stats["coco_eval_masks"] = coco_evaluator.coco_eval["segm"].stats.tolist()
 
     return stats, coco_evaluator
-
-
-def process_image_pair(args):
-    sample, target, result, filename, scale_factor = args
-    sample_img = visualize_detection(sample, target, f"sample_{filename}", return_image=True)
-    result_img = visualize_detection(sample, result, f"result_{filename}", scale_factor=scale_factor, return_image=True)
-    concatenate_images(sample_img, result_img, output_path=f"visualize_all/{filename}")

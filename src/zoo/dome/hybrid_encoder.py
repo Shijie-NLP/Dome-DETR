@@ -16,7 +16,6 @@ across levels) with the two Dome additions on the stride-4 / stride-8 levels:
 """
 
 import copy
-import os
 from collections import OrderedDict
 from math import ceil
 
@@ -25,22 +24,13 @@ import torch.nn as nn
 import torch.nn.functional as F  # noqa: N812
 
 from ...core import register
+from ...misc.visualizer import SAVE_INTERMEDIATE_VISUALIZE_RESULT, dump_feature_map
 from ...nn.blocks import ConvNormLayerFuse, RepNCSPELAN4, SCDown
 from ...nn.position_encoding import build_2d_sincos_position_embedding
 from .defe import GaussHeatmapGenerator, LiteDeFE, adaptive_defe_filter
 from .get_roi_features import TransformerEncoder, TransformerEncoderLayer, WindowProcessor
 
-SAVE_INTERMEDIATE_VISUALIZE_RESULT = os.environ.get("SAVE_INTERMEDIATE_VISUALIZE_RESULT", "False") == "True"
-
 __all__ = ["HybridEncoder"]
-
-
-def _visualize(name: str, feature: torch.Tensor):
-    """Dump a [B, C, H, W] map under ``name`` when SAVE_INTERMEDIATE_VISUALIZE_RESULT is set."""
-    if SAVE_INTERMEDIATE_VISUALIZE_RESULT:
-        from tools.visualize_src_flatten import visualize_src_flatten
-
-        visualize_src_flatten(feature.permute(0, 2, 3, 1), [tuple(feature.shape[2:4])], name, False)
 
 
 @register()
@@ -198,10 +188,10 @@ class HybridEncoder(nn.Module):
             proj_feats[1], defe["defe_window_mask"] = self.mwas_processor(
                 proj_feats[1], defe_feature_filtered, ws, glob_pos_embed
             )
-            _visualize("encoder_output_0", proj_feats[0])
-            _visualize("defe_feature_filtered", defe_feature_filtered)
-        _visualize("defe_feature", defe_feature)
-        _visualize("defe_feature_pooled", defe_feature_pooled)
+            dump_feature_map("encoder_output_0", proj_feats[0])
+            dump_feature_map("defe_feature_filtered", defe_feature_filtered)
+        dump_feature_map("defe_feature", defe_feature)
+        dump_feature_map("defe_feature_pooled", defe_feature_pooled)
 
         # the target heatmap, drawn from the boxes at image resolution; only the criterion reads
         # it, so it is built for training (and for the visualization dump)
@@ -218,13 +208,13 @@ class HybridEncoder(nn.Module):
                     boxes = torch.cat([(boxes[:, :2] + boxes[:, 2:]) / 2, boxes[:, 2:] - boxes[:, :2]], dim=1)
                 heatmaps.append(heatmap_generator(boxes))
             defe["gt_density_map"] = torch.stack(heatmaps).to(img_inputs.device)
-            _visualize("heatmap_gt", defe["gt_density_map"])
+            dump_feature_map("heatmap_gt", defe["gt_density_map"])
         return defe
 
     def forward(self, feats, img_inputs, targets=None):
         assert len(feats) == len(self.in_channels)
         proj_feats = [self.input_proj[i](feat) for i, feat in enumerate(feats)]
-        _visualize("backbone_output_0", proj_feats[0])
+        dump_feature_map("backbone_output_0", proj_feats[0])
 
         out = {"img_inputs": img_inputs}
         if self.use_defe:
