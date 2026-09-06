@@ -47,7 +47,6 @@ class BaseSolver:
 
         # tuning weights must be in place before the EMA copies the model
         if cfg.tuning:
-            print(f"Tuning checkpoint from {cfg.tuning}")
             self.load_tuning_state(cfg.tuning)
 
         self.model = dist_utils.warp_model(
@@ -78,34 +77,33 @@ class BaseSolver:
         if self.writer:
             self.writer.close()
 
+    def _setup_eval(self):
+        """The validation loader and the evaluator built on top of it."""
+        self.val_dataloader = self._distributed_loader(self.cfg.val_dataloader)
+        self.evaluator = self.cfg.evaluator
+
+    def _resume(self):
+        if self.cfg.resume:
+            self.load_resume_state(self.cfg.resume)
+
+    @staticmethod
+    def _distributed_loader(loader):
+        return dist_utils.warp_loader(loader, shuffle=loader.shuffle)
+
     def train(self):
         self._setup()
         self.optimizer = self.cfg.optimizer
         self.lr_scheduler = self.cfg.lr_scheduler
         self.lr_warmup_scheduler = self.cfg.lr_warmup_scheduler
-
-        self.train_dataloader = dist_utils.warp_loader(
-            self.cfg.train_dataloader, shuffle=self.cfg.train_dataloader.shuffle
-        )
-        self.val_dataloader = dist_utils.warp_loader(self.cfg.val_dataloader, shuffle=self.cfg.val_dataloader.shuffle)
-
-        self.evaluator = self.cfg.evaluator
-
+        self.train_dataloader = self._distributed_loader(self.cfg.train_dataloader)
+        self._setup_eval()
         # last, so that the checkpoint's optimizer and scheduler states land on built objects
-        if self.cfg.resume:
-            print(f"Resume checkpoint from {self.cfg.resume}")
-            self.load_resume_state(self.cfg.resume)
+        self._resume()
 
     def eval(self):
         self._setup()
-
-        self.val_dataloader = dist_utils.warp_loader(self.cfg.val_dataloader, shuffle=self.cfg.val_dataloader.shuffle)
-
-        self.evaluator = self.cfg.evaluator
-
-        if self.cfg.resume:
-            print(f"Resume checkpoint from {self.cfg.resume}")
-            self.load_resume_state(self.cfg.resume)
+        self._setup_eval()
+        self._resume()
 
     def to(self, module, device):
         return module.to(device) if hasattr(module, "to") else module
@@ -140,6 +138,7 @@ class BaseSolver:
 
     def load_resume_state(self, path: str):
         """Resume: the checkpoint's states, the epoch included."""
+        print(f"Resume checkpoint from {path}")
         self.load_state_dict(load_checkpoint(path))
 
     def load_tuning_state(self, path: str):
@@ -148,6 +147,7 @@ class BaseSolver:
         match the current model, and leave the rest (a classification head sized for another
         label set, say) at initialisation. Prefers the EMA weights when the checkpoint has them.
         """
+        print(f"Tuning checkpoint from {path}")
         state = load_checkpoint(path)
         pretrained = state["ema"]["module"] if "ema" in state else state["model"]
         pretrained = dist_utils.remove_module_prefix(pretrained)
