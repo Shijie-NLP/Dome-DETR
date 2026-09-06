@@ -44,21 +44,25 @@ def load_config(file_path, cfg=None) -> dict:
     return merge_dict(cfg, file_cfg)
 
 
+def _deep_merge(dct: dict, another: dict, overwrite: bool) -> dict:
+    """
+    Merge ``another`` into ``dct`` in place: keys missing from ``dct`` are added and dicts are
+    merged recursively. Where both hold a non-dict value, ``another`` wins if ``overwrite`` is
+    set and ``dct`` keeps its value otherwise.
+    """
+    for k, v in another.items():
+        if k in dct and isinstance(dct[k], dict) and isinstance(v, dict):
+            _deep_merge(dct[k], v, overwrite)
+        elif k not in dct or overwrite:
+            dct[k] = v
+    return dct
+
+
 def merge_dict(dct, another_dct, inplace=True) -> dict:
     """Merge ``another_dct`` into ``dct`` recursively; ``another_dct`` wins where both hold a value."""
-
-    def _merge(dct, another) -> dict:
-        for k in another:
-            if k in dct and isinstance(dct[k], dict) and isinstance(another[k], dict):
-                _merge(dct[k], another[k])
-            else:
-                dct[k] = another[k]
-        return dct
-
     if not inplace:
         dct = copy.deepcopy(dct)
-
-    return _merge(dct, another_dct)
+    return _deep_merge(dct, another_dct, overwrite=True)
 
 
 def dictify(s: str, v: Any) -> dict:
@@ -102,18 +106,6 @@ def merge_config(cfg, another_cfg=GLOBAL_CONFIG, inplace: bool = False, overwrit
         model1 = create(cfg1['model'], cfg1)
         model2 = create(cfg2['model'], cfg2)
     """
-
-    def _merge(dct, another):
-        for k in another:
-            if k not in dct:
-                dct[k] = another[k]
-            elif isinstance(dct[k], dict) and isinstance(another[k], dict):
-                _merge(dct[k], another[k])
-            elif overwrite:
-                dct[k] = another[k]
-        return dct
-
     if not inplace:
         cfg = copy.deepcopy(cfg)
-
-    return _merge(cfg, another_cfg)
+    return _deep_merge(cfg, another_cfg, overwrite=overwrite)
