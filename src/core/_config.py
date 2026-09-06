@@ -123,6 +123,7 @@ class BaseConfig:
         self.use_ema: bool = False
         self.ema_decay: float = 0.9999
         self.ema_warmups: int = 2000
+        self.ema_restart_decay: float = 0.9999  # decay after the stage-2 restart (see DetSolver)
         self.sync_bn: bool = False
         self.clip_max_norm: float = 0.0
         self.find_unused_parameters: bool = None

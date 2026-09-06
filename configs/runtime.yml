@@ -20,3 +20,5 @@ ema:
   type: ModelEMA
   decay: 0.9999
   warmups: 1000
+# decay the EMA restarts with when stage 2 reloads the best stage-1 checkpoint
+ema_restart_decay: 0.9999

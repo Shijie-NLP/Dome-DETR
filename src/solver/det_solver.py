@@ -31,8 +31,7 @@ class DetSolver(BaseSolver):
     def fit(self):
         self.train()
         cfg = self.cfg
-        collate_fn = self.train_dataloader.collate_fn
-        stage2_start = collate_fn.stop_epoch
+        stage2_start = self.train_dataloader.collate_fn.stop_epoch
 
         n_parameters, model_stats = stats(cfg)
         print(model_stats)
@@ -56,7 +55,7 @@ class DetSolver(BaseSolver):
             stage2 = epoch >= stage2_start
 
             if epoch == stage2_start:
-                self._reload_best_stage1(epoch, ema_decay=collate_fn.ema_restart_decay)
+                self._reload_best_stage1(epoch, ema_decay=cfg.ema_restart_decay)
 
             print("Train starting...")
             train_stats = train_one_epoch(
