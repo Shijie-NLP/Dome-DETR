@@ -7,9 +7,6 @@ negatives, compared with their own source GT and with the other GT they overlap 
 * ``other>own``: the query is closer to some other GT than to its own source.
 * ``beats pos``: negatives only; take the other GT the negative overlaps most and compare with
   that GT's own positive in the same CDN group. The negative is the better box for it.
-* Hungarian: match every group's positives *and* negatives to the GT with the training matcher's
-  box cost (5 L1 + 2 GIoU, no class term since dn queries carry no scores) and record what each
-  GT gets: its own positive, its own negative, or another GT's positive / negative.
 
 Ground truth comes from the Hub through the repo's dataset classes, filtered exactly like a
 training target (ignore regions and degenerate boxes out).
@@ -26,19 +23,16 @@ import sys
 
 import numpy as np
 import torch
-from scipy.optimize import linear_sum_assignment
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 
 from src.data.dataset import AITODDetection, VisDroneDetection, VOCDetection  # noqa: E402
-from src.misc.box_ops import box_cxcywh_to_xyxy, box_iou, generalized_box_iou  # noqa: E402
+from src.misc.box_ops import box_cxcywh_to_xyxy, box_iou  # noqa: E402
 from src.zoo.dome.denoising import get_contrastive_denoising_training_group  # noqa: E402
 
 DATASETS = {"visdrone": VisDroneDetection, "aitod": AITODDetection, "voc": VOCDetection}
 SIZE_BUCKETS = [("tiny <16px", 0, 16), ("small 16-32px", 16, 32), ("medium 32-96px", 32, 96), ("large >96px", 96, 1e9)]
 COUNT_BUCKETS = [("1-50 GT", 1, 50), ("51-200 GT", 51, 200), ("201-500 GT", 201, 500), (">500 GT", 501, 10**9)]
-COST_BBOX, COST_GIOU = 5.0, 2.0  # the training matcher's box terms
-MATCH_KINDS = ("own pos", "own neg", "other pos", "other neg")
 
 
 def load_gt(dataset, index):
@@ -60,7 +54,7 @@ def load_gt(dataset, index):
 
 
 def sample_cdn(boxes, labels, num_classes, num_denoising, box_noise_scale, label_noise_ratio):
-    """One CDN draw. Returns dn boxes (cxcywh, [N_dn, 4]), the source-GT index and is_negative of every dn query."""
+    """One CDN draw. Returns dn boxes (xyxy, [N_dn, 4]), the source-GT index and is_negative of every dn query."""
     targets = [{"labels": labels, "boxes": boxes}]
     class_embed = torch.nn.Embedding(num_classes + 1, 8, padding_idx=num_classes)
     _, dn_bbox_unact, _, dn_meta = get_contrastive_denoising_training_group(
@@ -72,50 +66,27 @@ def sample_cdn(boxes, labels, num_classes, num_denoising, box_noise_scale, label
         label_noise_ratio=label_noise_ratio,
         box_noise_scale=box_noise_scale,
     )
-    dn_cxcywh = torch.sigmoid(dn_bbox_unact[0])
+    dn_boxes = box_cxcywh_to_xyxy(torch.sigmoid(dn_bbox_unact[0]))
     n_gt = len(labels)
-    idx = torch.arange(dn_cxcywh.shape[0])
+    idx = torch.arange(dn_boxes.shape[0])
     source = idx % n_gt  # layout: [group0: n_gt positives, n_gt negatives][group1: ...]
     is_negative = (idx // n_gt) % 2 == 1
-    return dn_cxcywh, source, is_negative
-
-
-def hungarian(dn_cxcywh, gt_cxcywh, n_gt):
-    """
-    Per CDN group, the training matcher's box cost between its 2 * n_gt queries and the GT, then
-    a Hungarian assignment. Returns, per GT and group, what it was matched to as an index into
-    ``MATCH_KINDS``.
-    """
-    gt_xyxy = box_cxcywh_to_xyxy(gt_cxcywh)
-    kinds = []
-    for g in range(dn_cxcywh.shape[0] // (2 * n_gt)):
-        q = dn_cxcywh[g * 2 * n_gt : (g + 1) * 2 * n_gt]
-        cost = COST_BBOX * torch.cdist(q, gt_cxcywh, p=1) - COST_GIOU * generalized_box_iou(
-            box_cxcywh_to_xyxy(q), gt_xyxy
-        )
-        rows, cols = linear_sum_assignment(torch.nan_to_num(cost, nan=1.0).numpy())
-        matched = torch.empty(n_gt, dtype=torch.int64)
-        matched[cols] = torch.from_numpy(rows)  # every GT gets one query: 2 * n_gt >= n_gt
-        own = matched % n_gt == torch.arange(n_gt)
-        negative = matched >= n_gt
-        kinds.append((~own).long() * 2 + negative.long())
-    return torch.cat(kinds)
+    return dn_boxes, source, is_negative
 
 
 def measure(boxes, labels, num_classes, repeat, num_denoising, box_noise_scale):
     """
     ``repeat`` CDN draws on one image, concatenated. Per dn query: ``own`` (IoU with the source
     GT), ``other`` / ``other_arg`` (best IoU with any other GT and which), ``other_pos`` (the own
-    IoU of that GT's positive in the same group), ``neg`` and ``src``; and per GT and group,
-    ``match``, what the Hungarian assignment gave it (see ``hungarian``).
+    IoU of that GT's positive in the same group), ``neg`` and ``src``.
     """
     gt_xyxy = box_cxcywh_to_xyxy(boxes)
     n_gt = len(labels)
-    cols = {k: [] for k in ("own", "other", "other_arg", "other_pos", "neg", "src", "match")}
+    cols = {k: [] for k in ("own", "other", "other_arg", "other_pos", "neg", "src")}
     for _ in range(repeat):
-        dn_cxcywh, source, is_negative = sample_cdn(boxes, labels, num_classes, num_denoising, box_noise_scale, 0.0)
+        dn_boxes, source, is_negative = sample_cdn(boxes, labels, num_classes, num_denoising, box_noise_scale, 0.0)
         idx = torch.arange(len(source))
-        iou, _ = box_iou(box_cxcywh_to_xyxy(dn_cxcywh), gt_xyxy)  # [N_dn, N_gt]
+        iou, _ = box_iou(dn_boxes, gt_xyxy)  # [N_dn, N_gt]
         own = iou[idx, source]
         iou[idx, source] = -1
         other, other_arg = iou.max(dim=1)
@@ -126,7 +97,6 @@ def measure(boxes, labels, num_classes, repeat, num_denoising, box_noise_scale):
         cols["other_pos"].append(own[pos_of_other])
         cols["neg"].append(is_negative)
         cols["src"].append(source)
-        cols["match"].append(hungarian(dn_cxcywh, boxes, n_gt))  # per GT and group, not per query
     return {k: torch.cat(v) for k, v in cols.items()}
 
 
@@ -139,15 +109,6 @@ def counts(m, mask, thr):
         "other_gt_own": int((other > own).sum()),
         "beats": int((other > m["other_pos"][mask]).sum()),
     }
-
-
-def match_counts(m):
-    """How many (GT, group) pairs the Hungarian assignment gave each kind of query."""
-    return {"n": len(m["match"]), **{k: int((m["match"] == i).sum()) for i, k in enumerate(MATCH_KINDS)}}
-
-
-def match_row(c):
-    return " | ".join(pct(c[k], c["n"]) for k in MATCH_KINDS)
 
 
 def add(acc, c):
@@ -203,19 +164,8 @@ def run_image(dataset, num_classes, args):
         same_class = labels[m["src"][beats]] == labels[m["other_arg"][beats]]
         print(
             "negatives that beat the other GT's positive: "
-            f"same class as that GT in {same_class.float().mean() * 100:.1f}%\n"
+            f"same class as that GT in {same_class.float().mean() * 100:.1f}%"
         )
-
-    print(
-        f"HUNGARIAN over each group's positives + negatives: what every GT is matched to ({len(m['match'])} GT x groups)"
-    )
-    print(f"{'':16s} " + " | ".join(MATCH_KINDS))
-    print(f"{'all sizes':16s} {match_row(match_counts(m))}")
-    gt_size = sizes.repeat(len(m["match"]) // n_gt)
-    for bname, lo, hi in SIZE_BUCKETS:
-        bmask = (gt_size >= lo) & (gt_size < hi)
-        if bmask.any():
-            print(f"  {bname:16s} {match_row(match_counts({'match': m['match'][bmask]}))}")
 
     if args.plot:
         import matplotlib
@@ -257,7 +207,7 @@ def run_dataset(dataset, num_classes, args):
         gt_overlap = (gg.max(dim=1).values >= args.thr).float().mean().item()
         m = measure(boxes, labels, num_classes, args.repeat, args.num_denoising, args.box_noise_scale)
         pos, neg = counts(m, ~m["neg"], args.thr), counts(m, m["neg"], args.thr)
-        rows.append((len(labels), sizes.median().item(), gt_overlap, pos, neg, match_counts(m)))
+        rows.append((len(labels), sizes.median().item(), gt_overlap, pos, neg))
 
     print(
         f"{dataset}\n{len(rows)} images ({skipped} with fewer than 2 GT skipped), "
@@ -272,7 +222,7 @@ def run_dataset(dataset, num_classes, args):
         if not sel:
             return
         pos, neg = {}, {}
-        for *_, p, n, _ in sel:
+        for *_, p, n in sel:
             add(pos, p)
             add(neg, n)
         print(
@@ -282,22 +232,9 @@ def run_dataset(dataset, num_classes, args):
             f"{pct(neg['other_thr'], neg['n'])} | {pct(neg['other_gt_own'], neg['n'])} | {pct(neg['beats'], neg['n'])}"
         )
 
-    def report_match(name, sel):
-        if not sel:
-            return
-        c = {}
-        for *_, mc in sel:
-            add(c, mc)
-        print(f"{name:12s} | {len(sel):4d} | {c['n']:8d} | {match_row(c)}")
-
-    buckets = [(name, [r for r in rows if lo <= r[0] <= hi]) for name, lo, hi in COUNT_BUCKETS] + [("all", rows)]
-    for name, sel in buckets:
-        report(name, sel)
-
-    print("\nHUNGARIAN over each group's positives + negatives: what every GT is matched to")
-    print(f"{'bucket':12s} | imgs | GT x grp | " + " | ".join(MATCH_KINDS))
-    for name, sel in buckets:
-        report_match(name, sel)
+    for name, lo, hi in COUNT_BUCKETS:
+        report(name, [r for r in rows if lo <= r[0] <= hi])
+    report("all", rows)
 
 
 def main():
