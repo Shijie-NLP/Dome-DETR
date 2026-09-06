@@ -5,8 +5,6 @@ Copyright (c) 2025 The Dome-DETR Authors. All Rights Reserved.
 VisDrone2019-DET, read from the Hub (https://huggingface.co/datasets/shijli/visdrone2019-det).
 """
 
-from collections.abc import Callable
-
 import torch
 
 from ...core import register
@@ -49,18 +47,6 @@ class VisDroneDetection(HFDetection):
     REPO = "shijli/visdrone2019-det"
     CONFIG = "detection"
     CATEGORIES = [(i, name) for i, name in enumerate(VISDRONE_CLASSES) if i not in (IGNORED_REGIONS, OTHERS)]
-
-    def __init__(
-        self,
-        split: str,
-        repo: str = REPO,
-        transforms: Callable | None = None,
-        revision: str | None = None,
-        cache_dir: str | None = None,
-    ):
-        super().__init__(
-            split, repo=repo, config=self.CONFIG, transforms=transforms, revision=revision, cache_dir=cache_dir
-        )
 
     def parse_objects(self, objects):
         category = torch.tensor(objects["category"], dtype=torch.int64)

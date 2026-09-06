@@ -5,8 +5,6 @@ Copyright (c) 2025 The Dome-DETR Authors. All Rights Reserved.
 PASCAL VOC 2012 detection, read from the Hub (https://huggingface.co/datasets/shijli/voc2012).
 """
 
-from collections.abc import Callable
-
 import torch
 
 from ...core import register
@@ -52,18 +50,6 @@ class VOCDetection(HFDetection):
     REPO = "shijli/voc2012"
     CONFIG = "detection"
     CATEGORIES = list(enumerate(VOC_CLASSES))
-
-    def __init__(
-        self,
-        split: str,
-        repo: str = REPO,
-        transforms: Callable | None = None,
-        revision: str | None = None,
-        cache_dir: str | None = None,
-    ):
-        super().__init__(
-            split, repo=repo, config=self.CONFIG, transforms=transforms, revision=revision, cache_dir=cache_dir
-        )
 
     def parse_objects(self, objects):
         boxes = torch.tensor(objects["bbox"], dtype=torch.float32).reshape(-1, 4)
