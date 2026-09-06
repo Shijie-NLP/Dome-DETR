@@ -9,6 +9,8 @@ Copyright (c) 2024 The D-FINE Authors. All Rights Reserved.
 import torch.nn as nn
 
 from ...core import register
+from .dome_decoder import DomeTransformer
+from .dome_encoder import DomeHybridEncoder
 
 __all__ = ["DOME"]
 
@@ -26,11 +28,29 @@ class DOME(nn.Module):
 
     __inject__ = ["backbone", "encoder", "decoder"]
 
-    def __init__(self, backbone: nn.Module, encoder: nn.Module, decoder: nn.Module):
+    def __init__(self, backbone: nn.Module, encoder: nn.Module = None, decoder: nn.Module = None):
         super().__init__()
+        if encoder is None or decoder is None:
+            raise ValueError(
+                "DOME needs an encoder and a decoder: set `DOME: {encoder: ..., decoder: ...}` in the model "
+                "config (DomeHybridEncoder + DomeTransformer for Dome-DETR, HybridEncoder + DFINETransformer "
+                "for the D-FINE baseline)"
+            )
+        if isinstance(decoder, DomeTransformer) and not isinstance(encoder, DomeHybridEncoder):
+            raise ValueError(
+                f"DomeTransformer needs the density map of DomeHybridEncoder, got {type(encoder).__name__}; "
+                "for the D-FINE baseline use DFINETransformer"
+            )
         self.backbone = backbone
         self.encoder = encoder
         self.decoder = decoder
+
+    @property
+    def wiring(self) -> str:
+        return (
+            f"{type(self).__name__}(backbone={type(self.backbone).__name__}, "
+            f"encoder={type(self.encoder).__name__}, decoder={type(self.decoder).__name__})"
+        )
 
     def forward(self, x, targets=None):
         feats = self.backbone(x)

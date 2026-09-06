@@ -254,29 +254,32 @@ class DomeCriterion(nn.Module):
 
     def loss_defe(self, defe, targets):
         """
-        The count regression loss (a squared error on the normalized object count, doubled when
-        the prediction falls short) and the density-map loss (a squared error weighted up where
-        the map under-estimates populated cells).
+        The density-map loss (a squared error weighted up where the map under-estimates populated
+        cells) and, when the decoder is ``DomeTransformer`` (it writes its query budget into
+        ``defe``), the count regression loss: a squared error on the object count normalized to
+        that budget, doubled when the prediction falls short. With ``DFINETransformer`` there is
+        no budget to normalize to and the count head is left untrained.
         """
-        min_n, max_n = defe["min_num_select"], defe["max_num_select"]
-        reg_value = defe["reg_value"]
-        # NOTE: kept exactly as trained upstream. The normalized count is cast to int64, which
-        # truncates every target below max_num_select to 0, and reg_value [B, 1] broadcasts
-        # against the [B] targets to a [B, B] difference.
-        counts = [min(max(len(t["labels"]), min_n), max_n) for t in targets]
-        reg_targets = torch.tensor(
-            [(c - min_n) / (max_n - min_n) for c in counts], dtype=torch.int64, device=reg_value.device
-        )
-        diff = reg_value - reg_targets
-        penalty = torch.where(diff < 0, 2.0, 1.0)
-        defe_reg_loss = (penalty * diff**2).mean()
-
         density_map, gt_density_map = defe["defe_feature"], defe["gt_density_map"]
         under = (density_map < gt_density_map).float()
         penalty = 1 + self.density_recall_penalty * gt_density_map * under
         defe_density_loss = (penalty * (density_map - gt_density_map) ** 2).mean() * self.defe_density_map_weight
+        losses = {"defe_density_loss": defe_density_loss}
 
-        return {"defe_reg_loss": defe_reg_loss, "defe_density_loss": defe_density_loss}
+        if "min_num_select" in defe:
+            min_n, max_n = defe["min_num_select"], defe["max_num_select"]
+            reg_value = defe["reg_value"]
+            # NOTE: kept exactly as trained upstream. The normalized count is cast to int64, which
+            # truncates every target below max_num_select to 0, and reg_value [B, 1] broadcasts
+            # against the [B] targets to a [B, B] difference.
+            counts = [min(max(len(t["labels"]), min_n), max_n) for t in targets]
+            reg_targets = torch.tensor(
+                [(c - min_n) / (max_n - min_n) for c in counts], dtype=torch.int64, device=reg_value.device
+            )
+            diff = reg_value - reg_targets
+            penalty = torch.where(diff < 0, 2.0, 1.0)
+            losses["defe_reg_loss"] = (penalty * diff**2).mean()
+        return losses
 
     # ------------------------------------------------------------------ assembling
 

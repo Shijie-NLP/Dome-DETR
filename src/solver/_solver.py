@@ -44,6 +44,7 @@ class BaseSolver:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         self.model = cfg.model
+        print("model:", getattr(self.model, "wiring", type(self.model).__name__))
 
         # tuning weights must be in place before the EMA copies the model
         if cfg.tuning:

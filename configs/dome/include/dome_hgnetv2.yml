@@ -1,6 +1,12 @@
-# Dome-DETR on an HGNetv2 backbone: the architecture shared by every Dome-{S,M,L} config.
-# The model configs set what depends on the backbone size (HGNetv2 name, encoder in_channels,
-# depth_mult / expansion, decoder num_layers) and the dataset (DeFE query budget).
+# Dome-DETR on an HGNetv2 backbone: the architecture shared by every Dome-{S,M,L} config and
+# the D-FINE baselines. The model configs set what depends on the backbone size (HGNetv2 name,
+# encoder in_channels, depth_mult / expansion, decoder num_layers), the dataset (DeFE query
+# budget), and, deliberately, which encoder and decoder DOME is built from:
+#
+#   DOME: {encoder: DomeHybridEncoder, decoder: DomeTransformer}   # Dome-DETR
+#   DOME: {encoder: HybridEncoder,     decoder: DFINETransformer}  # D-FINE baseline
+#
+# There is no default here: a config that does not say fails at model construction.
 
 task: detection
 
@@ -14,8 +20,6 @@ use_focal_loss: True
 
 DOME:
   backbone: HGNetv2
-  encoder: DomeHybridEncoder
-  decoder: DomeTransformer
 
 HGNetv2:
   pretrained: True

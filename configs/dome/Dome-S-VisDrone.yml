@@ -10,6 +10,9 @@ __include__: [
 
 output_dir: ./outputs/dome_s_visdrone
 
+DOME:
+  encoder: DomeHybridEncoder
+  decoder: DomeTransformer
 
 HGNetv2:
   name: 'B0'

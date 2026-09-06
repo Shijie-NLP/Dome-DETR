@@ -6,9 +6,8 @@ The Dome decoder: ``DFINETransformer`` with Progressive Adaptive Query Initializ
 place of the fixed top-k query selection. Each image gets a core set of the ``min_num_select``
 best encoder tokens plus, from the next ``max_num_select - min_num_select``, those that fall in
 a window the density map marks as populated and survive a class-wise NMS whose IoU threshold
-rises with the local density. Images in a batch therefore have different query counts. Without a
-density map (the plain ``HybridEncoder``) every candidate is kept, i.e. a fixed
-``max_num_select`` queries.
+rises with the local density. Images in a batch therefore have different query counts. The
+density map comes from ``DomeHybridEncoder``; with any other encoder the decoder raises.
 """
 
 import torch
@@ -127,12 +126,13 @@ class DomeTransformer(DFINETransformer):
         loss, and the real query count of every image.
         """
         defe = encoder_out.get("defe")
-        if defe is not None:
-            # the criterion reads the query budget from here
-            defe["min_num_select"] = self.min_num_select
-            defe["max_num_select"] = self.max_num_select
-        defe_window_mask = defe["defe_window_mask"] if defe is not None else None
-        defe_feature = defe["density_map_pooled"] if defe is not None else None
+        if defe is None or "defe_window_mask" not in defe:
+            raise ValueError("DomeTransformer needs DomeHybridEncoder's density map and window mask (use_mwas: True)")
+        # the criterion reads the query budget from here
+        defe["min_num_select"] = self.min_num_select
+        defe["max_num_select"] = self.max_num_select
+        defe_window_mask = defe["defe_window_mask"]
+        defe_feature = defe["density_map_pooled"]
 
         anchors, valid_mask = self._generate_anchors(spatial_shapes, device=memory.device)
         if memory.shape[0] > 1:
@@ -149,10 +149,7 @@ class DomeTransformer(DFINETransformer):
         min_num = self.min_num_select
 
         # the core queries are kept as they are; the rest must sit in a populated window
-        if defe_window_mask is not None:
-            selected_mask = self._in_marked_windows(topk_anchors[:, min_num:], defe_window_mask)
-        else:
-            selected_mask = torch.ones_like(topk_anchors[:, min_num:, 0], dtype=torch.bool)
+        selected_mask = self._in_marked_windows(topk_anchors[:, min_num:], defe_window_mask)
 
         per_image = []  # (memory, logits, bbox_unact) per image, after window filtering and NMS
         for i in range(b):
@@ -161,7 +158,7 @@ class DomeTransformer(DFINETransformer):
             logits = topk_logits[i][keep]
             bbox_unact = self.enc_bbox_head(mem) + topk_anchors[i][keep]
 
-            if defe_feature is not None and logits.size(0) > 0:
+            if logits.size(0) > 0:
                 keep_idx = self._density_nms(F.sigmoid(bbox_unact), logits, defe_feature[i])
                 # the core queries are never suppressed
                 keep_idx = torch.cat([torch.arange(min_num, device=keep_idx.device), keep_idx[keep_idx >= min_num]])
