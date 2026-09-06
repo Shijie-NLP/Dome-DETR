@@ -2,9 +2,10 @@
 # This include comes after the dataset file, so its `ops` lists replace the dataset file's:
 # the augmentations that actually run are the ones here.
 #
-# Images are resized with their aspect ratio kept, short side to 800. Training then takes a random
-# 800x800 crop; validation runs on the whole image, batches padded to a multiple of 80 so every
-# side divides into MWAS windows. For AI-TOD, whose tiles are 800x800 already, both are no-ops.
+# Images are resized with their aspect ratio kept. Training resizes the short side to 800 and takes
+# a random 800x800 crop; validation uses the mmdetection-style 1333x800 (short side 800, long side
+# capped at 1333) on the whole image, batches padded to a multiple of 32. For AI-TOD, whose tiles
+# are 800x800 already, both are no-ops.
 
 train_dataloader:
   dataset:
@@ -46,11 +47,11 @@ val_dataloader:
   dataset:
     transforms:
       ops:
-        - {type: Resize, size: 800}  # short side 800, aspect ratio kept, whole image
+        - {type: Resize, size: 800, max_size: 1333}  # 1333x800: short side 800, long side at most 1333
         - {type: ConvertPILImage, dtype: 'float32', scale: True}
   collate_fn:
     type: BatchImageCollateFunction
-    pad_to_multiple: 80
+    pad_to_multiple: 32
   shuffle: False
   total_batch_size: 16
   num_workers: 4
