@@ -38,11 +38,13 @@ class HungarianMatcher(nn.Module):
         self.gamma = gamma
 
     @torch.no_grad()
-    def forward(self, outputs: dict[str, torch.Tensor], targets):
+    def forward(self, outputs: dict[str, torch.Tensor], targets, batch_queries_num=None):
         """
         Args:
             outputs: ``pred_logits`` ``[B, Q, C]`` and ``pred_boxes`` ``[B, Q, 4]`` (normalized cxcywh).
             targets: one dict per image with ``labels`` ``[N_i]`` and ``boxes`` ``[N_i, 4]``.
+            batch_queries_num: the real query count of every image; the queries past it are
+                padding and never matched.
 
         Returns:
             ``{"indices": [(pred_idx, target_idx), ...]}``, one pair of int64 index tensors per
@@ -67,7 +69,12 @@ class HungarianMatcher(nn.Module):
         cost_giou = -generalized_box_iou(box_cxcywh_to_xyxy(out_bbox), box_cxcywh_to_xyxy(tgt_bbox))
 
         cost = self.cost_bbox * cost_bbox + self.cost_class * cost_class + self.cost_giou * cost_giou
-        cost = torch.nan_to_num(cost.view(bs, num_queries, -1).cpu(), nan=1.0)
+        cost = cost.view(bs, num_queries, -1)
+        if batch_queries_num is not None:  # padded queries cost more than any real one
+            counts = torch.tensor(batch_queries_num).to(cost.device, non_blocking=True)
+            pad = torch.arange(num_queries, device=cost.device)[None, :] >= counts[:, None]
+            cost = cost.masked_fill(pad[..., None], 1e6)
+        cost = torch.nan_to_num(cost.cpu(), nan=1.0)
 
         sizes = [len(v["boxes"]) for v in targets]
         indices = [linear_sum_assignment(c[i]) for i, c in enumerate(cost.split(sizes, -1))]

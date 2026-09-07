@@ -424,11 +424,10 @@ class DomeCriterion(nn.Module):
 
         # match every prediction set, and build the union matching for the box losses
         main_outputs = {k: v for k, v in outputs.items() if "aux" not in k}
-        indices = self.matcher(main_outputs, targets)["indices"]
-        cached_indices = [
-            self.matcher(o, targets)["indices"] for o in outputs["aux_outputs"] + [outputs["pre_outputs"]]
-        ]
-        cached_indices_enc = [self.matcher(o, targets)["indices"] for o in outputs["enc_aux_outputs"]]
+        match = lambda o: self.matcher(o, targets, batch_queries_num=batch_queries_num)["indices"]  # noqa: E731
+        indices = match(main_outputs)
+        cached_indices = [match(o) for o in outputs["aux_outputs"] + [outputs["pre_outputs"]]]
+        cached_indices_enc = [match(o) for o in outputs["enc_aux_outputs"]]
         indices_go = self._union_indices(indices, cached_indices + cached_indices_enc)
         shared = (indices_go, self._average_over_ranks(sum(len(x[0]) for x in indices_go), device))
         num_boxes = self._average_over_ranks(sum(len(t["labels"]) for t in targets), device)
