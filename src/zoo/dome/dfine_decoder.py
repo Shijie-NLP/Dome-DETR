@@ -100,6 +100,7 @@ class TransformerDecoder(nn.Module):
         memory_mask=None,
         img_input=None,
         self_attn_q_scale=None,
+        fdr_min_unit=None,
     ):
         output = target
         output_detach = pred_corners_undetach = 0
@@ -135,7 +136,7 @@ class TransformerDecoder(nn.Module):
 
             # refine the edge distributions, carrying the previous layer's correction along
             pred_corners = bbox_head[i](output + output_detach) + pred_corners_undetach
-            inter_ref_bbox = distance2bbox(ref_points_initial, integral(pred_corners, project), reg_scale)
+            inter_ref_bbox = distance2bbox(ref_points_initial, integral(pred_corners, project), reg_scale, fdr_min_unit)
 
             if self.training or i == self.eval_idx:
                 scores = self.lqe_layers[i](score_head[i](output), pred_corners)
@@ -199,6 +200,10 @@ class DFINETransformer(nn.Module):
             the query's box; with a value above 0 that radius is at least so many cells on every
             level (1: the neighbouring cells), so a tiny box still reads its surroundings on the
             coarse levels (0: off).
+        min_refine_cells: the FDR layers move the box edges within a range proportional to the
+            first layer's box; with a value above 0 every edge can move at least so many cells of
+            the finest level whatever the box size, so a tiny box a cell off can still reach its
+            ground truth (0: off).
     """
 
     __share__ = ["num_classes", "eval_spatial_size"]
@@ -233,6 +238,7 @@ class DFINETransformer(nn.Module):
         attn_logn_scale=False,
         attn_logn_base=None,
         min_sample_cells=0.0,
+        min_refine_cells=0.0,
     ):
         super().__init__()
         assert len(feat_channels) <= num_levels
@@ -261,6 +267,7 @@ class DFINETransformer(nn.Module):
         self.local_attn_k = local_attn_k
         self.attn_logn_scale = attn_logn_scale
         self.attn_logn_base = attn_logn_base or num_queries
+        self.min_refine_cells = min_refine_cells
 
         # backbone feature projection
         self._build_input_proj_layer(feat_channels)
@@ -486,6 +493,10 @@ class DFINETransformer(nn.Module):
         num_dn = dn_meta["dn_num_split"][0] if dn_meta is not None else 0
         attn_mask = self._local_attn_mask(attn_mask, dec_in.boxes_unact, batch_queries_num, num_dn)
         q_scale = self._logn_scale(batch_queries_num, memory.device)
+        fdr_min_unit = None
+        if self.min_refine_cells > 0:  # so many cells of the finest level, normalized, (x, y)
+            h, w = spatial_shapes[0]
+            fdr_min_unit = torch.tensor([self.min_refine_cells / w, self.min_refine_cells / h], device=memory.device)
 
         out_bboxes, out_logits, out_corners, out_refs, pre_bboxes, pre_logits = self.decoder(
             init_ref_contents,
@@ -502,6 +513,7 @@ class DFINETransformer(nn.Module):
             attn_mask=attn_mask,
             img_input=img_inputs,
             self_attn_q_scale=q_scale,
+            fdr_min_unit=fdr_min_unit,
         )
 
         if dn_meta is not None:
@@ -527,6 +539,7 @@ class DFINETransformer(nn.Module):
             out["ref_points"] = out_refs[-1]
             out["up"] = self.up
             out["reg_scale"] = self.reg_scale
+            out["fdr_min_unit"] = fdr_min_unit
 
         if self.training and self.aux_loss:
             out["aux_outputs"] = self._layer_outputs(

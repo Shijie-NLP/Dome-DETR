@@ -229,7 +229,12 @@ class DomeCriterion(nn.Module):
         if getattr(self, cache) is None:
             with torch.no_grad():
                 distances = bbox2distance(
-                    ref_points, box_cxcywh_to_xyxy(target_boxes), self.reg_max, outputs["reg_scale"], outputs["up"]
+                    ref_points,
+                    box_cxcywh_to_xyxy(target_boxes),
+                    self.reg_max,
+                    outputs["reg_scale"],
+                    outputs["up"],
+                    min_unit=outputs.get("fdr_min_unit"),
                 )
             setattr(self, cache, distances)
         target_corners, weight_right, weight_left = getattr(self, cache)
@@ -476,6 +481,7 @@ class DomeCriterion(nn.Module):
         for i, aux in enumerate(outputs["aux_outputs"]):
             if "local" in self.losses:
                 aux["up"], aux["reg_scale"] = outputs["up"], outputs["reg_scale"]
+                aux["fdr_min_unit"] = outputs.get("fdr_min_unit")
             losses.update(block(aux, targets, cached_indices[i], f"_aux_{i}"))
 
         losses.update(block(outputs["pre_outputs"], targets, cached_indices[-1], "_pre"))
@@ -497,6 +503,7 @@ class DomeCriterion(nn.Module):
                 if "local" in self.losses:
                     dn["is_dn"] = True
                     dn["up"], dn["reg_scale"] = outputs["up"], outputs["reg_scale"]
+                    dn["fdr_min_unit"] = outputs.get("fdr_min_unit")
                 losses.update(block(dn, targets, indices_dn, f"_dn_{i}", **dn_args))
             losses.update(block(outputs["dn_pre_outputs"], targets, indices_dn, "_dn_pre", **dn_args))
 

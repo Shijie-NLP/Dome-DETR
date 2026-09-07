@@ -91,28 +91,42 @@ def translate_gt(gt, reg_max, reg_scale, up):
     return indices, weight_right, weight_left
 
 
-def distance2bbox(points, distance, reg_scale):
+def _edge_unit(points, reg_scale, min_unit):
+    """
+    The unit of the edge distances, ``(..., 2)`` for x and y: the reference size / reg_scale,
+    floored at ``min_unit / reg_scale`` (``min_unit``: ``(2,)`` normalized sizes, or ``None``).
+    """
+    size = points[..., 2:]
+    if min_unit is not None:
+        size = torch.maximum(size, min_unit.to(size.dtype))
+    return size / reg_scale
+
+
+def distance2bbox(points, distance, reg_scale, min_unit=None):
     """
     Boxes from reference boxes and predicted edge distances.
 
     Args:
         points (Tensor): ``(..., 4)`` reference boxes as [cx, cy, w, h].
-        distance (Tensor): ``(..., 4)`` distances to the left, top, right and bottom edges, in
-            units of the reference size / reg_scale, measured from half a reg_scale out.
+        distance (Tensor): ``(..., 4)`` distances of the left, top, right and bottom edges from
+            the reference box's edges, outwards positive, in units of the reference size /
+            reg_scale.
         reg_scale: curvature of W(n).
+        min_unit (Tensor): with a value, ``(2,)`` normalized sizes the reference size is floored
+            at in the unit, so a tiny reference box still leaves its edges room to move.
 
     Returns:
         Tensor: ``(..., 4)`` boxes as [cx, cy, w, h].
     """
-    reg_scale = abs(reg_scale)
-    x1 = points[..., 0] - (0.5 * reg_scale + distance[..., 0]) * (points[..., 2] / reg_scale)
-    y1 = points[..., 1] - (0.5 * reg_scale + distance[..., 1]) * (points[..., 3] / reg_scale)
-    x2 = points[..., 0] + (0.5 * reg_scale + distance[..., 2]) * (points[..., 2] / reg_scale)
-    y2 = points[..., 1] + (0.5 * reg_scale + distance[..., 3]) * (points[..., 3] / reg_scale)
+    unit = _edge_unit(points, abs(reg_scale), min_unit)
+    x1 = points[..., 0] - 0.5 * points[..., 2] - distance[..., 0] * unit[..., 0]
+    y1 = points[..., 1] - 0.5 * points[..., 3] - distance[..., 1] * unit[..., 1]
+    x2 = points[..., 0] + 0.5 * points[..., 2] + distance[..., 2] * unit[..., 0]
+    y2 = points[..., 1] + 0.5 * points[..., 3] + distance[..., 3] * unit[..., 1]
     return box_xyxy_to_cxcywh(torch.stack([x1, y1, x2, y2], -1))
 
 
-def bbox2distance(points, bbox, reg_max, reg_scale, up, eps=0.1):
+def bbox2distance(points, bbox, reg_max, reg_scale, up, eps=0.1, min_unit=None):
     """
     The inverse of ``distance2bbox`` for training targets: ground-truth boxes as binned edge
     distances (see ``translate_gt``), clamped to ``[0, reg_max - eps]``.
@@ -120,15 +134,17 @@ def bbox2distance(points, bbox, reg_max, reg_scale, up, eps=0.1):
     Args:
         points (Tensor): ``(n, 4)`` reference boxes as [cx, cy, w, h].
         bbox (Tensor): ``(n, 4)`` ground-truth boxes as [x1, y1, x2, y2].
+        min_unit: as in ``distance2bbox``.
 
     Returns:
         distances (4n,), weight_right (4n,), weight_left (4n,), all detached.
     """
     reg_scale = abs(reg_scale)
-    left = (points[:, 0] - bbox[:, 0]) / (points[..., 2] / reg_scale + 1e-16) - 0.5 * reg_scale
-    top = (points[:, 1] - bbox[:, 1]) / (points[..., 3] / reg_scale + 1e-16) - 0.5 * reg_scale
-    right = (bbox[:, 2] - points[:, 0]) / (points[..., 2] / reg_scale + 1e-16) - 0.5 * reg_scale
-    bottom = (bbox[:, 3] - points[:, 1]) / (points[..., 3] / reg_scale + 1e-16) - 0.5 * reg_scale
+    unit = _edge_unit(points, reg_scale, min_unit) + 1e-16
+    left = (points[:, 0] - 0.5 * points[:, 2] - bbox[:, 0]) / unit[:, 0]
+    top = (points[:, 1] - 0.5 * points[:, 3] - bbox[:, 1]) / unit[:, 1]
+    right = (bbox[:, 2] - points[:, 0] - 0.5 * points[:, 2]) / unit[:, 0]
+    bottom = (bbox[:, 3] - points[:, 1] - 0.5 * points[:, 3]) / unit[:, 1]
     four_lens = torch.stack([left, top, right, bottom], -1)
     four_lens, weight_right, weight_left = translate_gt(four_lens, reg_max, reg_scale, up)
     if reg_max is not None:
