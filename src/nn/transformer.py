@@ -179,9 +179,20 @@ class TransformerDecoderLayer(nn.Module):
     def forward_ffn(self, tgt):
         return self.linear2(self.dropout3(self.activation(self.linear1(tgt))))
 
-    def forward(self, target, reference_points, value, spatial_shapes, attn_mask=None, query_pos_embed=None):
-        # self attention
+    def forward(
+        self,
+        target,
+        reference_points,
+        value,
+        spatial_shapes,
+        attn_mask=None,
+        query_pos_embed=None,
+        self_attn_q_scale=None,
+    ):
+        # self attention; ``self_attn_q_scale`` [B, 1, 1] rescales the logits per image (log-n scaling)
         q = k = self.with_pos_embed(target, query_pos_embed)
+        if self_attn_q_scale is not None:
+            q = q * self_attn_q_scale
         target2, _ = self.self_attn(q, k, value=target, attn_mask=attn_mask)
         target = self.norm1(target + self.dropout1(target2))
 

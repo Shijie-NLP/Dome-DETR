@@ -14,6 +14,7 @@ mask how many are real.
 """
 
 import copy
+import math
 from collections import OrderedDict
 from typing import NamedTuple
 
@@ -98,6 +99,7 @@ class TransformerDecoder(nn.Module):
         attn_mask=None,
         memory_mask=None,
         img_input=None,
+        self_attn_q_scale=None,
     ):
         output = target
         output_detach = pred_corners_undetach = 0
@@ -121,7 +123,9 @@ class TransformerDecoder(nn.Module):
                 output = F.interpolate(output, size=query_pos_embed.shape[-1])
                 output_detach = output.detach()
 
-            output = layer(output, ref_points_input, value, spatial_shapes, attn_mask, query_pos_embed)
+            output = layer(
+                output, ref_points_input, value, spatial_shapes, attn_mask, query_pos_embed, self_attn_q_scale
+            )
 
             if i == 0:
                 # the first layer predicts plain boxes; they anchor the distributions of every layer
@@ -184,6 +188,13 @@ class DFINETransformer(nn.Module):
         query_select_method: how encoder tokens are ranked, ``default`` (best class score),
             ``one2many`` (every class score) or ``agnostic`` (a single objectness score).
         num_queries: the number of encoder tokens taken as initial queries.
+        local_attn_k: with a value above 0, every query attends (self-attention) only to the
+            ``local_attn_k`` queries nearest to it by initial box centre, itself included, so the
+            softmax runs over a fixed number of keys whatever the image's query count; 0 is full
+            attention. The neighbourhood comes from the initial boxes and is shared by all layers.
+        attn_logn_scale / attn_logn_base: scale the self-attention logits of every image by
+            ``log(n) / log(base)``, ``n`` its number of keys (the log-n scaling that keeps the
+            attention entropy stable across query counts); ``base`` defaults to ``num_queries``.
     """
 
     __share__ = ["num_classes", "eval_spatial_size"]
@@ -214,6 +225,9 @@ class DFINETransformer(nn.Module):
         reg_scale=4.0,
         layer_scale=1,
         num_queries=300,
+        local_attn_k=0,
+        attn_logn_scale=False,
+        attn_logn_base=None,
     ):
         super().__init__()
         assert len(feat_channels) <= num_levels
@@ -239,6 +253,9 @@ class DFINETransformer(nn.Module):
         self.num_queries = num_queries
         self.cross_attn_method = cross_attn_method
         self.query_select_method = query_select_method
+        self.local_attn_k = local_attn_k
+        self.attn_logn_scale = attn_logn_scale
+        self.attn_logn_base = attn_logn_base or num_queries
 
         # backbone feature projection
         self._build_input_proj_layer(feat_channels)
@@ -460,6 +477,9 @@ class DFINETransformer(nn.Module):
             init_ref_contents = torch.concat([denoising_logits, init_ref_contents], dim=1)
         else:
             attn_mask = self._padding_attn_mask(batch_queries_num, memory.device)
+        num_dn = dn_meta["dn_num_split"][0] if dn_meta is not None else 0
+        attn_mask = self._local_attn_mask(attn_mask, dec_in.boxes_unact, batch_queries_num, num_dn)
+        q_scale = self._logn_scale(batch_queries_num, memory.device)
 
         out_bboxes, out_logits, out_corners, out_refs, pre_bboxes, pre_logits = self.decoder(
             init_ref_contents,
@@ -475,6 +495,7 @@ class DFINETransformer(nn.Module):
             self.reg_scale,
             attn_mask=attn_mask,
             img_input=img_inputs,
+            self_attn_q_scale=q_scale,
         )
 
         if dn_meta is not None:
@@ -539,6 +560,42 @@ class DFINETransformer(nn.Module):
         real = torch.arange(num_queries, device=device)[None, :] < counts[:, None]  # [B, Q]
         mask = real[:, :, None] != real[:, None, :]  # True blocks attention
         return mask.repeat_interleave(self.nhead, dim=0)
+
+    def _local_attn_mask(self, attn_mask, boxes_unact, batch_queries_num, num_dn):
+        """
+        With ``local_attn_k``: the self-attention mask restricting every matching query to its
+        ``local_attn_k`` nearest matching queries by initial box centre (itself always allowed,
+        padding never), merged into ``attn_mask`` (the denoising or padding mask, or ``None``).
+        The denoising block of ``attn_mask``, if any, is left as it is.
+        """
+        if self.local_attn_k <= 0:
+            return attn_mask
+        b, q = boxes_unact.shape[:2]
+        k = min(self.local_attn_k, q)
+        device = boxes_unact.device
+        counts = torch.tensor(batch_queries_num, device=device)
+        real = torch.arange(q, device=device)[None, :] < counts[:, None]  # [B, Q]
+        centres = F.sigmoid(boxes_unact[..., :2].float())
+        dist = torch.cdist(centres, centres)  # [B, Q, Q]
+        dist = dist.masked_fill(~real[:, None, :], float("inf"))  # padding is never a neighbour
+        blocked = torch.ones((b, q, q), dtype=torch.bool, device=device)
+        blocked.scatter_(2, dist.topk(k, dim=-1, largest=False).indices, False)
+        blocked &= ~torch.eye(q, dtype=torch.bool, device=device)[None]  # every row keeps itself
+        blocked = blocked.repeat_interleave(self.nhead, dim=0)  # [B * heads, Q, Q]
+        if attn_mask is None:
+            return blocked
+        attn_mask = attn_mask.clone()
+        attn_mask[:, num_dn:, num_dn:] |= blocked
+        return attn_mask
+
+    def _logn_scale(self, batch_queries_num, device):
+        """With ``attn_logn_scale``: the per-image ``[B, 1, 1]`` factor ``log(n) / log(base)``."""
+        if not self.attn_logn_scale:
+            return None
+        n = torch.tensor(batch_queries_num, dtype=torch.float32, device=device).clamp(min=2)
+        if self.local_attn_k > 0:
+            n = n.clamp(max=self.local_attn_k)
+        return (n.log() / math.log(self.attn_logn_base)).view(-1, 1, 1)
 
     @staticmethod
     @torch.jit.unused
