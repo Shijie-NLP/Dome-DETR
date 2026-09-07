@@ -31,8 +31,8 @@ logit 0, can serve as the selection rule.
   forced tokens per level (``levels``: a drift of tiny objects' tokens towards coarse levels shows
   here).
 
-Host syncs: one per batch (the query counts), plus one boolean when a ground truth needs the
-nearest-free-token fallback.
+Host syncs per batch: one boolean per round of the forced-token pass (one or two rounds nearly
+always) and the query counts.
 """
 
 import torch
@@ -235,6 +235,7 @@ class MaxIoUTransformer(DFINETransformer):
         owner = torch.empty((b, n + 1), dtype=torch.long, device=device)
         gt = torch.arange(m, device=device)[None, :].expand(b, -1)
         left = gt_valid.clone()
+        pending = True
         for r in range(cand.shape[-1]):
             tok = cand[..., r]  # [B, M]
             want = left & (tok < n) & ~forced.gather(1, tok)
@@ -242,9 +243,12 @@ class MaxIoUTransformer(DFINETransformer):
             win = want & (owner.gather(1, tok) == gt)
             forced.scatter_(1, torch.where(win, tok, n), True)
             left &= ~win
+            pending = bool(left.any())  # one boolean per round; the first round covers nearly everything
+            if not pending:
+                break
         forced = forced[:, :n]
 
-        if left.any():  # one boolean; only when a ground truth's candidates all went to others
+        if pending:  # a ground truth's candidates all went to others
             cost = torch.where(valid[None, :] & ~forced, 0.0, float("inf")).to(pred_cxcywh.dtype)
             for i, j in left.nonzero().tolist():
                 dist = torch.cdist(gt_boxes[i, j : j + 1, :2], pred_cxcywh[i, :, :2]).squeeze(0) + cost[i]
