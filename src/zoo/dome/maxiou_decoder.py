@@ -14,8 +14,10 @@ the queries in training and inference alike; the decoder alone decides localizat
   (``loss_obj``, no IoU-aware target); the claimed tokens also get the box losses (``enc_dense``).
   No Hungarian on the encoder side. The objectness of a token is its highest class logit, and
   the decision boundary, logit 0, is the selection rule: no threshold to estimate or store.
-  ``last_assign_stats['selected']`` counts the claimed tokens the head already lets through, i.e.
-  its recall in training.
+  ``last_assign_stats`` reports, per image, the claimed tokens the head already lets through
+  (``selected``, i.e. its recall in training), how many claims came from the fallback and how
+  many claimed tokens lie on each level (``levels``: a drift of tiny objects' claims towards
+  coarse levels shows here).
 - Decoder queries, training: the claimed tokens (forced) plus every other token the objectness
   selects, floored at ``min_negatives`` of the latter and capped so an image has at most
   ``max(num_queries, #gt + min_negatives)`` queries. Every query is a real token with its own
@@ -163,7 +165,8 @@ class MaxIoUTransformer(DFINETransformer):
         self.min_queries = min_queries
         self.infer_rule = infer_rule
         # diagnostics of the last training forward, per image: ground truths, how many of their
-        # claimed tokens the objectness already lets through, and the rule-selected queries
+        # claimed tokens the objectness already lets through, the rule-selected queries, the claims
+        # that needed the fallback and the claimed tokens per level
         self.last_assign_stats = None
 
     # ------------------------------------------------------------------ ground-truth claims
@@ -263,8 +266,8 @@ class MaxIoUTransformer(DFINETransformer):
     def _claim(self, targets, pred_cxcywh, valid, spatial_shapes):
         """
         The tokens the ground truths claim: ``[B, M]`` token indices in ground-truth order (``-1``
-        only for padded ground truths), the padded ground-truth boxes ``[B, M, 4]`` and the number
-        of real ground truths per image.
+        only for padded ground truths), the padded ground-truth boxes ``[B, M, 4]``, the number
+        of real ground truths per image and how many of them needed the fallback, ``[B]``.
         """
         b, n = pred_cxcywh.shape[:2]
         num_gts = [t["boxes"].shape[0] for t in targets]
@@ -276,8 +279,9 @@ class MaxIoUTransformer(DFINETransformer):
             gt_valid[i, : num_gts[i]] = True
         cand_idx, cand_val = self._candidates(gt_boxes, gt_valid, pred_cxcywh, valid, spatial_shapes)
         assigned = self._resolve(cand_idx, cand_val, gt_valid, n)
+        fallen = ((assigned < 0) & gt_valid).sum(1)  # ground truths whose candidates all went to others
         assigned = self._fallback(assigned, gt_boxes, gt_valid, pred_cxcywh, valid)
-        return assigned, gt_boxes, num_gts
+        return assigned, gt_boxes, num_gts, fallen
 
     def _fallback(self, assigned, gt_cxcywh, gt_valid, pred_cxcywh, valid):
         """
@@ -393,26 +397,31 @@ class MaxIoUTransformer(DFINETransformer):
                 boxes_unact = inverse_sigmoid(take(all_boxes, index)).masked_fill(pad[..., None], 0)
                 return DecoderInput(contents, boxes_unact, [], [], batch_queries_num)
 
-            assigned, gt_boxes, num_gts = self._claim(targets, all_boxes, valid, spatial_shapes)  # [B, M]
+            assigned, gt_boxes, num_gts, fallen = self._claim(targets, all_boxes, valid, spatial_shapes)
             m = assigned.shape[1]
             num_gt = torch.tensor(num_gts, device=device)
             gt_valid = torch.arange(m, device=device)[None, :] < num_gt[:, None]
             claimed = assigned.clamp(min=0)  # padding rows point at token 0 and are masked below
             claimed_passed = (take(scores.unsqueeze(-1), claimed).squeeze(-1) > 0) & gt_valid
+            # the claimed tokens per level, [B, L]
+            ends = torch.tensor([h * w for h, w in spatial_shapes]).cumsum(0).to(device, non_blocking=True)
+            level = F.one_hot(torch.bucketize(claimed, ends, right=True), len(spatial_shapes))
+            per_level = level.masked_fill(~gt_valid[..., None], 0).sum(1)
 
             # rule-selected queries: the unclaimed tokens the objectness passes, floored and capped
             passed_free = passed.sum(1) - claimed_passed.sum(1)
             cap = (self.num_queries - num_gt).clamp(min=self.min_negatives)
             rule_count = passed_free.clamp(min=self.min_negatives).minimum(cap).clamp(max=n - num_gt)
-            index, pad, batch_queries_num, rule_list, selected = layout(
-                assigned, num_gt, rule_count, claimed_passed.sum(1)
+            index, pad, batch_queries_num, rule_list, selected, fell, *levels = layout(
+                assigned, num_gt, rule_count, claimed_passed.sum(1), fallen, *per_level.unbind(1)
             )
 
             contents = take(output_memory, index).masked_fill(pad[..., None], 0)
             boxes_unact = inverse_sigmoid(take(all_boxes, index)).masked_fill(pad[..., None], 0)
 
             self.last_assign_stats = [
-                {"num_gt": g, "selected": s, "rule": c} for g, s, c in zip(num_gts, selected, rule_list)
+                {"num_gt": g, "selected": s, "rule": c, "fallback": f, "levels": lv}
+                for g, s, c, f, *lv in zip(num_gts, selected, rule_list, fell, *levels)
             ]
 
         # the encoder's dense outputs: every token's class logits, and the claimed tokens' boxes
