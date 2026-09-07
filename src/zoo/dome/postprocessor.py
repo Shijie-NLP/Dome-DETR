@@ -61,7 +61,7 @@ class DomePostProcessor(nn.Module):
             scores, labels = scores.max(dim=-1)
             scores, index = torch.topk(scores, k, dim=-1)
             labels = labels.gather(dim=1, index=index)
-        boxes = bbox_pred.gather(dim=1, index=index.unsqueeze(-1).repeat(1, 1, 4))
+        boxes = bbox_pred.gather(dim=1, index=index.unsqueeze(-1).expand(-1, -1, 4))
 
         if self.deploy_mode:
             return labels, boxes, scores

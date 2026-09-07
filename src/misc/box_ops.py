@@ -49,10 +49,11 @@ def box_iou(boxes1: Tensor, boxes2: Tensor) -> tuple[Tensor, Tensor]:
 
 
 def generalized_box_iou(boxes1: Tensor, boxes2: Tensor) -> Tensor:
-    """Pairwise generalized IoU (https://giou.stanford.edu/) of xyxy boxes, ``[N, M]``."""
-    # degenerate boxes give inf / nan results, so check early
-    assert (boxes1[:, 2:] >= boxes1[:, :2]).all()
-    assert (boxes2[:, 2:] >= boxes2[:, :2]).all()
+    """
+    Pairwise generalized IoU (https://giou.stanford.edu/) of xyxy boxes, ``[N, M]``. The boxes
+    must be well formed (``x2 >= x1``, ``y2 >= y1``; ``box_cxcywh_to_xyxy`` guarantees it), or
+    the result is inf / nan; there is no check, which would be a host sync per call.
+    """
     iou, union = box_iou(boxes1, boxes2)
 
     lt = torch.min(boxes1[:, None, :2], boxes2[:, :2])
@@ -89,13 +90,16 @@ def gaussian_box_similarity(boxes1: Tensor, boxes2: Tensor, eps: float = 1e-6) -
     centre = (boxes1[..., :2] - boxes2[..., :2]) ** 2 / size_sq
     size = 0.5 * torch.log(size_sq / (2 * size1 * size2))
     coefficient = torch.exp(-(centre + size).sum(-1))
-    return 1 - (1 - coefficient).clamp(min=0).sqrt()
+    # the square root's gradient is infinite at 0 (identical boxes): floored at eps^2, so the
+    # similarity of identical boxes is 1 - eps and its gradient there 0
+    return 1 - (1 - coefficient).clamp(min=eps**2).sqrt()
 
 
 def elementwise_generalized_box_iou(boxes1: Tensor, boxes2: Tensor) -> Tensor:
-    """Generalized IoU of the i-th box of each set, ``[N]`` (the diagonal of ``generalized_box_iou``)."""
-    assert (boxes1[:, 2:] >= boxes1[:, :2]).all()
-    assert (boxes2[:, 2:] >= boxes2[:, :2]).all()
+    """
+    Generalized IoU of the i-th box of each set, ``[N]`` (the diagonal of ``generalized_box_iou``;
+    well-formed boxes, as there).
+    """
     iou, union = elementwise_box_iou(boxes1, boxes2)
     lt = torch.min(boxes1[:, :2], boxes2[:, :2])
     rb = torch.max(boxes1[:, 2:], boxes2[:, 2:])
