@@ -20,6 +20,7 @@ from ._utils import unpack_inputs
 RandomPhotometricDistort = register()(T.RandomPhotometricDistort)
 RandomZoomOut = register()(T.RandomZoomOut)
 RandomHorizontalFlip = register()(T.RandomHorizontalFlip)
+RandomVerticalFlip = register()(T.RandomVerticalFlip)
 Resize = register()(T.Resize)
 SanitizeBoundingBoxes = register()(T.SanitizeBoundingBoxes)
 RandomCrop = register()(T.RandomCrop)
@@ -64,6 +65,35 @@ class PadToSize(T.Pad):
         if len(outputs) > 1 and isinstance(outputs[1], dict):
             outputs[1]["padding"] = torch.tensor(self.padding)
         return outputs
+
+
+@register()
+class RandomRotate90(T.Transform):
+    """
+    Rotate the image, boxes and masks by a random multiple of 90 degrees, exactly (no
+    resampling, axis-aligned boxes stay exact). With probability ``p`` the rotation is 90, 180
+    or 270 degrees, equally likely; 0.75 makes the four orientations equally likely. For
+    aerial imagery, where every orientation is as natural as any other.
+    """
+
+    _transformed_types = (PIL.Image.Image, Image, Video, Mask, BoundingBoxes)
+
+    def __init__(self, p: float = 0.75) -> None:
+        super().__init__()
+        self.p = p
+
+    def make_params(self, flat_inputs: list[Any]) -> dict[str, Any]:
+        turns = int(torch.randint(1, 4, ())) if torch.rand(1) < self.p else 0
+        return {"angle": 90 * turns}
+
+    _get_params = make_params  # torchvision before 0.20
+
+    def transform(self, inpt: Any, params: dict[str, Any]) -> Any:
+        if params["angle"] == 0:
+            return inpt
+        return F.rotate(inpt, params["angle"], expand=True)
+
+    _transform = transform  # torchvision before 0.20
 
 
 @register()
