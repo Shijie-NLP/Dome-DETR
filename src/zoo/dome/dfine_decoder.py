@@ -15,6 +15,7 @@ mask how many are real.
 
 import copy
 from collections import OrderedDict
+from typing import NamedTuple
 
 import torch
 import torch.nn as nn
@@ -157,6 +158,17 @@ class TransformerDecoder(nn.Module):
             pre_bboxes,
             pre_scores,
         )
+
+
+class DecoderInput(NamedTuple):
+    """What ``_get_decoder_input`` hands the decoder (and, in training, the criterion)."""
+
+    contents: torch.Tensor  # [B, Q, D] initial query contents, detached
+    boxes_unact: torch.Tensor  # [B, Q, 4] initial boxes as logits, detached
+    enc_bboxes_list: list  # encoder-side predictions for the auxiliary loss, one set per entry
+    enc_logits_list: list
+    batch_queries_num: list  # the real query count of every image (the rest is padding)
+    extra: dict | None = None  # more training outputs, merged into the decoder's output dict
 
 
 @register()
@@ -387,9 +399,10 @@ class DFINETransformer(nn.Module):
         """
         The initial queries: the ``num_queries`` best encoder tokens. Returns their contents and
         boxes (as logits, both detached), the encoder-side predictions for the auxiliary loss,
-        and the query count of every image (the same for all here). A subclass with a
-        per-image query count pads its queries to the largest and reports the real counts.
-        ``targets`` (training only) lets a subclass choose queries by ground truth.
+        and the query count of every image (the same for all here), as a ``DecoderInput``. A
+        subclass with a per-image query count pads its queries to the largest and reports the real
+        counts; ``targets`` (training only) lets it choose queries by ground truth, and ``extra``
+        carries any further training outputs to the criterion.
         """
         anchors, valid_mask = self._generate_anchors(spatial_shapes, device=memory.device)
         if memory.shape[0] > 1:
@@ -407,7 +420,7 @@ class DFINETransformer(nn.Module):
         enc_topk_bboxes_list = [F.sigmoid(topk_bbox_unact)]
         enc_topk_logits_list = [topk_logits]
         batch_queries_num = [self.num_queries] * memory.shape[0]
-        return (
+        return DecoderInput(
             topk_memory.detach(),
             topk_bbox_unact.detach(),
             enc_topk_bboxes_list,
@@ -423,9 +436,10 @@ class DFINETransformer(nn.Module):
 
         _, memory, spatial_shapes = self._get_encoder_input(feats)
 
-        init_ref_contents, init_ref_points_unact, enc_topk_bboxes_list, enc_topk_logits_list, batch_queries_num = (
-            self._get_decoder_input(memory, spatial_shapes, encoder_out, targets)
-        )
+        dec_in = self._get_decoder_input(memory, spatial_shapes, encoder_out, targets)
+        init_ref_contents, init_ref_points_unact = dec_in.contents, dec_in.boxes_unact
+        enc_topk_bboxes_list, enc_topk_logits_list = dec_in.enc_bboxes_list, dec_in.enc_logits_list
+        batch_queries_num = dec_in.batch_queries_num
         num_queries = max(batch_queries_num)
 
         # denoising queries are prepended to the matching queries during training
@@ -487,6 +501,8 @@ class DFINETransformer(nn.Module):
             ]
             out["pre_outputs"] = {"pred_logits": pre_logits, "pred_boxes": pre_bboxes}
             out["enc_meta"] = {"class_agnostic": self.query_select_method == "agnostic"}
+            if dec_in.extra:
+                out.update(dec_in.extra)
 
             if dn_meta is not None:
                 out["dn_outputs"] = self._layer_outputs(

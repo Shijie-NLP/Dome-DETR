@@ -15,7 +15,7 @@ import torch.nn.functional as F  # noqa: N812
 
 from ...core import register
 from ...misc.box_ops import box_cxcywh_to_xyxy
-from .dfine_decoder import DFINETransformer
+from .dfine_decoder import DecoderInput, DFINETransformer
 from .dynamic_nms import dynamic_nms
 
 __all__ = ["DomeTransformer"]
@@ -179,7 +179,7 @@ class DomeTransformer(DFINETransformer):
         # the criterion masks the padded entries with batch_queries_num
         enc_topk_bboxes_list = [F.sigmoid(padded_bbox_unact)]
         enc_topk_logits_list = [padded_logits]
-        return (
+        return DecoderInput(
             padded_memory.detach(),
             padded_bbox_unact.detach(),
             enc_topk_bboxes_list,
