@@ -174,47 +174,51 @@ class MaxIoUTransformer(DFINETransformer):
         Each ground truth's ``assign_candidates`` best tokens, ``[B, M, K]`` indices and match
         values (best first), over ``gt_cxcywh [B, M, 4]`` (``gt_valid [B, M]`` marks padding) and
         ``pred_cxcywh [B, N, 4]``. The candidates are the tokens of the window of
-        ``2 * assign_radius + 1`` cells around the ground truth's centre cell on every level,
-        found by index arithmetic; invalid tokens never qualify. A token index of ``N`` in the
-        result is a dummy (its value is ``-inf``).
+        ``2 * assign_radius + 1`` cells around the ground truth's centre cell (clamped to the grid)
+        on every level, found by index arithmetic; invalid tokens never qualify. A token index of
+        ``N`` in the result is a dummy (its value is ``-inf``).
         """
         b, m = gt_cxcywh.shape[:2]
         n = pred_cxcywh.shape[1]
         device = gt_cxcywh.device
         r = self.assign_radius
-        offs = torch.arange(-r, r + 1, device=device)
+        i32 = torch.int32  # the index arithmetic (N < 2^31); int64 only where gather needs it
+        offs = torch.arange(-r, r + 1, dtype=i32, device=device)
         dy, dx = torch.meshgrid(offs, offs, indexing="ij")
-        dy, dx = dy.reshape(-1), dx.reshape(-1)  # [(2r+1)^2]
+        dy, dx = dy.reshape(-1), dx.reshape(-1)  # [P], P = (2r+1)^2
 
-        cand, start = [], 0
-        for h, w in spatial_shapes:
-            col = (gt_cxcywh[..., 0] * w).floor().long()  # [B, M]
-            row = (gt_cxcywh[..., 1] * h).floor().long()
-            cc, rr = col[..., None] + dx, row[..., None] + dy  # [B, M, (2r+1)^2]
-            inside = (cc >= 0) & (cc < w) & (rr >= 0) & (rr < h)
-            idx = start + rr.clamp(0, h - 1) * w + cc.clamp(0, w - 1)
-            cand.append(torch.where(inside, idx, n))  # n is the dummy token
-            start += h * w
-        cand = torch.cat(cand, dim=-1)  # [B, M, C]
+        # the windows of every level at once (the level sizes reach the device without a stream sync)
+        hw = torch.tensor(spatial_shapes, dtype=i32).to(device, non_blocking=True)  # [L, 2]
+        h, w = hw[:, 0], hw[:, 1]
+        start = (h * w).cumsum(0, dtype=i32) - h * w  # each level's first token, [L]
+        # the centre cell, clamped to the grid: a centre on the far border lies in the last cell
+        col = torch.minimum((gt_cxcywh[..., 0, None] * w).to(i32).clamp_(min=0), w - 1)  # [B, M, L]
+        row = torch.minimum((gt_cxcywh[..., 1, None] * h).to(i32).clamp_(min=0), h - 1)
+        cc, rr = col[..., None] + dx, row[..., None] + dy  # [B, M, L, P]
+        inside = (cc >= 0) & (cc < w[:, None]) & (rr >= 0) & (rr < h[:, None])
+        idx = rr.mul_(w[:, None]).add_(cc).add_(start[:, None])
+        cand = torch.where(inside, idx, n).flatten(2).long()  # [B, M, C]; n is the dummy token
 
-        pred_pad = torch.cat([pred_cxcywh, pred_cxcywh.new_zeros((b, 1, 4))], dim=1)
-        valid_pad = torch.cat([valid, valid.new_zeros(1)])
-        boxes = pred_pad.gather(1, cand.flatten(1).unsqueeze(-1).expand(-1, -1, 4)).view(b, m, -1, 4)
-        ok = valid_pad[cand]  # dummy and invalid tokens out
+        # the metric's features of every token and ground truth, the candidates' gathered through
+        # a zero row for the dummy token, [B, M, C, 4]
         if self.assign_metric == "nwd":
             # exp(-W2 / C) is monotone in the Wasserstein distance between the boxes' Gaussians, so
             # ranking by the plain distance in (cx, cy, w/2, h/2) space is the same ranking
-            gt_pts = torch.cat([gt_cxcywh[..., :2], gt_cxcywh[..., 2:] / 2], dim=-1)
-            pts = torch.cat([boxes[..., :2], boxes[..., 2:] / 2], dim=-1)
-            match = -(pts - gt_pts[:, :, None, :]).norm(dim=-1)
+            feat = torch.cat([pred_cxcywh[..., :2], pred_cxcywh[..., 2:] / 2], dim=-1)
+            gt_feat = torch.cat([gt_cxcywh[..., :2], gt_cxcywh[..., 2:] / 2], dim=-1)
         else:
-            iou, giou = _pair_iou_giou(box_cxcywh_to_xyxy(gt_cxcywh)[:, :, None, :], box_cxcywh_to_xyxy(boxes))
+            feat, gt_feat = box_cxcywh_to_xyxy(pred_cxcywh), box_cxcywh_to_xyxy(gt_cxcywh)
+        feat = torch.cat([feat, feat.new_zeros((b, 1, 4))], dim=1)
+        feat = feat.gather(1, cand.flatten(1).unsqueeze(-1).expand(-1, -1, 4)).view(b, m, -1, 4)
+        if self.assign_metric == "nwd":
+            match = -(feat - gt_feat[:, :, None, :]).norm(dim=-1)
+        else:
+            iou, giou = _pair_iou_giou(gt_feat[:, :, None, :], feat)
             match = iou if self.assign_metric == "iou" else giou
-        match = match.masked_fill(~ok | ~gt_valid[..., None], float("-inf"))
-        k = min(self.assign_candidates, match.shape[-1])
-        best = match.topk(k, dim=-1)
-        idx = cand.gather(-1, best.indices)
-        return torch.where(best.values.isfinite(), idx, torch.full_like(idx, n)), best.values
+        ok = torch.cat([valid, valid.new_zeros(1)])[cand] & gt_valid[..., None]  # dummy, invalid, padding out
+        match = match.masked_fill_(~ok, float("-inf"))
+        best = match.topk(min(self.assign_candidates, match.shape[-1]), dim=-1)
+        return torch.where(best.values.isfinite(), cand.gather(-1, best.indices), n), best.values
 
     def _resolve(self, cand_idx, cand_val, gt_valid, n_tokens):
         """
