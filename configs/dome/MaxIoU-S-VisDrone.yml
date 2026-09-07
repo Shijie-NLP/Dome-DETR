@@ -75,6 +75,9 @@ DomeCriterion:
   enc_matching: topk
   enc_topk: 3
   enc_in_uni_set: False
+  # the positives' targets stay 1 (every one of the enc_topk tokens must pass, for recall) but their
+  # shares of the loss follow their Gaussian similarity: a token whose box is well off pushes less
+  obj_quality_weight: True
   # the VFL target of the decoder's queries: the boxes' Gaussian similarity (1 - Hellinger distance),
   # parameter-free and about three times less sensitive to a pixel of offset on a tiny box than
   # IoU, whose target jumps with the box head's normal jitter; iou (D-FINE), giou or nwd to ablate

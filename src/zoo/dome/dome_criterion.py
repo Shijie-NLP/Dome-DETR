@@ -75,6 +75,10 @@ class DomeCriterion(nn.Module):
         mal_alpha: the negative weight of the MAL loss (``None``: 1).
         use_uni_set: match the box and localization losses against the union of the matches of
             every prediction set (D-FINE's 'go' indices) rather than each set's own.
+        obj_quality_weight: in ``loss_obj``, share the positive half among the positives in
+            proportion to their ``quality`` (the pair's Gaussian similarity with ``gaussian``)
+            instead of equally: the targets stay 1, so every positive is still pushed past the
+            boundary (recall), but a positive whose box is well off its ground truth pushes less.
         obj_pos_weight: in the 0/1 classification loss (``loss_obj``, a class-balanced BCE over
             every (query, class) entry, the matched queries' ground-truth class positive),
             how much more the positive half weighs than the negative half; 1 is the balanced
@@ -104,6 +108,7 @@ class DomeCriterion(nn.Module):
         enc_matching="hungarian",
         enc_topk=3,
         enc_in_uni_set=True,
+        obj_quality_weight=False,
         obj_pos_weight=1.0,
     ):
         super().__init__()
@@ -128,6 +133,7 @@ class DomeCriterion(nn.Module):
         self.density_recall_penalty = density_recall_penalty
         self.mal_alpha = mal_alpha
         self.use_uni_set = use_uni_set
+        self.obj_quality_weight = obj_quality_weight
         self.obj_pos_weight = obj_pos_weight
         self._clear_cache()
 
@@ -348,21 +354,28 @@ class DomeCriterion(nn.Module):
         Plain 0/1 classification, no IoU-aware target: a class-balanced BCE over every (query,
         class) entry of ``pred_logits [B, Q, C]``. The matched queries are positive on their
         ground-truth class (class 0 when ``C`` is 1), every other entry negative; each half is
-        normalized to weight 1/2 and the positive half scaled by ``obj_pos_weight``, so the
-        decision boundary is logit 0. Padded queries are left out.
+        normalized to weight 1/2 (the positives' shares equal, or with ``obj_quality_weight`` in
+        proportion to their ``quality``) and the positive half scaled by ``obj_pos_weight``, so
+        the decision boundary is logit 0. Padded queries are left out.
         """
         logits = outputs["pred_logits"].float()  # the weights are built in fp32 under autocast too
         target = torch.zeros_like(logits)
+        share = torch.zeros(logits.shape[:2], device=logits.device)  # each positive query's share of the positive half
         for i, (src, tgt) in enumerate(indices):
             cls = targets[i]["labels"][tgt] if logits.shape[-1] > 1 else torch.zeros_like(tgt)
             target[i, src, cls] = 1.0
+            share[i, src] = 1.0
+        if self.obj_quality_weight:
+            idx, src_boxes, target_boxes = self._matched_boxes(outputs, targets, indices)
+            share[idx] = self._matched_quality(src_boxes.detach(), target_boxes).to(share.dtype)
         keep = torch.ones_like(logits, dtype=torch.bool)
         if batch_queries_num is not None:
             counts = torch.tensor(batch_queries_num).to(logits.device, non_blocking=True)
             keep &= (torch.arange(logits.shape[1], device=logits.device)[None, :] < counts[:, None])[..., None]
         pos, neg = (target > 0) & keep, (target == 0) & keep
         weight = torch.zeros_like(logits)
-        weight[pos] = 0.5 * self.obj_pos_weight / pos.sum().clamp(min=1)
+        share = share[..., None].expand_as(logits)[pos]
+        weight[pos] = 0.5 * self.obj_pos_weight * share / share.sum().clamp(min=1e-6)
         weight[neg] = 0.5 / neg.sum().clamp(min=1)
         return {"loss_obj": F.binary_cross_entropy_with_logits(logits, target, weight=weight, reduction="sum")}
 
