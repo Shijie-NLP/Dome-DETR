@@ -42,7 +42,7 @@ MaxIoUTransformer:
   infer_rule: objectness   # or topk, the plain D-FINE selection
   # query self-attention: each query sees its local_attn_k nearest queries (0: all); or keep full
   # attention and rescale the logits by log(n)/log(num_queries) so the entropy does not grow with n
-  local_attn_k: 32
+  local_attn_k: 64
   attn_logn_scale: False
   # how a ground truth ranks the tokens' boxes: nwd (the AI-TOD line's metric: a small box that just
   # misses a tiny ground truth still beats a coarse-level box that merely contains it, which under
