@@ -50,8 +50,15 @@ class DomeCriterion(nn.Module):
             ``['obj', 'boxes']`` trains the encoder's class logits as plain 0/1 objectness.
         alpha, gamma: the focal parameters of the classification losses.
         reg_max: the FDR bin count of the decoder.
+        quality: the localization quality of a matched pair, the VFL / MAL target score and the
+            FGL weight: ``iou`` (D-FINE), ``giou`` (clamped at 0), ``nwd`` (the normalized Gaussian
+            Wasserstein distance, ``exp(-W2 / nwd_c)``) or ``gaussian`` (one minus the Hellinger
+            distance between the boxes as Gaussians: parameter-free, scale-invariant, smooth,
+            and defined for boxes that do not overlap; about three times less sensitive to a
+            small offset than IoU, which is what tiny objects need).
+        nwd_c: the ``nwd`` constant, in normalized units (0.016 is 12.8 px of an 800 px image).
         boxes_weight_format: ``None``, ``iou`` or ``giou``: weight the GIoU loss and the VFL / MAL
-            targets by the matched pairs' (G)IoU instead of the loss's own IoU.
+            targets by the matched pairs' (G)IoU instead of ``quality``.
         defe_density_map_weight, density_recall_penalty: the density-map loss weight, and how
             much harder under-estimation of populated cells is penalised.
         mal_alpha: the negative weight of the MAL loss (``None``: 1).
@@ -75,6 +82,8 @@ class DomeCriterion(nn.Module):
         gamma=2.0,
         num_classes=80,
         reg_max=32,
+        quality="iou",
+        nwd_c=0.016,
         boxes_weight_format=None,
         defe_density_map_weight=4,
         density_recall_penalty=0.3,
@@ -89,6 +98,9 @@ class DomeCriterion(nn.Module):
         self.weight_dict = weight_dict
         self.losses = losses
         self.enc_losses = enc_losses
+        assert quality in ("iou", "giou", "nwd", "gaussian"), quality
+        self.quality = quality
+        self.nwd_c = nwd_c
         self.boxes_weight_format = boxes_weight_format
         self.alpha = alpha
         self.gamma = gamma
@@ -122,9 +134,25 @@ class DomeCriterion(nn.Module):
         target_boxes = torch.cat([t["boxes"][i] for t, (_, i) in zip(targets, indices)], dim=0)
         return idx, src_boxes, target_boxes
 
-    @staticmethod
-    def _matched_ious(src_boxes, target_boxes):
-        return elementwise_box_iou(box_cxcywh_to_xyxy(src_boxes), box_cxcywh_to_xyxy(target_boxes))[0]
+    def _matched_quality(self, src_boxes, target_boxes):
+        """The localization quality of matched pairs of cxcywh boxes, ``[K]`` in [0, 1], by ``quality``."""
+        if self.quality == "iou":
+            return elementwise_box_iou(box_cxcywh_to_xyxy(src_boxes), box_cxcywh_to_xyxy(target_boxes))[0]
+        if self.quality == "giou":
+            giou = elementwise_generalized_box_iou(box_cxcywh_to_xyxy(src_boxes), box_cxcywh_to_xyxy(target_boxes))
+            return giou.clamp(min=0)
+        if self.quality == "nwd":
+            delta = src_boxes - target_boxes
+            w2 = torch.cat([delta[:, :2], delta[:, 2:] / 2], dim=-1).norm(dim=-1)  # in (cx, cy, w/2, h/2)
+            return torch.exp(-w2 / self.nwd_c)
+        # gaussian: a box is the Gaussian N((cx, cy), diag((w/2)^2, (h/2)^2)); per axis the
+        # Bhattacharyya distance of two Gaussians is dc^2 / (w1^2 + w2^2) + ln((w1^2 + w2^2) / (2 w1 w2)) / 2,
+        # the coefficient is exp(-distance) and the Hellinger distance sqrt(1 - coefficient)
+        size_sq = src_boxes[:, 2:].clamp(min=1e-6) ** 2 + target_boxes[:, 2:].clamp(min=1e-6) ** 2
+        centre = (src_boxes[:, :2] - target_boxes[:, :2]) ** 2 / size_sq
+        size = 0.5 * torch.log(size_sq / (2 * src_boxes[:, 2:].clamp(min=1e-6) * target_boxes[:, 2:].clamp(min=1e-6)))
+        coefficient = torch.exp(-(centre + size).sum(-1))
+        return 1 - (1 - coefficient).clamp(min=0).sqrt()
 
     def _class_targets(self, src_logits, targets, indices, idx):
         """Per-query target class (``num_classes`` = background) and its one-hot over the real classes."""
@@ -154,10 +182,10 @@ class DomeCriterion(nn.Module):
         return {"loss_focal": self._reduce_query_loss(loss, batch_queries_num, num_boxes)}
 
     def _iou_aware_targets(self, outputs, targets, indices, values):
-        """Shared by VFL and MAL: the one-hot targets with the matched IoU (or ``values``) as the positive score."""
+        """Shared by VFL and MAL: the one-hot targets with the matched quality (or ``values``) as the positive score."""
         src_logits = outputs["pred_logits"]
         idx, src_boxes, target_boxes = self._matched_boxes(outputs, targets, indices)
-        ious = self._matched_ious(src_boxes, target_boxes).detach() if values is None else values
+        ious = self._matched_quality(src_boxes, target_boxes).detach() if values is None else values
         target_classes, target = self._class_targets(src_logits, targets, indices, idx)
         target_score = torch.zeros_like(target_classes, dtype=src_logits.dtype)
         target_score[idx] = ious.to(target_score.dtype)
@@ -212,7 +240,7 @@ class DomeCriterion(nn.Module):
             setattr(self, cache, distances)
         target_corners, weight_right, weight_left = getattr(self, cache)
 
-        ious = self._matched_ious(src_boxes, target_boxes)
+        ious = self._matched_quality(src_boxes, target_boxes)
         weight_targets = ious.unsqueeze(-1).repeat(1, 4).reshape(-1).detach()
         losses = {
             "loss_fgl": self.unimodal_distribution_focal_loss(
