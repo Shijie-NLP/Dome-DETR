@@ -1,0 +1,86 @@
+# MaxIoU-S on VisDrone2019-DET: the D-FINE-S baseline recipe (plain HybridEncoder, no DeFE / MWAS)
+# with the ground-truth-claimed query initialization and no denoising. At training every ground
+# truth claims the encoder token whose box matches it best (plus a runner-up) and the rest of the
+# budget is top-k by score; at inference it is the plain top-k of D-FINE.
+
+__include__: [
+  '../dataset/visdrone_detection.yml',
+  '../runtime.yml',
+  './include/dataloader.yml',
+  './include/optimizer.yml',
+  './include/dome_hgnetv2.yml',
+]
+
+output_dir: ./outputs/maxiou_s_visdrone
+
+DOME:
+  encoder: HybridEncoder
+  decoder: MaxIoUTransformer
+
+HGNetv2:
+  name: 'B0'
+  return_idx: [0, 1, 2, 3]
+  freeze_at: -1
+  freeze_norm: False
+  use_lab: True
+
+HybridEncoder:
+  in_channels: [64, 256, 512, 1024]
+  depth_mult: .34
+  expansion: 0.5
+
+MaxIoUTransformer:
+  num_layers: 3
+  num_queries: 2000    # the most queries an image gets (memory guard, training and inference)
+  num_denoising: 0   # the ground truths' claimed tokens replace the denoising queries
+  # the encoder's class logits are trained on 0/1 targets (class-balanced BCE, the claimed token's
+  # class positive); their maximum is the objectness that picks the queries in training and
+  # inference alike at its decision boundary, logit 0
+  min_negatives: 100   # training: the least rule-selected queries per image
+  min_queries: 100     # inference: the least queries per image; num_queries is only a memory guard
+  infer_rule: objectness   # or topk, the plain D-FINE selection
+  # query self-attention: each query sees its local_attn_k nearest queries (0: all); or keep full
+  # attention and rescale the logits by log(n)/log(num_queries) so the entropy does not grow with n
+  local_attn_k: 32
+  attn_logn_scale: False
+  # how a ground truth claims a token: giou (default), iou, or nwd (the AI-TOD line's metric)
+  assign_metric: giou
+  assign_candidates: 8   # candidates per ground truth, and max conflict-resolution rounds
+  assign_radius: 1       # candidates: the 3x3 cells around the ground truth's centre, per level
+  assign_chunk: 256      # ground truths per chunk of the fallback's distance matrix
+
+
+optimizer:
+  type: AdamW
+  params:
+    -
+      params: '^(?=.*backbone)(?!.*(?:norm|bn)).*$'
+      lr: 0.00002
+    -
+      params: '^(?=.*backbone)(?=.*(?:norm|bn)).*$'
+      lr: 0.00002
+      weight_decay: 0.
+    -
+      params: '^(?=.*(?:encoder|decoder))(?=.*(?:norm|bn|bias)).*$'
+      weight_decay: 0.
+
+  lr: 0.0002
+  betas: [0.9, 0.999]
+  weight_decay: 0.000065
+
+lr_scheduler:
+  type: MultiStepLR
+  milestones: [80, 120]
+  gamma: 0.8
+
+
+# 160 epochs; augmentation and multi-scale training stop at 108 and the last 52 epochs
+# train on clean images
+epoches: 160
+train_dataloader:
+  dataset:
+    transforms:
+      policy:
+        epoch: 108
+  collate_fn:
+    stop_epoch: 108

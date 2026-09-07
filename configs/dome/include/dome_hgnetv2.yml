@@ -94,3 +94,7 @@ DomeCriterion:
 
 DomeTransformer:
   <<: *dfine_transformer
+
+# MaxIoUTransformer merges the same settings and claims queries by ground truth at training time.
+MaxIoUTransformer:
+  <<: *dfine_transformer
