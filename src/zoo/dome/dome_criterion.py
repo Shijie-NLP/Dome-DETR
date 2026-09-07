@@ -118,6 +118,7 @@ class DomeCriterion(nn.Module):
         # regress from the first layer's reference boxes), and so are the DDF normalisers
         self.fgl_targets, self.fgl_targets_dn = None, None
         self.num_pos, self.num_neg = None, None
+        self.matched = {}  # (set, matching) -> the matched pairs, gathered once per forward
 
     # ------------------------------------------------------------------ matched pairs
 
@@ -130,10 +131,13 @@ class DomeCriterion(nn.Module):
 
     def _matched_boxes(self, outputs, targets, indices):
         """The matched predictions' index, their boxes and the target boxes they are matched to (cxcywh)."""
-        idx = self._get_src_permutation_idx(indices)
-        src_boxes = outputs["pred_boxes"][idx]
-        target_boxes = torch.cat([t["boxes"][i] for t, (_, i) in zip(targets, indices)], dim=0)
-        return idx, src_boxes, target_boxes
+        key = (id(outputs), id(indices))
+        if key not in self.matched:
+            idx = self._get_src_permutation_idx(indices)
+            src_boxes = outputs["pred_boxes"][idx]
+            target_boxes = torch.cat([t["boxes"][i] for t, (_, i) in zip(targets, indices)], dim=0)
+            self.matched[key] = (idx, src_boxes, target_boxes)
+        return self.matched[key]
 
     def _matched_quality(self, src_boxes, target_boxes):
         """The localization quality of matched pairs of cxcywh boxes, ``[K]`` in [0, 1], by ``quality``."""
@@ -254,8 +258,8 @@ class DomeCriterion(nn.Module):
         """KL distillation of every query's edge distributions towards the teacher's, at temperature ``T``."""
         pred_corners = outputs["pred_corners"].reshape(-1, self.reg_max + 1)
         target_corners = outputs["teacher_corners"].reshape(-1, self.reg_max + 1)
-        if torch.equal(pred_corners, target_corners):
-            return pred_corners.sum() * 0  # the teacher layer itself
+        if pred_corners.data_ptr() == target_corners.data_ptr():
+            return pred_corners.sum() * 0  # the teacher layer itself (the same storage)
 
         # matched queries are weighted by their IoU, the others by the teacher's confidence
         weight_targets_local = outputs["teacher_logits"].sigmoid().max(dim=-1)[0]
@@ -401,27 +405,30 @@ class DomeCriterion(nn.Module):
         return torch.clamp(count / dist_utils.get_world_size(), min=1).item()
 
     @staticmethod
-    def _union_indices(indices, indices_aux_list):
+    def _union_indices(indices_list, num_queries, num_targets):
         """
-        D-FINE's 'go' matching: the union of one set of matches with several others, keeping for
-        every query the target it was matched to most often.
+        D-FINE's 'go' matching: the union of the matches of several prediction sets
+        (``indices_list``, one per-image list each), keeping for every query the target it was
+        matched to most often (the lowest index on a tie). Three host syncs.
         """
-        for indices_aux in indices_aux_list:
-            indices = [
-                (torch.cat([idx1[0], idx2[0]]), torch.cat([idx1[1], idx2[1]]))
-                for idx1, idx2 in zip(indices, indices_aux)
-            ]
-        results = []
-        for ind in [torch.cat([idx[0][:, None], idx[1][:, None]], 1) for idx in indices]:
-            unique, counts = torch.unique(ind, return_counts=True, dim=0)
-            unique_sorted = unique[torch.argsort(counts, descending=True)]
-            query_to_target = {}
-            for row_idx, col_idx in unique_sorted.tolist():
-                query_to_target.setdefault(row_idx, col_idx)
-            rows = torch.tensor(list(query_to_target.keys()), device=ind.device)
-            cols = torch.tensor(list(query_to_target.values()), device=ind.device)
-            results.append((rows.long(), cols.long()))
-        return results
+        b, m = len(num_targets), max(num_targets)
+        device = indices_list[0][0][0].device
+        if m == 0:
+            empty = torch.zeros(0, dtype=torch.long, device=device)
+            return [(empty, empty) for _ in range(b)]
+        # every match as one key (image, query, target); the number of sets a key appears in
+        key = torch.cat([(i * num_queries + src) * m + tgt for ind in indices_list for i, (src, tgt) in enumerate(ind)])
+        key, count = torch.unique(key, return_counts=True)  # sorted: image, query, then target
+        query, target = key // m, key % m  # query numbered across the batch
+        best = torch.zeros((b * num_queries,), dtype=count.dtype, device=device)
+        best.scatter_reduce_(0, query, count, "amax")
+        top = count == best[query]
+        first = torch.full((b * num_queries,), m, dtype=torch.long, device=device)
+        first.scatter_reduce_(0, query[top], target[top], "amin")  # the lowest target among the ties
+        keep = top & (target == first[query])
+        query, target = query[keep], target[keep]
+        per_image = torch.bincount(query // num_queries, minlength=b).tolist()
+        return list(zip((query % num_queries).split(per_image), target.split(per_image)))
 
     @staticmethod
     def get_cdn_matched_indices(dn_meta, targets):
@@ -459,15 +466,15 @@ class DomeCriterion(nn.Module):
         batch_queries_num = outputs.get("batch_queries_num")
         self._clear_cache()
 
-        # match every prediction set, and build the union matching for the box losses
-        main_outputs = {k: v for k, v in outputs.items() if "aux" not in k}
-        match = lambda o: self.matcher(o, targets, batch_queries_num=batch_queries_num)["indices"]  # noqa: E731
-        indices = match(main_outputs)
-        cached_indices = [match(o) for o in outputs["aux_outputs"] + [outputs["pre_outputs"]]]
-        cached_indices_enc = [match(o) for o in outputs["enc_aux_outputs"]]
-        indices_go = self._union_indices(indices, cached_indices + cached_indices_enc)
+        # match every prediction set in one go, and build the union matching for the box losses
+        sets = [outputs, *outputs["aux_outputs"], outputs["pre_outputs"], *outputs["enc_aux_outputs"]]
+        matched = self.matcher.match_sets(sets, targets, batch_queries_num=batch_queries_num)
+        num_aux = len(outputs["aux_outputs"])
+        indices, cached_indices, cached_indices_enc = matched[0], matched[1 : num_aux + 2], matched[num_aux + 2 :]
+        num_targets = [len(t["labels"]) for t in targets]
+        indices_go = self._union_indices(matched, outputs["pred_logits"].shape[1], num_targets)
         shared = (indices_go, self._average_over_ranks(sum(len(x[0]) for x in indices_go), device))
-        num_boxes = self._average_over_ranks(sum(len(t["labels"]) for t in targets), device)
+        num_boxes = self._average_over_ranks(sum(num_targets), device)
 
         def block(set_outputs, set_targets, set_indices, suffix, uni_losses=("boxes", "local"), **overrides):
             args = dict(num_boxes=num_boxes, shared=shared, batch_queries_num=batch_queries_num)
