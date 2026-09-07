@@ -3,6 +3,10 @@ Copied from D-FINE (https://github.com/Peterande/D-FINE)
 Copyright(c) 2024 The D-FINE Authors. All Rights Reserved.
 """
 
+import os
+from concurrent.futures import ThreadPoolExecutor
+
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F  # noqa: N812
@@ -12,6 +16,9 @@ from ...core import register
 from ...misc.box_ops import box_cxcywh_to_xyxy, gaussian_box_similarity, generalized_box_iou
 
 __all__ = ["HungarianMatcher"]
+
+# the assignments of a batch run in parallel: scipy releases the GIL in linear_sum_assignment
+_ASSIGN_POOL = ThreadPoolExecutor(max_workers=min(8, os.cpu_count() or 1))
 
 
 @register()
@@ -41,6 +48,23 @@ class HungarianMatcher(nn.Module):
         self.alpha = alpha
         self.gamma = gamma
 
+    def _cost(self, logits, boxes, tgt_ids, tgt_bbox):
+        """The cost matrix ``[Q, N]`` of one image's real queries against its ground truths."""
+        if self.use_focal_loss:
+            out_prob = F.sigmoid(logits)[:, tgt_ids]
+            neg_cost_class = (1 - self.alpha) * (out_prob**self.gamma) * (-(1 - out_prob + 1e-8).log())
+            pos_cost_class = self.alpha * ((1 - out_prob) ** self.gamma) * (-(out_prob + 1e-8).log())
+            cost_class = pos_cost_class - neg_cost_class
+        else:
+            cost_class = -logits.softmax(-1)[:, tgt_ids]
+
+        cost = self.cost_class * cost_class + self.cost_bbox * torch.cdist(boxes, tgt_bbox, p=1)
+        if self.cost_giou:
+            cost = cost - self.cost_giou * generalized_box_iou(box_cxcywh_to_xyxy(boxes), box_cxcywh_to_xyxy(tgt_bbox))
+        if self.cost_gaussian:
+            cost = cost + self.cost_gaussian * (1 - gaussian_box_similarity(boxes[:, None, :], tgt_bbox[None, :, :]))
+        return cost
+
     @torch.no_grad()
     def forward(self, outputs: dict[str, torch.Tensor], targets, batch_queries_num=None):
         """
@@ -52,41 +76,35 @@ class HungarianMatcher(nn.Module):
 
         Returns:
             ``{"indices": [(pred_idx, target_idx), ...]}``, one pair of int64 index tensors per
-            image, each of length ``min(Q, N_i)``.
+            image on the predictions' device, each of length ``min(Q_i, N_i)``.
         """
-        bs, num_queries = outputs["pred_logits"].shape[:2]
-        logits = outputs["pred_logits"].flatten(0, 1)  # [B * Q, C]
-        out_bbox = outputs["pred_boxes"].flatten(0, 1)  # [B * Q, 4]
-        tgt_ids = torch.cat([v["labels"] for v in targets])
-        tgt_bbox = torch.cat([v["boxes"] for v in targets])
+        return {"indices": self.match_sets([outputs], targets, batch_queries_num)[0]}
 
-        # the constant 1 of "1 - p[target]" does not change the matching and is left out
-        if self.use_focal_loss:
-            out_prob = F.sigmoid(logits)[:, tgt_ids]
-            neg_cost_class = (1 - self.alpha) * (out_prob**self.gamma) * (-(1 - out_prob + 1e-8).log())
-            pos_cost_class = self.alpha * ((1 - out_prob) ** self.gamma) * (-(out_prob + 1e-8).log())
-            cost_class = pos_cost_class - neg_cost_class
-        else:
-            cost_class = -logits.softmax(-1)[:, tgt_ids]
+    @torch.no_grad()
+    def match_sets(self, outputs_list, targets, batch_queries_num=None):
+        """
+        The matching of several prediction sets (each as in ``forward``) against the same targets
+        in one go: the cost of every (set, image) is computed on the device over the image's real
+        queries alone, the costs reach the host in one copy, the assignments run in parallel
+        threads and the indices go back in one copy. Returns one list of per-image index pairs
+        per set.
+        """
+        device = outputs_list[0]["pred_logits"].device
+        costs, shapes = [], []
+        for outputs in outputs_list:
+            logits, boxes = outputs["pred_logits"], outputs["pred_boxes"]
+            for i, t in enumerate(targets):
+                q = logits.shape[1] if batch_queries_num is None else batch_queries_num[i]
+                cost = self._cost(logits[i, :q], boxes[i, :q], t["labels"], t["boxes"])
+                costs.append(cost.flatten())
+                shapes.append(tuple(cost.shape))
+        flat = torch.nan_to_num(torch.cat(costs), nan=1.0).cpu()  # the one device-to-host copy
+        mats = [m.view(shape).numpy() for m, shape in zip(flat.split([q * n for q, n in shapes]), shapes)]
+        pairs = list(_ASSIGN_POOL.map(linear_sum_assignment, mats))
 
-        cost = self.cost_class * cost_class + self.cost_bbox * torch.cdist(out_bbox, tgt_bbox, p=1)
-        if self.cost_giou:
-            cost = cost - self.cost_giou * generalized_box_iou(
-                box_cxcywh_to_xyxy(out_bbox), box_cxcywh_to_xyxy(tgt_bbox)
-            )
-        if self.cost_gaussian:
-            cost = cost + self.cost_gaussian * (1 - gaussian_box_similarity(out_bbox[:, None, :], tgt_bbox[None, :, :]))
-        cost = cost.view(bs, num_queries, -1)
-        if batch_queries_num is not None:  # padded queries cost more than any real one
-            counts = torch.tensor(batch_queries_num).to(cost.device, non_blocking=True)
-            pad = torch.arange(num_queries, device=cost.device)[None, :] >= counts[:, None]
-            cost = cost.masked_fill(pad[..., None], 1e6)
-        cost = torch.nan_to_num(cost.cpu(), nan=1.0)
-
-        sizes = [len(v["boxes"]) for v in targets]
-        indices = [linear_sum_assignment(c[i]) for i, c in enumerate(cost.split(sizes, -1))]
-        return {
-            "indices": [
-                (torch.as_tensor(i, dtype=torch.int64), torch.as_tensor(j, dtype=torch.int64)) for i, j in indices
-            ]
-        }
+        lengths = [len(i) for i, _ in pairs]
+        packed = torch.from_numpy(np.concatenate([np.stack([i, j]) for i, j in pairs], axis=1)).to(device)
+        rows, cols = packed[0].split(lengths), packed[1].split(lengths)
+        indices = list(zip(rows, cols))
+        b = len(targets)
+        return [indices[k * b : (k + 1) * b] for k in range(len(outputs_list))]
