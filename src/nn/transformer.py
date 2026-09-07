@@ -73,7 +73,9 @@ class TransformerEncoderLayer(nn.Module):
         src = residual = v
         if self.normalize_before:
             src = self.norm1(src)
-        src, _ = self.self_attn(q, k, value=src, attn_mask=attn_mask)
+        # need_weights=False: the fused SDPA path, which never materializes the [B * heads, Q, Q]
+        # attention weights (the default path does, keeps them for backward and averages them)
+        src, _ = self.self_attn(q, k, value=src, attn_mask=attn_mask, need_weights=False)
         src = residual + self.dropout1(src)
         if not self.normalize_before:
             src = self.norm1(src)
@@ -193,7 +195,7 @@ class TransformerDecoderLayer(nn.Module):
         q = k = self.with_pos_embed(target, query_pos_embed)
         if self_attn_q_scale is not None:
             q = q * self_attn_q_scale
-        target2, _ = self.self_attn(q, k, value=target, attn_mask=attn_mask)
+        target2, _ = self.self_attn(q, k, value=target, attn_mask=attn_mask, need_weights=False)  # SDPA path
         target = self.norm1(target + self.dropout1(target2))
 
         # cross attention
