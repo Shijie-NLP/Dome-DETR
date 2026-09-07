@@ -459,7 +459,7 @@ class DFINETransformer(nn.Module):
             init_ref_points_unact = torch.concat([denoising_bbox_unact, init_ref_points_unact], dim=1)
             init_ref_contents = torch.concat([denoising_logits, init_ref_contents], dim=1)
         else:
-            attn_mask = None
+            attn_mask = self._padding_attn_mask(batch_queries_num, memory.device)
 
         out_bboxes, out_logits, out_corners, out_refs, pre_bboxes, pre_logits = self.decoder(
             init_ref_contents,
@@ -484,6 +484,15 @@ class DFINETransformer(nn.Module):
             dn_out_logits, out_logits = torch.split(out_logits, dn_meta["dn_num_split"], dim=2)
             dn_out_corners, out_corners = torch.split(out_corners, dn_meta["dn_num_split"], dim=2)
             dn_out_refs, out_refs = torch.split(out_refs, dn_meta["dn_num_split"], dim=2)
+
+        if min(batch_queries_num) < num_queries:
+            # padded queries never become detections (the criterion masks them by count anyway)
+            pad = (
+                torch.arange(num_queries, device=memory.device)[None, :]
+                >= torch.tensor(batch_queries_num, device=memory.device)[:, None]
+            )
+            out_logits = out_logits.masked_fill(pad[None, :, :, None], -1e4)
+            pre_logits = pre_logits.masked_fill(pad[:, :, None], -1e4)
 
         out = {"pred_logits": out_logits[-1], "pred_boxes": out_bboxes[-1]}
         if self.training:
@@ -516,6 +525,20 @@ class DFINETransformer(nn.Module):
                 out[key] = value
         out["batch_queries_num"] = batch_queries_num
         return out
+
+    def _padding_attn_mask(self, batch_queries_num, device):
+        """
+        Without denoising queries: a ``[num_heads * B, Q, Q]`` self-attention mask hiding every
+        image's padded queries from its real ones and vice versa (padding still sees itself), or
+        ``None`` when no image is padded.
+        """
+        num_queries = max(batch_queries_num)
+        if min(batch_queries_num) == num_queries:
+            return None
+        counts = torch.tensor(batch_queries_num, device=device)
+        real = torch.arange(num_queries, device=device)[None, :] < counts[:, None]  # [B, Q]
+        mask = real[:, :, None] != real[:, None, :]  # True blocks attention
+        return mask.repeat_interleave(self.nhead, dim=0)
 
     @staticmethod
     @torch.jit.unused
