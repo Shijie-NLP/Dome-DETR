@@ -104,23 +104,27 @@ class CocoEvaluator:
         return prediction
 
     def prepare_for_coco_detection(self, predictions):
-        coco_results = []
+        """The batch's detections as COCO result dicts; the batch reaches the host in two copies."""
+        image_ids, boxes, scores, labels = [], [], [], []
         for original_id, prediction in predictions.items():
             if len(prediction) == 0:
                 continue
             prediction = self.filter_prediction(original_id, prediction)
-            if len(prediction["boxes"]) == 0:
+            n = len(prediction["boxes"])
+            if n == 0:
                 continue
-
-            boxes = convert_to_xywh(prediction["boxes"]).tolist()
-            scores = prediction["scores"].tolist()
-            labels = prediction["labels"].tolist()
-
-            coco_results.extend(
-                {"image_id": original_id, "category_id": labels[k], "bbox": box, "score": scores[k]}
-                for k, box in enumerate(boxes)
-            )
-        return coco_results
+            image_ids.extend([original_id] * n)
+            boxes.append(prediction["boxes"])
+            scores.append(prediction["scores"])
+            labels.append(prediction["labels"])
+        if not boxes:
+            return []
+        rows = torch.cat([convert_to_xywh(torch.cat(boxes)), torch.cat(scores)[:, None].float()], dim=1).tolist()
+        labels = torch.cat(labels).tolist()
+        return [
+            {"image_id": image_id, "category_id": label, "bbox": row[:4], "score": row[4]}
+            for image_id, label, row in zip(image_ids, labels, rows)
+        ]
 
     def prepare_for_coco_segmentation(self, predictions):
         coco_results = []
