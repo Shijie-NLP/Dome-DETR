@@ -2,46 +2,37 @@
 Dome-DETR: DETR with Density-Oriented Feature-Query Manipulation for Efficient Tiny Object Detection
 Copyright (c) 2025 The Dome-DETR Authors. All Rights Reserved.
 
-Ground-truth-claimed query initialization (working name ``MaxIoUTransformer``): a
-``DFINETransformer`` whose training splits into three parts, with no denoising queries. The
-encoder's class scores are trained as plain 0/1 targets and their maximum, an objectness, picks
-the queries in training and inference alike; the decoder alone decides localization quality.
+Ground-truth-forced query selection (working name ``MaxIoUTransformer``): a ``DFINETransformer``
+whose query selection replaces the top-k by objectness, with no denoising queries. Everything
+past the selection is D-FINE's: the encoder's predictions on the queries and the decoder's
+outputs are Hungarian-matched by the criterion. The one difference in the losses is on the
+encoder side, where the class logits are trained as plain 0/1 objectness (``loss_obj``, no
+IoU-aware target, ``enc_losses`` of ``DomeCriterion``), so that their decision boundary,
+logit 0, can serve as the selection rule.
 
-- Encoder: every token predicts a box; each ground truth claims the token whose box matches it
-  best (``giou`` by default, ``iou`` or ``nwd``), one token per ground truth. The encoder is
-  trained on the queries alone, as D-FINE's on its top-k (``enc_queries``): its score head keeps
-  its class logits, trained with a class-balanced BCE on 0/1 targets, 1 on a claimed token's
-  ground-truth class and 0 on every other (query, class) entry (``loss_obj``, no IoU-aware
-  target); the claimed tokens also get the box losses. Tokens outside the query set get no loss.
-  No Hungarian on the encoder side. The objectness of a token is its highest class logit, and
-  the decision boundary, logit 0, is the selection rule: no threshold to estimate or store.
-  ``last_assign_stats`` reports, per image, the claimed tokens the head already lets through
-  (``selected``, i.e. its recall in training), how many claims came from the fallback and how
-  many claimed tokens lie on each level (``levels``: a drift of tiny objects' claims towards
-  coarse levels shows here).
-- Decoder queries, training: the claimed tokens (forced) plus every other token the objectness
-  selects, floored so an image has at least ``min_queries`` queries (the same floor as at
-  inference; ``min_negatives`` of them unforced) and capped so it has at most
-  ``max(num_queries, #gt + min_negatives)``. Every query is a real token with its own
-  content and predicted box; the decoder's Hungarian matching labels them. Images differ in query
-  count (padded to the largest, ``batch_queries_num`` tells the criterion).
-- Inference: the tokens the objectness selects, clamped to ``[min_queries, num_queries]`` by its
+- The objectness of a token is its highest class logit; logit 0 is the selection rule, no
+  threshold to estimate or store.
+- Training (with ground truths in the batch): every ground truth forces one token of its own
+  into the queries, the token whose predicted box matches it best (``assign_metric``: ``nwd``,
+  ``giou`` or ``iou``) among the ``(2 * assign_radius + 1)``-cell windows around its centre cell
+  on every level (index arithmetic, no ``cdist``). Two ground truths wanting the same token are
+  not a matter of assignment (the criterion's Hungarian decides who predicts what) but of
+  coverage: every ground truth gets a distinct token, so the second one moves on to its next
+  candidate (``assign_candidates`` per ground truth; the rare one whose candidates all went to
+  others takes the nearest free token). The rest of the queries are the unforced tokens the
+  objectness passes, and the count is clamped to ``[min_queries, num_queries]``. Images differ
+  in query count (padded to the largest, ``batch_queries_num`` tells the criterion).
+- Inference: the tokens the objectness passes, clamped to ``[min_queries, num_queries]`` by its
   logit, so the query count is per image; ``num_queries`` is only a memory guard. As the head
-  learns to pass the claimed tokens, the training set converges to the inference set plus a
+  learns to pass the forced tokens, the training set converges to the inference set plus a
   vanishing forced part. ``infer_rule='topk'`` restores the plain top-k by objectness.
+- ``last_assign_stats`` reports, per image, the ground truths, how many forced tokens the head
+  already lets through (``selected``, its recall in training), the rule-selected queries and the
+  forced tokens per level (``levels``: a drift of tiny objects' tokens towards coarse levels shows
+  here).
 
-The claim is one-to-one and runs batched over the images with the ground truths padded to the
-largest count. Candidates come from the token grid, not from a distance matrix: on every level the
-tokens of the ``(2 * assign_radius + 1)``-cell window around the ground truth's centre cell (index
-arithmetic, no ``cdist``), scored exactly with ``assign_metric`` (for ``nwd`` the ranking by the
-normalized Gaussian Wasserstein distance is the ranking by the plain distance in
-``(cx, cy, w/2, h/2)`` space). Each ground truth keeps its ``assign_candidates`` best tokens; when
-two ground truths want the same token the better-matching one keeps it and the other moves to its
-next candidate, in vectorized rounds until nobody loses (a boolean host sync per round; a few
-rounds in practice). A ground truth whose candidates all went to others then
-takes the nearest-centre unclaimed token, so every ground truth ends up with a query of its own
-(``_fallback``, on the leftovers alone, in rounds). One more host sync per batch (the query
-counts) plus one count per fallback round.
+Host syncs: one per batch (the query counts), plus one boolean when a ground truth needs the
+nearest-free-token fallback.
 """
 
 import torch
@@ -76,17 +67,16 @@ def _pair_iou_giou(a_xyxy, b_xyxy):
 class MaxIoUTransformer(DFINETransformer):
     """
     Args (on top of ``DFINETransformer``'s; ``num_queries`` is the most queries an image gets):
-        assign_metric: ``giou`` (default: unlike IoU it still ranks tokens whose box does not
-            overlap a tiny ground truth), ``iou`` or ``nwd``.
-        assign_candidates: tokens each ground truth keeps as candidates.
+        assign_metric: how a ground truth ranks the tokens' predicted boxes: ``nwd`` (a small box
+            that just misses a tiny ground truth still beats a coarse box that merely contains
+            it), ``giou`` or ``iou`` (under both, any box containing the ground truth beats any
+            box not overlapping it).
+        assign_candidates: tokens each ground truth keeps as candidates, its fallbacks when
+            another ground truth took its best one.
         assign_radius: cells around the ground truth's centre cell, per level, that are candidates
             (1: a 3x3 window on each level).
-        assign_chunk: ground truths per chunk of the fallback's distance matrix (memory).
-        min_queries: the least queries an image gets, in training (claimed tokens included) and at
-            inference alike.
-        min_negatives: the least rule-selected (unforced) queries an image gets in training, on
-            top of ``min_queries``: a floor for images with about ``min_queries`` ground truths
-            or more, which would otherwise train the decoder with no negative query.
+        min_queries: the least queries an image gets, in training (forced tokens included) and
+            at inference alike.
         infer_rule: ``objectness`` (the head's decision, per-image count) or ``topk``
             (``num_queries`` best by objectness).
         local_attn_k / attn_logn_scale / attn_logn_base: see ``DFINETransformer``.
@@ -118,12 +108,10 @@ class MaxIoUTransformer(DFINETransformer):
         reg_scale=4.0,
         layer_scale=1,
         num_queries=300,
-        assign_metric="giou",
+        assign_metric="nwd",
         assign_candidates=8,
         assign_radius=1,
-        assign_chunk=256,
-        min_negatives=100,
-        min_queries=100,
+        min_queries=300,
         infer_rule="objectness",
         local_attn_k=0,
         attn_logn_scale=False,
@@ -165,16 +153,14 @@ class MaxIoUTransformer(DFINETransformer):
         self.assign_metric = assign_metric
         self.assign_candidates = assign_candidates
         self.assign_radius = assign_radius
-        self.assign_chunk = assign_chunk
-        self.min_negatives = min_negatives
         self.min_queries = min_queries
         self.infer_rule = infer_rule
         # diagnostics of the last training forward, per image: ground truths, how many of their
-        # claimed tokens the objectness already lets through, the rule-selected queries, the claims
-        # that needed the fallback and the claimed tokens per level
+        # forced tokens the objectness already lets through, the rule-selected queries and the
+        # forced tokens per level
         self.last_assign_stats = None
 
-    # ------------------------------------------------------------------ ground-truth claims
+    # ------------------------------------------------------------------ forced tokens
 
     def _candidates(self, gt_cxcywh, gt_valid, pred_cxcywh, valid, spatial_shapes):
         """
@@ -206,9 +192,8 @@ class MaxIoUTransformer(DFINETransformer):
         idx = rr.mul_(w[:, None]).add_(cc).add_(start[:, None])
         cand = torch.where(inside, idx, n).flatten(2).long()  # [B, M, C]; n is the dummy token
 
-        # the metric's features of the candidate tokens and the ground truths, [B, M, C, 4] (a
-        # dummy reads token N - 1 and is masked below)
-        token = cand.clamp(max=n - 1)
+        # the metric's features of every token and ground truth, the candidates' gathered through
+        # a zero row for the dummy token, [B, M, C, 4]
         if self.assign_metric == "nwd":
             # exp(-W2 / C) is monotone in the Wasserstein distance between the boxes' Gaussians, so
             # ranking by the plain distance in (cx, cy, w/2, h/2) space is the same ranking
@@ -216,121 +201,58 @@ class MaxIoUTransformer(DFINETransformer):
             gt_feat = torch.cat([gt_cxcywh[..., :2], gt_cxcywh[..., 2:] / 2], dim=-1)
         else:
             feat, gt_feat = box_cxcywh_to_xyxy(pred_cxcywh), box_cxcywh_to_xyxy(gt_cxcywh)
-        feat = feat.gather(1, token.flatten(1).unsqueeze(-1).expand(-1, -1, 4)).view(b, m, -1, 4)
+        feat = torch.cat([feat, feat.new_zeros((b, 1, 4))], dim=1)
+        feat = feat.gather(1, cand.flatten(1).unsqueeze(-1).expand(-1, -1, 4)).view(b, m, -1, 4)
         if self.assign_metric == "nwd":
             match = -(feat - gt_feat[:, :, None, :]).norm(dim=-1)
         else:
             iou, giou = _pair_iou_giou(gt_feat[:, :, None, :], feat)
             match = iou if self.assign_metric == "iou" else giou
-        ok = inside.flatten(2) & valid[token] & gt_valid[..., None]  # dummy, invalid, padding out
+        ok = torch.cat([valid, valid.new_zeros(1)])[cand] & gt_valid[..., None]  # dummy, invalid, padding out
         match = match.masked_fill_(~ok, float("-inf"))
         best = match.topk(min(self.assign_candidates, match.shape[-1]), dim=-1)
         return torch.where(best.values.isfinite(), cand.gather(-1, best.indices), n), best.values
 
-    def _resolve(self, cand_idx, cand_val, gt_valid, n_tokens):
-        """
-        One-to-one claims from the candidate lists ``[B, M, K]`` (``n_tokens`` marks a dummy): a
-        ground truth that loses its current candidate to a better-matching ground truth moves to
-        its next one, until nobody loses. Returns the claimed token of every ground truth,
-        ``[B, M]``, ``-1`` where the candidates ran out or the ground truth is padding.
-        """
-        b, m, k = cand_idx.shape
-        device = cand_idx.device
-        # tokens numbered across the batch (the dummy included); the bid tables are one row per
-        # token, a few MiB, so nothing to compact
-        u = b * (n_tokens + 1)
-        slots = cand_idx + (torch.arange(b, device=device) * (n_tokens + 1))[:, None, None]
-        gt = torch.arange(b * m, device=device).view(b, m)
-        best = cand_val.new_empty((u,))
-        owner = torch.empty((u + 1,), dtype=torch.long, device=device)  # row u: the non-holders' bin
-        ptr = torch.zeros((b, m), dtype=torch.long, device=device)
-        active = gt_valid.clone()
-        # A round: every active ground truth bids on its current candidate; the best bid holds the
-        # token and the others move on. Winners can lose later to a better bid that moves in, so
-        # the rounds run until nobody loses. Every loss advances a pointer, so k * m rounds bound it.
-        for _ in range(k * m + 1):
-            slot = slots.gather(-1, ptr[..., None]).squeeze(-1)  # [B, M]
-            val = cand_val.gather(-1, ptr[..., None]).squeeze(-1)
-            active &= val.isfinite()  # candidates are best first: past a dummy, only dummies remain
-            # the best bid on each slot, then the lowest-index ground truth holding it
-            best.fill_(float("-inf")).scatter_reduce_(0, slot.flatten(), val.flatten(), "amax")
-            holds = active & (val >= best[slot])
-            owner.fill_(b * m).scatter_reduce_(0, torch.where(holds, slot, u).flatten(), gt.flatten(), "amin")
-            win = holds & (owner[slot] == gt)
-            lose = active & ~win
-            if not lose.any():  # one boolean per round
-                break
-            ptr = ptr + lose.long()
-            active &= ptr < k
-            ptr = ptr.clamp(max=k - 1)
-        # the winners hold distinct tokens by construction
-        tok = cand_idx.gather(-1, ptr[..., None]).squeeze(-1)
-        return torch.where(win, tok, torch.full_like(tok, -1))
-
     @torch.no_grad()
-    def _claim(self, targets, pred_cxcywh, valid, spatial_shapes):
+    def _forced(self, targets, pred_cxcywh, valid, spatial_shapes):
         """
-        The tokens the ground truths claim: ``[B, M]`` token indices in ground-truth order (``-1``
-        only for padded ground truths), the padded ground-truth boxes ``[B, M, 4]`` and their
-        validity ``[B, M]``, the number of real ground truths per image and how many of them
-        needed the fallback, ``[B]``.
-        """
-        n = pred_cxcywh.shape[1]
-        device = pred_cxcywh.device
-        num_gts = [t["boxes"].shape[0] for t in targets]
-        gt_boxes = pad_sequence([t["boxes"] for t in targets], batch_first=True).to(pred_cxcywh.dtype)
-        gt_valid = (
-            torch.arange(gt_boxes.shape[1], device=device)[None, :] < torch.tensor(num_gts, device=device)[:, None]
-        )
-        cand_idx, cand_val = self._candidates(gt_boxes, gt_valid, pred_cxcywh, valid, spatial_shapes)
-        assigned = self._resolve(cand_idx, cand_val, gt_valid, n)
-        fallen = ((assigned < 0) & gt_valid).sum(1)  # ground truths whose candidates all went to others
-        assigned = self._fallback(assigned, gt_boxes, gt_valid, pred_cxcywh, valid)
-        return assigned, gt_boxes, gt_valid, num_gts, fallen
-
-    def _fallback(self, assigned, gt_cxcywh, gt_valid, pred_cxcywh, valid):
-        """
-        Every real ground truth gets a token: one whose candidates all went to better-matching
-        ground truths takes the nearest-centre token nobody claimed. Works on the leftovers alone:
-        each keeps its ``assign_candidates`` nearest unclaimed tokens and the claims are resolved
-        as before, in rounds until every leftover holds a token (the nearest wins a contested
-        token). Only runs when needed.
+        The tokens the ground truths force into the queries, a ``[B, N]`` mask with one distinct
+        token per real ground truth, and the number of real ground truths per image. Round ``r``
+        gives every ground truth still without a token its ``r``-th candidate unless another has
+        it (the lowest-index ground truth wins a tie); the rare ground truth whose candidates all
+        went to others takes the nearest free token, settled on the host.
         """
         b, n = pred_cxcywh.shape[:2]
-        device = assigned.device
-        k = min(self.assign_candidates, n)
-        taken = torch.zeros((b, n + 1), dtype=torch.bool, device=device)
-        rounds = None
-        while True:
-            left = (assigned < 0) & gt_valid
-            num_left = left.sum(1)
-            max_left = int(num_left.max())  # one host sync per round
-            if max_left == 0:
-                return assigned
-            if rounds is None:
-                rounds = max_left  # every round settles the best bidder of each image with leftovers
-            assert rounds > 0, "an image has more ground truths than valid tokens"
-            rounds -= 1
-            taken.scatter_(1, torch.where(assigned >= 0, assigned, n), True)
-            blocked = torch.where(valid[None, :] & ~taken[:, :n], 0.0, float("inf")).to(pred_cxcywh.dtype)
-            # the leftovers compacted to [B, max_left], in ground-truth order, then their nearest
-            # unclaimed tokens (cdist's matmul path is exact enough: its error is ~1e-7 in the
-            # squared distance, the cells are 1e-2 wide)
-            order = torch.sort((~left).long(), dim=1, stable=True).indices[:, :max_left]
-            left_valid = torch.arange(max_left, device=device)[None, :] < num_left[:, None]
-            centres = gt_cxcywh[..., :2].gather(1, order[..., None].expand(-1, -1, 2))
-            idx, val = [], []
-            for start in range(0, max_left, self.assign_chunk):
-                sl = slice(start, start + self.assign_chunk)
-                dist = torch.cdist(centres[:, sl], pred_cxcywh[..., :2])
-                near = dist.add_(blocked[:, None, :]).topk(k, dim=-1, largest=False)
-                idx.append(near.indices)
-                val.append(-near.values)  # blocked tokens: -inf, never held
-            val = torch.cat(val, 1).masked_fill(~left_valid[..., None], float("-inf"))
-            claimed = self._resolve(torch.cat(idx, 1), val, left_valid, n)  # [B, max_left]
-            assigned = assigned.scatter(1, order, torch.where(left_valid, claimed, assigned.gather(1, order)))
+        device = pred_cxcywh.device
+        num_gts = [t["boxes"].shape[0] for t in targets]
+        gt_boxes = pad_sequence([t["boxes"] for t in targets], batch_first=True)  # [B, M, 4]
+        m = gt_boxes.shape[1]
+        counts = torch.tensor(num_gts).to(device, non_blocking=True)
+        gt_valid = torch.arange(m, device=device)[None, :] < counts[:, None]
+        cand, _ = self._candidates(gt_boxes, gt_valid, pred_cxcywh, valid, spatial_shapes)  # [B, M, K]
 
-    # ------------------------------------------------------------------ query initialization
+        forced = torch.zeros((b, n + 1), dtype=torch.bool, device=device)  # column n: the dummy's bin
+        owner = torch.empty((b, n + 1), dtype=torch.long, device=device)
+        gt = torch.arange(m, device=device)[None, :].expand(b, -1)
+        left = gt_valid.clone()
+        for r in range(cand.shape[-1]):
+            tok = cand[..., r]  # [B, M]
+            want = left & (tok < n) & ~forced.gather(1, tok)
+            owner.fill_(m).scatter_reduce_(1, torch.where(want, tok, n), gt, "amin")
+            win = want & (owner.gather(1, tok) == gt)
+            forced.scatter_(1, torch.where(win, tok, n), True)
+            left &= ~win
+        forced = forced[:, :n]
+
+        if left.any():  # one boolean; only when a ground truth's candidates all went to others
+            cost = torch.where(valid[None, :] & ~forced, 0.0, float("inf")).to(pred_cxcywh.dtype)
+            for i, j in left.nonzero().tolist():
+                dist = torch.cdist(gt_boxes[i, j : j + 1, :2], pred_cxcywh[i, :, :2]).squeeze(0) + cost[i]
+                t = dist.argmin()
+                forced[i, t], cost[i, t] = True, float("inf")
+        return forced, num_gts
+
+    # ------------------------------------------------------------------ query selection
 
     def _encoder_tokens(self, memory, spatial_shapes):
         """
@@ -339,7 +261,8 @@ class MaxIoUTransformer(DFINETransformer):
         """
         anchors, valid_mask = self._generate_anchors(spatial_shapes, device=memory.device)
         valid = valid_mask.reshape(-1)  # [N]
-        anchors = anchors.expand(memory.shape[0], -1, -1)  # [B, N, 4], no copy
+        if memory.shape[0] > 1:
+            anchors = anchors.repeat(memory.shape[0], 1, 1)
         memory = valid_mask.to(memory.dtype) * memory
         output_memory: torch.Tensor = self.enc_output(memory)
         enc_outputs_logits: torch.Tensor = self.enc_score_head(output_memory)  # [B, N, C]
@@ -348,9 +271,9 @@ class MaxIoUTransformer(DFINETransformer):
 
     def _get_decoder_input(self, memory, spatial_shapes, encoder_out, targets=None):
         """
-        Training (with ground truths in the batch): every ground truth's claimed token, then the
-        other tokens the objectness passes, by its logit, padded to the largest count in the
-        batch, plus the encoder's outputs on them for the criterion (``extra``). Inference: the
+        Training (with ground truths in the batch): every ground truth's forced token plus the
+        unforced tokens the objectness passes, by its logit, padded to the largest count in the
+        batch, plus the encoder's predictions on the queries for the criterion. Inference: the
         tokens the objectness passes, clamped to ``[min_queries, num_queries]`` by its logit, or
         the plain top-k by objectness with ``infer_rule='topk'``.
         """
@@ -365,40 +288,28 @@ class MaxIoUTransformer(DFINETransformer):
         def take(x, index):
             return x.gather(1, index.unsqueeze(-1).expand(-1, -1, x.shape[-1]))
 
-        def layout(forced, num_forced, rule_count, *extra):
+        def select(ranking, count, *extra):
             """
-            The query index ``[B, max_total]`` and padding mask: each image's forced tokens
-            (``forced[i, :num_forced[i]]``, a prefix of real token indices), then its ``rule_count``
-            best tokens by objectness among the rest; the real counts and ``rule_count``, and every
-            ``extra`` ``[B]`` tensor, as lists read from the device in the same, single host sync.
+            Every image's ``count`` best tokens by ``ranking``: the query index ``[B, max_count]``
+            and its padding mask, plus the counts and every ``extra`` ``[B]`` tensor as lists, read
+            from the device in one host sync.
             """
-            m = forced.shape[1]
-            taken = torch.zeros((b, n + 1), dtype=torch.bool, device=device)
-            taken.scatter_(1, torch.where(forced >= 0, forced, n), True)
-            rest = scores.masked_fill(taken[:, :n], float("-inf"))
-            total = num_forced + rule_count
-            batch_queries_num, rule_list, *extra = torch.stack([total, rule_count, *extra]).tolist()
-            max_total, k = max(batch_queries_num), min(max(rule_list), n)
-            ranked = rest.topk(k, dim=1).indices
-            pos = torch.arange(max_total, device=device)[None, :]
-            pad = pos >= total[:, None]
-            index = ranked.gather(1, (pos - num_forced[:, None]).clamp(0, k - 1).expand(b, -1))
-            if m:  # the forced prefix; padded rows of ``forced`` are never read
-                from_forced = forced.gather(1, pos.clamp(max=m - 1).expand(b, -1))
-                index = torch.where(pos < num_forced[:, None], from_forced, index)
-            return index, pad, batch_queries_num, rule_list, *extra
+            batch_queries_num, *extra = torch.stack([count, *extra]).tolist()
+            max_count = max(batch_queries_num)
+            index = ranking.topk(max_count, dim=1).indices
+            pad = torch.arange(max_count, device=device)[None, :] >= count[:, None]
+            return index, pad, batch_queries_num, *extra
 
         with torch.no_grad():
             passed = scores > 0  # [B, N], the head's decision
             num_valid = valid.sum()  # the rule never selects an invalid token
+            floor, cap = min(self.min_queries, n), min(self.num_queries, n)
 
             if not training:
                 if self.training:
                     self.last_assign_stats = None  # a batch without ground truths
-                count = passed.sum(1).clamp(min(self.min_queries, n), min(self.num_queries, n)).minimum(num_valid)
-                index, pad, batch_queries_num, _ = layout(
-                    scores.new_empty((b, 0), dtype=torch.long), torch.zeros_like(count), count
-                )
+                count = passed.sum(1).clamp(floor, cap).minimum(num_valid)
+                index, pad, batch_queries_num = select(scores, count)
                 contents = take(output_memory, index)
                 boxes_unact = self.enc_bbox_head(contents) + take(anchors, index)  # the head on the queries alone
                 return DecoderInput(
@@ -409,42 +320,31 @@ class MaxIoUTransformer(DFINETransformer):
                     batch_queries_num,
                 )
 
-            boxes_unact = self.enc_bbox_head(output_memory) + anchors  # every token's box: the claim needs them
-            all_boxes = F.sigmoid(boxes_unact)
-            assigned, gt_boxes, gt_valid, num_gts, fallen = self._claim(targets, all_boxes, valid, spatial_shapes)
-            num_gt = gt_valid.sum(1)
-            claimed = assigned.clamp(min=0)  # padding rows point at token 0 and are masked below
-            num_selected = (passed.gather(1, claimed) & gt_valid).sum(1)  # claimed tokens the head lets through
-            # the claimed tokens per level, [B, L]
-            ends = torch.tensor([h * w for h, w in spatial_shapes]).cumsum(0).to(device, non_blocking=True)
-            level = F.one_hot(torch.bucketize(claimed, ends, right=True), len(spatial_shapes))
-            per_level = level.masked_fill(~gt_valid[..., None], 0).sum(1)
-
-            # rule-selected queries: the unclaimed tokens the objectness passes, floored and capped
-            passed_free = passed.sum(1) - num_selected
-            floor = (self.min_queries - num_gt).clamp(min=self.min_negatives)
-            cap = (self.num_queries - num_gt).clamp(min=self.min_negatives)
-            rule_count = passed_free.maximum(floor).minimum(cap).minimum(num_valid - num_gt)
-            index, pad, batch_queries_num, rule_list, selected, fell, *levels = layout(
-                assigned, num_gt, rule_count, num_selected, fallen, *per_level.unbind(1)
+            # every token's box: the pick needs them. In fp32 with autocast off: under autocast this
+            # no-grad call would cache the head's half-precision weights without a graph, and the
+            # graph-bearing call on the queries below would reuse them and reach no parameter
+            with torch.autocast(device.type, enabled=False):
+                boxes_unact = self.enc_bbox_head(output_memory.float()) + anchors
+            forced, num_gts = self._forced(targets, F.sigmoid(boxes_unact), valid, spatial_shapes)  # [B, N]
+            num_gt = forced.sum(1)
+            num_selected = (forced & passed).sum(1)  # forced tokens the head lets through
+            per_level = torch.stack([f.sum(1) for f in forced.split([h * w for h, w in spatial_shapes], 1)], 1)
+            # the forced tokens plus the unforced ones the head passes, floored and capped (a
+            # crowd beyond num_queries keeps its forced tokens; they are valid by construction)
+            count = (num_gt + (passed & ~forced).sum(1)).clamp(min=floor).minimum(num_gt.clamp(min=cap))
+            count = count.minimum(num_valid)
+            index, pad, batch_queries_num, selected, *levels = select(
+                scores.masked_fill(forced, float("inf")), count, num_selected, *per_level.unbind(1)
             )
-
             contents = take(output_memory, index).masked_fill(pad[..., None], 0)
-            boxes_unact = take(boxes_unact, index).masked_fill(pad[..., None], 0)
-
+            boxes_init = take(boxes_unact, index).masked_fill(pad[..., None], 0)
             self.last_assign_stats = [
-                {"num_gt": g, "selected": s, "rule": c, "fallback": f, "levels": lv}
-                for g, s, c, f, *lv in zip(num_gts, selected, rule_list, fell, *levels)
+                {"num_gt": g, "selected": s, "rule": q - g, "levels": lv}
+                for g, s, q, *lv in zip(num_gts, selected, batch_queries_num, *levels)
             ]
 
-        # the encoder's outputs on the queries, with a graph, for the criterion: the class logits
-        # of every query (the claimed tokens positive, the rest negative, padding left out) and the
-        # boxes of the claimed tokens alone. Those are the query prefix in ground-truth order, so
-        # one index pair, (query position, ground truth) = (j, j), serves both
-        enc_queries = {
-            "pred_logits": take(enc_outputs_logits, index),  # [B, Q, C]
-            "pred_boxes": F.sigmoid(self.enc_bbox_head(take(output_memory, claimed)) + take(anchors, claimed)),
-            "valid": ~pad,
-            "indices": [(torch.arange(g, device=device),) * 2 for g in num_gts],
-        }
-        return DecoderInput(contents, boxes_unact, [], [], batch_queries_num, extra={"enc_queries": enc_queries})
+        # the encoder's predictions on the queries, with a graph: D-FINE's enc_aux_outputs, which
+        # the criterion Hungarian-matches (padding is masked there)
+        enc_logits = take(enc_outputs_logits, index)
+        enc_boxes = F.sigmoid(self.enc_bbox_head(take(output_memory, index)) + take(anchors, index))
+        return DecoderInput(contents, boxes_init, [enc_boxes], [enc_logits], batch_queries_num)

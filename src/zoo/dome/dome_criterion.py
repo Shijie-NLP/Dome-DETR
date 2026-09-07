@@ -35,14 +35,19 @@ class DomeCriterion(nn.Module):
     The decoder output carries, besides the last layer's predictions, ``aux_outputs`` (the other
     layers), ``pre_outputs`` (the first layer's plain boxes), ``enc_aux_outputs`` (the encoder
     tokens picked as queries), and their denoising twins ``dn_outputs`` / ``dn_pre_outputs``. Each
-    set is matched to the targets and scored with the same ``losses``, and the weighted terms are
-    returned with a suffix naming the set (``_aux_0``, ``_pre``, ``_enc_0``, ``_dn_0``, ...).
+    set is matched to the targets and scored with the same ``losses`` (the encoder sets with
+    ``enc_losses`` when given), and the weighted terms are returned with a suffix naming the set
+    (``_aux_0``, ``_pre``, ``_enc_0``, ``_dn_0``, ...). Padded queries (``batch_queries_num``)
+    are never matched and count in no loss.
 
     Args:
         matcher: the Hungarian matcher (injected from the config).
         weight_dict: weight per loss term; terms not listed are dropped.
-        losses: which of ``vfl`` / ``focal`` / ``mal`` (classification), ``boxes`` (L1 + GIoU) and
-            ``local`` (FDR's fine-grained localization and distillation losses) to compute.
+        losses: which of ``vfl`` / ``focal`` / ``mal`` / ``obj`` (classification), ``boxes`` (L1 +
+            GIoU) and ``local`` (FDR's fine-grained localization and distillation losses) to
+            compute.
+        enc_losses: the losses of the encoder sets instead (``None``: ``losses``); e.g.
+            ``['obj', 'boxes']`` trains the encoder's class logits as plain 0/1 objectness.
         alpha, gamma: the focal parameters of the classification losses.
         reg_max: the FDR bin count of the decoder.
         boxes_weight_format: ``None``, ``iou`` or ``giou``: weight the GIoU loss and the VFL / MAL
@@ -52,11 +57,8 @@ class DomeCriterion(nn.Module):
         mal_alpha: the negative weight of the MAL loss (``None``: 1).
         use_uni_set: match the box and localization losses against the union of the matches of
             every prediction set (D-FINE's 'go' indices) rather than each set's own.
-        enc_queries_weight: weight of the encoder's losses on its queries (``enc_queries`` outputs:
-            the queries' class logits, the ground-truth-claimed tokens as positives with their own
-            indices, and the box losses on those).
-        obj_pos_weight: in the encoder's 0/1 classification loss (``loss_obj``, a class-balanced
-            BCE over every (query, class) entry, the claimed tokens' ground-truth class positive),
+        obj_pos_weight: in the 0/1 classification loss (``loss_obj``, a class-balanced BCE over
+            every (query, class) entry, the matched queries' ground-truth class positive),
             how much more the positive half weighs than the negative half; 1 is the balanced
             decision boundary at logit 0.
     """
@@ -78,7 +80,7 @@ class DomeCriterion(nn.Module):
         density_recall_penalty=0.3,
         mal_alpha=None,
         use_uni_set=True,
-        enc_queries_weight=1.0,
+        enc_losses=None,
         obj_pos_weight=1.0,
     ):
         super().__init__()
@@ -86,6 +88,7 @@ class DomeCriterion(nn.Module):
         self.matcher = matcher
         self.weight_dict = weight_dict
         self.losses = losses
+        self.enc_losses = enc_losses
         self.boxes_weight_format = boxes_weight_format
         self.alpha = alpha
         self.gamma = gamma
@@ -94,7 +97,6 @@ class DomeCriterion(nn.Module):
         self.density_recall_penalty = density_recall_penalty
         self.mal_alpha = mal_alpha
         self.use_uni_set = use_uni_set
-        self.enc_queries_weight = enc_queries_weight
         self.obj_pos_weight = obj_pos_weight
         self._clear_cache()
 
@@ -292,24 +294,28 @@ class DomeCriterion(nn.Module):
             losses["defe_reg_loss"] = (penalty * diff**2).mean()
         return losses
 
-    def loss_obj(self, logits, targets, indices, valid=None):
+    def loss_obj(self, outputs, targets, indices, num_boxes, batch_queries_num=None, **kwargs):
         """
-        The encoder's 0/1 classification over its queries: a class-balanced BCE over every
-        (query, class) entry of ``logits [B, Q, C]``. The claimed tokens (``indices``, per image
-        the query position and its ground truth) are positive on their ground-truth class (class 0
-        when ``C`` is 1), every other entry negative; each half is normalized to weight 1/2 and the
-        positive half scaled by ``obj_pos_weight``. ``valid [B, Q]`` leaves the padding out.
+        Plain 0/1 classification, no IoU-aware target: a class-balanced BCE over every (query,
+        class) entry of ``pred_logits [B, Q, C]``. The matched queries are positive on their
+        ground-truth class (class 0 when ``C`` is 1), every other entry negative; each half is
+        normalized to weight 1/2 and the positive half scaled by ``obj_pos_weight``, so the
+        decision boundary is logit 0. Padded queries are left out.
         """
+        logits = outputs["pred_logits"].float()  # the weights are built in fp32 under autocast too
         target = torch.zeros_like(logits)
         for i, (src, tgt) in enumerate(indices):
             cls = targets[i]["labels"][tgt] if logits.shape[-1] > 1 else torch.zeros_like(tgt)
             target[i, src, cls] = 1.0
-        keep = torch.ones_like(logits, dtype=torch.bool) if valid is None else valid[..., None].expand_as(target)
+        keep = torch.ones_like(logits, dtype=torch.bool)
+        if batch_queries_num is not None:
+            counts = torch.tensor(batch_queries_num).to(logits.device, non_blocking=True)
+            keep &= (torch.arange(logits.shape[1], device=logits.device)[None, :] < counts[:, None])[..., None]
         pos, neg = (target > 0) & keep, (target == 0) & keep
         weight = torch.zeros_like(logits)
         weight[pos] = 0.5 * self.obj_pos_weight / pos.sum().clamp(min=1)
         weight[neg] = 0.5 / neg.sum().clamp(min=1)
-        return F.binary_cross_entropy_with_logits(logits, target, weight=weight, reduction="sum")
+        return {"loss_obj": F.binary_cross_entropy_with_logits(logits, target, weight=weight, reduction="sum")}
 
     # ------------------------------------------------------------------ assembling
 
@@ -319,6 +325,7 @@ class DomeCriterion(nn.Module):
             "focal": self.loss_labels_focal,
             "vfl": self.loss_labels_vfl,
             "mal": self.loss_labels_mal,
+            "obj": self.loss_obj,
             "local": self.loss_local,
         }
         assert loss in loss_map, f"do you really want to compute {loss} loss?"
@@ -342,13 +349,16 @@ class DomeCriterion(nn.Module):
             return {"values": iou}
         return {}
 
-    def _weighted_losses(self, outputs, targets, indices, num_boxes, suffix, uni_losses, shared, batch_queries_num):
+    def _weighted_losses(
+        self, outputs, targets, indices, num_boxes, suffix, uni_losses, shared, batch_queries_num, losses=None
+    ):
         """
-        Every configured loss on one prediction set, weighted and suffixed. Losses named in
-        ``uni_losses`` use the union matches and count in ``shared`` instead of ``indices`` / ``num_boxes``.
+        Every configured loss (``losses``, default the criterion's) on one prediction set,
+        weighted and suffixed. Losses named in ``uni_losses`` use the union matches and count in
+        ``shared`` instead of ``indices`` / ``num_boxes``.
         """
         result = {}
-        for loss in self.losses:
+        for loss in self.losses if losses is None else losses:
             ind, nb = shared if (self.use_uni_set and loss in uni_losses) else (indices, num_boxes)
             meta = self.get_loss_meta_info(loss, outputs, targets, ind)
             l_dict = self.get_loss(loss, outputs, targets, ind, nb, batch_queries_num=batch_queries_num, **meta)
@@ -448,28 +458,14 @@ class DomeCriterion(nn.Module):
 
         losses.update(block(outputs["pre_outputs"], targets, cached_indices[-1], "_pre"))
 
+        enc_args = dict(uni_losses=("boxes",), losses=self.enc_losses)
         if outputs["enc_meta"]["class_agnostic"]:
             with self._class_agnostic(targets) as enc_targets:
                 for i, enc in enumerate(outputs["enc_aux_outputs"]):
-                    losses.update(block(enc, enc_targets, cached_indices_enc[i], f"_enc_{i}", uni_losses=("boxes",)))
+                    losses.update(block(enc, enc_targets, cached_indices_enc[i], f"_enc_{i}", **enc_args))
         else:
             for i, enc in enumerate(outputs["enc_aux_outputs"]):
-                losses.update(block(enc, targets, cached_indices_enc[i], f"_enc_{i}", uni_losses=("boxes",)))
-
-        if "enc_queries" in outputs:
-            # the encoder's outputs on its queries: objectness over the queries, box losses on the
-            # claimed tokens, both with the claim as the matching (no Hungarian), outside the union
-            # matching; tokens outside the query set get no loss
-            enc = outputs["enc_queries"]
-            on_queries = {"loss_obj": self.loss_obj(enc["pred_logits"], targets, enc["indices"], enc.get("valid"))}
-            on_queries.update(self.loss_boxes(enc, targets, enc["indices"], num_boxes))
-            losses.update(
-                {
-                    k + "_enc_queries": v * self.weight_dict[k] * self.enc_queries_weight
-                    for k, v in on_queries.items()
-                    if k in self.weight_dict
-                }
-            )
+                losses.update(block(enc, targets, cached_indices_enc[i], f"_enc_{i}", **enc_args))
 
         if "dn_outputs" in outputs:
             indices_dn = self.get_cdn_matched_indices(outputs["dn_meta"], targets)

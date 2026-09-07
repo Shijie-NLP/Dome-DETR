@@ -1,7 +1,9 @@
 # MaxIoU-S on VisDrone2019-DET: the D-FINE-S baseline recipe (plain HybridEncoder, no DeFE / MWAS)
-# with the ground-truth-claimed query initialization and no denoising. At training every ground
-# truth claims the encoder token whose box matches it best (plus a runner-up) and the rest of the
-# budget is top-k by score; at inference it is the plain top-k of D-FINE.
+# with the ground-truth-forced query selection and no denoising. At training every ground truth
+# forces the encoder token whose box matches it best into the queries and the rest are the tokens
+# the objectness passes; at inference the objectness alone selects. Everything past the selection
+# is D-FINE's (Hungarian matching), except that the encoder's class logits are trained as plain
+# 0/1 objectness (enc_losses) so that logit 0 is the selection rule.
 
 __include__: [
   '../dataset/visdrone_detection.yml',
@@ -36,20 +38,21 @@ MaxIoUTransformer:
   # the encoder's class logits are trained on 0/1 targets (class-balanced BCE, the claimed token's
   # class positive); their maximum is the objectness that picks the queries in training and
   # inference alike at its decision boundary, logit 0
-  min_queries: 300     # the least queries per image, training (claimed tokens included) and inference
-  min_negatives: 0     # training: the least rule-selected queries on top, for images with >= 300 gts
+  min_queries: 300     # the least queries per image, training (forced tokens included) and inference
   infer_rule: objectness   # or topk, the plain D-FINE selection
   # query self-attention: each query sees its local_attn_k nearest queries (0: all); or keep full
   # attention and rescale the logits by log(n)/log(num_queries) so the entropy does not grow with n
   local_attn_k: 32
   attn_logn_scale: False
-  # how a ground truth claims a token: nwd (the AI-TOD line's metric: a small box that just misses
-  # a tiny ground truth still beats a coarse-level box that merely contains it, which under giou
-  # or iou always wins because any non-overlapping box scores at most 0), giou or iou
+  # how a ground truth ranks the tokens' boxes: nwd (the AI-TOD line's metric: a small box that just
+  # misses a tiny ground truth still beats a coarse-level box that merely contains it, which under
+  # giou or iou always wins because any non-overlapping box scores at most 0), giou or iou
   assign_metric: nwd
-  assign_candidates: 8   # candidates per ground truth
+  assign_candidates: 8   # candidates per ground truth: its fallbacks when another took its best token
   assign_radius: 1       # candidates: the 3x3 cells around the ground truth's centre, per level
-  assign_chunk: 256      # ground truths per chunk of the fallback's distance matrix
+
+DomeCriterion:
+  enc_losses: ['obj', 'boxes']   # the encoder's queries: plain 0/1 objectness (no IoU target) and boxes
 
 
 optimizer:
