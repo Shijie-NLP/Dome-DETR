@@ -52,6 +52,13 @@ class DomeCriterion(nn.Module):
         mal_alpha: the negative weight of the MAL loss (``None``: 1).
         use_uni_set: match the box and localization losses against the union of the matches of
             every prediction set (D-FINE's 'go' indices) rather than each set's own.
+        enc_dense_weight: weight of the encoder's dense losses (``enc_dense`` outputs: every token's
+            class logits, the ground-truth-claimed tokens as positives with their own indices, and
+            the box losses on those).
+        obj_pos_weight: in the encoder's 0/1 classification loss (``loss_obj``, a class-balanced
+            BCE over every (token, class) entry, the claimed tokens' ground-truth class positive),
+            how much more the positive half weighs than the negative half; 1 is the balanced
+            decision boundary at logit 0.
     """
 
     __share__ = ["num_classes"]
@@ -71,6 +78,8 @@ class DomeCriterion(nn.Module):
         density_recall_penalty=0.3,
         mal_alpha=None,
         use_uni_set=True,
+        enc_dense_weight=1.0,
+        obj_pos_weight=1.0,
     ):
         super().__init__()
         self.num_classes = num_classes
@@ -85,6 +94,8 @@ class DomeCriterion(nn.Module):
         self.density_recall_penalty = density_recall_penalty
         self.mal_alpha = mal_alpha
         self.use_uni_set = use_uni_set
+        self.enc_dense_weight = enc_dense_weight
+        self.obj_pos_weight = obj_pos_weight
         self._clear_cache()
 
     def _clear_cache(self):
@@ -281,6 +292,25 @@ class DomeCriterion(nn.Module):
             losses["defe_reg_loss"] = (penalty * diff**2).mean()
         return losses
 
+    def loss_obj(self, logits, targets, indices, valid=None):
+        """
+        The encoder's 0/1 classification: a class-balanced BCE over every (token, class) entry of
+        ``logits [B, N, C]``. The claimed tokens (``indices``, per image the token index and its
+        ground truth) are positive on their ground-truth class (class 0 when ``C`` is 1), every
+        other entry negative; each half is normalized to weight 1/2 and the positive half scaled
+        by ``obj_pos_weight``. Invalid (border) tokens are left out.
+        """
+        target = torch.zeros_like(logits)
+        for i, (src, tgt) in enumerate(indices):
+            cls = targets[i]["labels"][tgt] if logits.shape[-1] > 1 else torch.zeros_like(tgt)
+            target[i, src, cls] = 1.0
+        keep = torch.ones_like(logits, dtype=torch.bool) if valid is None else valid[None, :, None].expand_as(target)
+        pos, neg = (target > 0) & keep, (target == 0) & keep
+        weight = torch.zeros_like(logits)
+        weight[pos] = 0.5 * self.obj_pos_weight / pos.sum().clamp(min=1)
+        weight[neg] = 0.5 / neg.sum().clamp(min=1)
+        return F.binary_cross_entropy_with_logits(logits, target, weight=weight, reduction="sum")
+
     # ------------------------------------------------------------------ assembling
 
     def get_loss(self, loss, outputs, targets, indices, num_boxes, **kwargs):
@@ -426,6 +456,20 @@ class DomeCriterion(nn.Module):
         else:
             for i, enc in enumerate(outputs["enc_aux_outputs"]):
                 losses.update(block(enc, targets, cached_indices_enc[i], f"_enc_{i}", uni_losses=("boxes",)))
+
+        if "enc_dense" in outputs:
+            # the encoder's dense outputs: objectness over every token, box losses on the claimed
+            # tokens, both with the claim as the matching (no Hungarian), outside the union matching
+            enc = outputs["enc_dense"]
+            dense = {"loss_obj": self.loss_obj(enc["pred_logits"], targets, enc["indices"], enc.get("valid"))}
+            dense.update(self.loss_boxes(enc, targets, enc["indices"], num_boxes))
+            losses.update(
+                {
+                    k + "_enc_dense": v * self.weight_dict[k] * self.enc_dense_weight
+                    for k, v in dense.items()
+                    if k in self.weight_dict
+                }
+            )
 
         if "dn_outputs" in outputs:
             indices_dn = self.get_cdn_matched_indices(outputs["dn_meta"], targets)
