@@ -345,26 +345,28 @@ class MaxIoUTransformer(DFINETransformer):
         def take(x, index):
             return x.gather(1, index.unsqueeze(-1).expand(-1, -1, x.shape[-1]))
 
-        def layout(forced, forced_valid, rule_count):
+        def layout(forced, num_forced, rule_count, *extra):
             """
-            The query index ``[B, max_total]`` and padding mask: each image's valid forced tokens,
-            then its ``rule_count`` best tokens by objectness among the rest; and the real counts.
+            The query index ``[B, max_total]`` and padding mask: each image's forced tokens
+            (``forced[i, :num_forced[i]]``, a prefix of real token indices), then its ``rule_count``
+            best tokens by objectness among the rest; the real counts and ``rule_count``, and every
+            ``extra`` ``[B]`` tensor, as lists read from the device in the same, single host sync.
             """
-            num_forced = forced_valid.sum(1)
+            m = forced.shape[1]
             taken = torch.zeros((b, n + 1), dtype=torch.bool, device=device)
-            taken.scatter_(1, torch.where(forced_valid, forced, n), True)
+            taken.scatter_(1, torch.where(forced >= 0, forced, n), True)
             rest = scores.masked_fill(taken[:, :n], float("-inf"))
             total = num_forced + rule_count
-            batch_queries_num = total.tolist()  # the one host sync
-            max_total = max(batch_queries_num)
-            ranked = rest.topk(min(int(rule_count.max()), n), dim=1).indices
-            ranked_valid = torch.arange(ranked.shape[1], device=device)[None, :] < rule_count[:, None]
-            index = torch.cat([forced.clamp(min=0), ranked], dim=1)
-            keep = torch.cat([forced_valid, ranked_valid], dim=1)
-            order = torch.sort((~keep).long(), dim=1, stable=True).indices
-            index = index.gather(1, order)[:, :max_total]
-            pad = torch.arange(max_total, device=device)[None, :] >= total[:, None]
-            return index, pad, batch_queries_num
+            batch_queries_num, rule_list, *extra = torch.stack([total, rule_count, *extra]).tolist()
+            max_total, k = max(batch_queries_num), min(max(rule_list), n)
+            ranked = rest.topk(k, dim=1).indices
+            pos = torch.arange(max_total, device=device)[None, :]
+            pad = pos >= total[:, None]
+            index = ranked.gather(1, (pos - num_forced[:, None]).clamp(0, k - 1).expand(b, -1))
+            if m:  # the forced prefix; padded rows of ``forced`` are never read
+                from_forced = forced.gather(1, pos.clamp(max=m - 1).expand(b, -1))
+                index = torch.where(pos < num_forced[:, None], from_forced, index)
+            return index, pad, batch_queries_num, rule_list, *extra
 
         with torch.no_grad():
             all_boxes = F.sigmoid(self.enc_bbox_head(output_memory) + anchors)  # no graph over all tokens
@@ -372,10 +374,8 @@ class MaxIoUTransformer(DFINETransformer):
 
             if not training:
                 count = passed.sum(1).clamp(min(self.min_queries, n), min(self.num_queries, n))
-                index, pad, batch_queries_num = layout(
-                    scores.new_empty((b, 0), dtype=torch.long),
-                    torch.zeros((b, 0), dtype=torch.bool, device=device),
-                    count,
+                index, pad, batch_queries_num, _ = layout(
+                    scores.new_empty((b, 0), dtype=torch.long), torch.zeros_like(count), count
                 )
                 contents = take(output_memory, index).masked_fill(pad[..., None], 0)
                 boxes_unact = inverse_sigmoid(take(all_boxes, index)).masked_fill(pad[..., None], 0)
@@ -392,14 +392,15 @@ class MaxIoUTransformer(DFINETransformer):
             passed_free = passed.sum(1) - claimed_passed.sum(1)
             cap = (self.num_queries - num_gt).clamp(min=self.min_negatives)
             rule_count = passed_free.clamp(min=self.min_negatives).minimum(cap).clamp(max=n - num_gt)
-            index, pad, batch_queries_num = layout(assigned, gt_valid, rule_count)
+            index, pad, batch_queries_num, rule_list, selected = layout(
+                assigned, num_gt, rule_count, claimed_passed.sum(1)
+            )
 
             contents = take(output_memory, index).masked_fill(pad[..., None], 0)
             boxes_unact = inverse_sigmoid(take(all_boxes, index)).masked_fill(pad[..., None], 0)
 
             self.last_assign_stats = [
-                {"num_gt": g, "selected": s, "rule": c}
-                for g, s, c in zip(num_gts, claimed_passed.sum(1).tolist(), rule_count.tolist())
+                {"num_gt": g, "selected": s, "rule": c} for g, s, c in zip(num_gts, selected, rule_list)
             ]
 
         # the encoder's dense outputs: every token's class logits, and the claimed tokens' boxes
