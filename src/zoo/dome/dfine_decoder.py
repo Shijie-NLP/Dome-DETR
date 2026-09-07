@@ -204,6 +204,10 @@ class DFINETransformer(nn.Module):
             first layer's box; with a value above 0 every edge can move at least so many cells of
             the finest level whatever the box size, so a tiny box a cell off can still reach its
             ground truth (0: off).
+        anchor_grid_size: the anchor box of the first level's tokens, as a fraction of the image;
+            it doubles per level (D-FINE's 0.05 is 5 cells of a stride-8 first level; a stride-4
+            first level wants 0.025 for the same ratio). Must exceed ``eps``, or the border test
+            marks every token invalid.
     """
 
     __share__ = ["num_classes", "eval_spatial_size"]
@@ -239,9 +243,11 @@ class DFINETransformer(nn.Module):
         attn_logn_base=None,
         min_sample_cells=0.0,
         min_refine_cells=0.0,
+        anchor_grid_size=0.05,
     ):
         super().__init__()
         assert len(feat_channels) <= num_levels
+        assert anchor_grid_size > eps, f"anchor_grid_size {anchor_grid_size} must exceed eps {eps}"
         assert len(feat_strides) == len(feat_channels)
         assert query_select_method in ("default", "one2many", "agnostic"), query_select_method
         assert cross_attn_method in ("default", "discrete"), cross_attn_method
@@ -257,6 +263,7 @@ class DFINETransformer(nn.Module):
         self.num_levels = num_levels
         self.num_classes = num_classes
         self.eps = eps
+        self.anchor_grid_size = anchor_grid_size
         self.num_layers = num_layers
         self.eval_spatial_size = eval_spatial_size
         self.aux_loss = aux_loss
@@ -388,8 +395,11 @@ class DFINETransformer(nn.Module):
         memory = torch.concat([feat.flatten(2).permute(0, 2, 1) for feat in proj_feats], 1)
         return proj_feats, memory, spatial_shapes
 
-    def _generate_anchors(self, spatial_shapes=None, grid_size=0.05, dtype=torch.float32, device="cpu"):
-        """One anchor box (as logits) per token of every level; boxes too close to the border are marked invalid."""
+    def _generate_anchors(self, spatial_shapes=None, dtype=torch.float32, device="cpu"):
+        """
+        One anchor box (as logits) per token of every level, ``anchor_grid_size * 2 ** level`` wide;
+        boxes too close to the border are marked invalid.
+        """
         if spatial_shapes is None:
             eval_h, eval_w = self.eval_spatial_size
             spatial_shapes = [[int(eval_h / s), int(eval_w / s)] for s in self.feat_strides]
@@ -399,7 +409,7 @@ class DFINETransformer(nn.Module):
             grid_y, grid_x = torch.meshgrid(torch.arange(h), torch.arange(w), indexing="ij")
             grid_xy = torch.stack([grid_x, grid_y], dim=-1)
             grid_xy = (grid_xy.unsqueeze(0) + 0.5) / torch.tensor([w, h], dtype=dtype)
-            wh = torch.ones_like(grid_xy) * grid_size * (2.0**lvl)
+            wh = torch.ones_like(grid_xy) * self.anchor_grid_size * (2.0**lvl)
             anchors.append(torch.concat([grid_xy, wh], dim=-1).reshape(-1, h * w, 4))
 
         anchors = torch.concat(anchors, dim=1).to(device)

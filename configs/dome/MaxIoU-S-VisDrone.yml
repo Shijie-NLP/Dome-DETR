@@ -54,6 +54,9 @@ MaxIoUTransformer:
   # the FDR layers move the box edges within a range proportional to the first layer's box; let
   # every edge move at least so many cells of the finest level whatever the box size (0: off)
   min_refine_cells: 2
+  # the first level's anchor box as a fraction of the image, doubling per level: 0.025 is 5 cells of
+  # the stride-4 level (20 px at 800), D-FINE's ratio; its 0.05 default was meant for a stride-8 level
+  anchor_grid_size: 0.025
   # how a ground truth ranks the tokens' boxes: gaussian (the same Gaussian similarity as the
   # criterion's quality: scale-invariant, and a small box that just misses a tiny ground truth still
   # beats a coarse-level box that merely contains it, which under giou or iou always wins because
