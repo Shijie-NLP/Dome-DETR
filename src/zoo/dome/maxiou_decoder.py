@@ -36,8 +36,8 @@ two ground truths want the same token the better-matching one keeps it and the o
 next candidate, in vectorized rounds until nobody loses (a boolean host sync per round; a few
 rounds in practice). A ground truth whose candidates all went to others then
 takes the nearest-centre unclaimed token, so every ground truth ends up with a query of its own
-(``_fallback``). One more host sync per batch (the query counts) plus one boolean when the fallback
-is needed.
+(``_fallback``, on the leftovers alone, in rounds). One more host sync per batch (the query
+counts) plus one count per fallback round.
 """
 
 import torch
@@ -282,38 +282,44 @@ class MaxIoUTransformer(DFINETransformer):
     def _fallback(self, assigned, gt_cxcywh, gt_valid, pred_cxcywh, valid):
         """
         Every real ground truth gets a token: one whose candidates all went to better-matching
-        ground truths takes the nearest-centre token nobody claimed (a second vectorized round on
-        those alone), and the rare leftovers are settled one by one. Only runs when needed.
+        ground truths takes the nearest-centre token nobody claimed. Works on the leftovers alone:
+        each keeps its ``assign_candidates`` nearest unclaimed tokens and the claims are resolved
+        as before, in rounds until every leftover holds a token (the nearest wins a contested
+        token). Only runs when needed.
         """
         b, n = pred_cxcywh.shape[:2]
-        left = (assigned < 0) & gt_valid
-        if not left.any():  # one host sync, only the boolean
-            return assigned
-        taken = torch.zeros((b, n + 1), dtype=torch.bool, device=assigned.device)
-        taken.scatter_(1, torch.where(assigned >= 0, assigned, n), True)
-        blocked = torch.where(valid[None, :] & ~taken[:, :n], 0.0, float("inf")).to(pred_cxcywh.dtype)
+        device = assigned.device
         k = min(self.assign_candidates, n)
-        idx, val = [], []
-        for start in range(0, gt_cxcywh.shape[1], self.assign_chunk):
-            sl = slice(start, start + self.assign_chunk)
-            dist = torch.cdist(gt_cxcywh[:, sl, :2], pred_cxcywh[..., :2]) + blocked[:, None, :]
-            near = dist.topk(k, dim=-1, largest=False)
-            idx.append(near.indices)
-            val.append(-near.values)
-        second = self._resolve(
-            torch.cat(idx, 1), torch.cat(val, 1).masked_fill(~left[..., None], float("-inf")), left, n
-        )
-        assigned = torch.where(left, second, assigned)
-
-        left = (assigned < 0) & gt_valid
-        if left.any():  # more contenders than candidates around one spot: settle them sequentially
+        taken = torch.zeros((b, n + 1), dtype=torch.bool, device=device)
+        rounds = None
+        while True:
+            left = (assigned < 0) & gt_valid
+            num_left = left.sum(1)
+            max_left = int(num_left.max())  # one host sync per round
+            if max_left == 0:
+                return assigned
+            if rounds is None:
+                rounds = max_left  # every round settles the best bidder of each image with leftovers
+            assert rounds > 0, "an image has more ground truths than valid tokens"
+            rounds -= 1
             taken.scatter_(1, torch.where(assigned >= 0, assigned, n), True)
-            for i, j in left.nonzero().tolist():
-                dist = torch.cdist(gt_cxcywh[i, j : j + 1, :2], pred_cxcywh[i, :, :2]).squeeze(0)
-                dist = dist.masked_fill(taken[i, :n] | ~valid, float("inf"))
-                assigned[i, j] = dist.argmin()
-                taken[i, assigned[i, j]] = True
-        return assigned
+            blocked = torch.where(valid[None, :] & ~taken[:, :n], 0.0, float("inf")).to(pred_cxcywh.dtype)
+            # the leftovers compacted to [B, max_left], in ground-truth order, then their nearest
+            # unclaimed tokens (cdist's matmul path is exact enough: its error is ~1e-7 in the
+            # squared distance, the cells are 1e-2 wide)
+            order = torch.sort((~left).long(), dim=1, stable=True).indices[:, :max_left]
+            left_valid = torch.arange(max_left, device=device)[None, :] < num_left[:, None]
+            centres = gt_cxcywh[..., :2].gather(1, order[..., None].expand(-1, -1, 2))
+            idx, val = [], []
+            for start in range(0, max_left, self.assign_chunk):
+                sl = slice(start, start + self.assign_chunk)
+                dist = torch.cdist(centres[:, sl], pred_cxcywh[..., :2])
+                near = dist.add_(blocked[:, None, :]).topk(k, dim=-1, largest=False)
+                idx.append(near.indices)
+                val.append(-near.values)  # blocked tokens: -inf, never held
+            val = torch.cat(val, 1).masked_fill(~left_valid[..., None], float("-inf"))
+            claimed = self._resolve(torch.cat(idx, 1), val, left_valid, n)  # [B, max_left]
+            assigned = assigned.scatter(1, order, torch.where(left_valid, claimed, assigned.gather(1, order)))
 
     # ------------------------------------------------------------------ query initialization
 
