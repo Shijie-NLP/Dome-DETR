@@ -23,6 +23,7 @@ from ...misc.box_ops import (
     gaussian_box_similarity,
 )
 from .fdr import bbox2distance
+from .matcher import topk_matching
 
 __all__ = ["DomeCriterion"]
 
@@ -49,6 +50,15 @@ class DomeCriterion(nn.Module):
             compute.
         enc_losses: the losses of the encoder sets instead (``None``: ``losses``); e.g.
             ``['obj', 'boxes']`` trains the encoder's class logits as plain 0/1 objectness.
+        enc_matching: how the encoder sets are matched: ``hungarian`` (D-FINE, one query per
+            ground truth) or ``topk`` (``matcher.topk_matching``: every ground truth's
+            ``enc_topk`` most similar queries are its positives, a query serving one ground truth
+            at most). The encoder's queries are candidates, not detections, so one-to-one is not
+            needed there, and several passing tokens per object make its recall robust.
+        enc_topk: the queries per ground truth of ``topk``.
+        enc_in_uni_set: whether the encoder sets' matches join the union matching (D-FINE: yes).
+            With ``topk`` they should not, or the decoder's box losses would turn one-to-many.
+            The encoder sets' box losses then use their own matches.
         alpha, gamma: the focal parameters of the classification losses.
         reg_max: the FDR bin count of the decoder.
         quality: the localization quality of a matched pair, the VFL / MAL target score and the
@@ -91,6 +101,9 @@ class DomeCriterion(nn.Module):
         mal_alpha=None,
         use_uni_set=True,
         enc_losses=None,
+        enc_matching="hungarian",
+        enc_topk=3,
+        enc_in_uni_set=True,
         obj_pos_weight=1.0,
     ):
         super().__init__()
@@ -99,6 +112,11 @@ class DomeCriterion(nn.Module):
         self.weight_dict = weight_dict
         self.losses = losses
         self.enc_losses = enc_losses
+        assert enc_matching in ("hungarian", "topk"), enc_matching
+        assert enc_topk >= 1
+        self.enc_matching = enc_matching
+        self.enc_topk = enc_topk
+        self.enc_in_uni_set = enc_in_uni_set
         assert quality in ("iou", "giou", "nwd", "gaussian"), quality
         self.quality = quality
         self.nwd_c = nwd_c
@@ -467,12 +485,24 @@ class DomeCriterion(nn.Module):
         self._clear_cache()
 
         # match every prediction set in one go, and build the union matching for the box losses
-        sets = [outputs, *outputs["aux_outputs"], outputs["pre_outputs"], *outputs["enc_aux_outputs"]]
-        matched = self.matcher.match_sets(sets, targets, batch_queries_num=batch_queries_num)
-        num_aux = len(outputs["aux_outputs"])
-        indices, cached_indices, cached_indices_enc = matched[0], matched[1 : num_aux + 2], matched[num_aux + 2 :]
+        hungarian_enc = self.enc_matching == "hungarian"
+        sets = [outputs, *outputs["aux_outputs"], outputs["pre_outputs"]]
+        matched = self.matcher.match_sets(
+            sets + (outputs["enc_aux_outputs"] if hungarian_enc else []), targets, batch_queries_num=batch_queries_num
+        )
+        indices, cached_indices = matched[0], matched[1 : len(sets)]
+        if hungarian_enc:
+            cached_indices_enc = matched[len(sets) :]
+        else:
+            cached_indices_enc = [
+                topk_matching(o, targets, self.enc_topk, batch_queries_num) for o in outputs["enc_aux_outputs"]
+            ]
         num_targets = [len(t["labels"]) for t in targets]
-        indices_go = self._union_indices(matched, outputs["pred_logits"].shape[1], num_targets)
+        indices_go = self._union_indices(
+            matched[: len(sets)] + (cached_indices_enc if self.enc_in_uni_set else []),
+            outputs["pred_logits"].shape[1],
+            num_targets,
+        )
         shared = (indices_go, self._average_over_ranks(sum(len(x[0]) for x in indices_go), device))
         num_boxes = self._average_over_ranks(sum(num_targets), device)
 
@@ -493,14 +523,20 @@ class DomeCriterion(nn.Module):
 
         losses.update(block(outputs["pre_outputs"], targets, cached_indices[-1], "_pre"))
 
-        enc_args = dict(uni_losses=("boxes",), losses=self.enc_losses)
+        # the encoder sets: their own losses, and outside the union their own matches and pair counts
+        def enc_args(i):
+            if self.enc_in_uni_set:
+                return dict(uni_losses=("boxes",), losses=self.enc_losses)
+            pairs = self._average_over_ranks(sum(len(x[0]) for x in cached_indices_enc[i]), device)
+            return dict(uni_losses=(), losses=self.enc_losses, num_boxes=pairs)
+
         if outputs["enc_meta"]["class_agnostic"]:
             with self._class_agnostic(targets) as enc_targets:
                 for i, enc in enumerate(outputs["enc_aux_outputs"]):
-                    losses.update(block(enc, enc_targets, cached_indices_enc[i], f"_enc_{i}", **enc_args))
+                    losses.update(block(enc, enc_targets, cached_indices_enc[i], f"_enc_{i}", **enc_args(i)))
         else:
             for i, enc in enumerate(outputs["enc_aux_outputs"]):
-                losses.update(block(enc, targets, cached_indices_enc[i], f"_enc_{i}", **enc_args))
+                losses.update(block(enc, targets, cached_indices_enc[i], f"_enc_{i}", **enc_args(i)))
 
         if "dn_outputs" in outputs:
             indices_dn = self.get_cdn_matched_indices(outputs["dn_meta"], targets)

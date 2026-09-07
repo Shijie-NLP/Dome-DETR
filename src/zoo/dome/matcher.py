@@ -15,10 +15,37 @@ from scipy.optimize import linear_sum_assignment
 from ...core import register
 from ...misc.box_ops import box_cxcywh_to_xyxy, gaussian_box_similarity, generalized_box_iou
 
-__all__ = ["HungarianMatcher"]
+__all__ = ["HungarianMatcher", "topk_matching"]
 
 # the assignments of a batch run in parallel: scipy releases the GIL in linear_sum_assignment
 _ASSIGN_POOL = ThreadPoolExecutor(max_workers=min(8, os.cpu_count() or 1))
+
+
+@torch.no_grad()
+def topk_matching(outputs, targets, k, batch_queries_num=None):
+    """
+    One-to-many assignment for a prediction set whose predictions are candidates rather than
+    detections (the encoder's queries): every ground truth takes its ``k`` most similar real
+    queries by ``box_ops.gaussian_box_similarity`` of the boxes, and a query wanted by several
+    ground truths goes to the one it is most similar to, so a query has at most one target and a
+    ground truth at most ``k`` queries. Returns per-image ``(pred_idx, target_idx)`` pairs on the
+    predictions' device, as ``HungarianMatcher.forward`` does.
+    """
+    boxes = outputs["pred_boxes"]
+    empty = torch.zeros(0, dtype=torch.long, device=boxes.device)
+    indices = []
+    for i, t in enumerate(targets):
+        q = boxes.shape[1] if batch_queries_num is None else batch_queries_num[i]
+        gt = t["boxes"]
+        if gt.shape[0] == 0 or q == 0:
+            indices.append((empty, empty))
+            continue
+        sim = gaussian_box_similarity(boxes[i, :q, None, :], gt[None, :, :])  # [Q_i, N_i]
+        wanted = torch.zeros_like(sim, dtype=torch.bool).scatter_(0, sim.topk(min(k, q), dim=0).indices, True)
+        best = sim.masked_fill(~wanted, -1.0).max(dim=1)  # each query's best ground truth among those wanting it
+        src = (best.values >= 0).nonzero().squeeze(1)
+        indices.append((src, best.indices[src]))
+    return indices
 
 
 @register()

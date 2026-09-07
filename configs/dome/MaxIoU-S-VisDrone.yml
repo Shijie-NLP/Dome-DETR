@@ -68,6 +68,13 @@ MaxIoUTransformer:
 
 DomeCriterion:
   enc_losses: ['obj', 'boxes']   # the encoder's queries: plain 0/1 objectness (no IoU target) and boxes
+  # the encoder's queries are candidates, not detections: every ground truth's enc_topk most similar
+  # queries are its positives (one-to-many), so an object keeps a few passing tokens instead of one
+  # peak; their matches stay out of the union matching, which would make the decoder's box losses
+  # one-to-many too. enc_matching: hungarian, enc_in_uni_set: True restores D-FINE's
+  enc_matching: topk
+  enc_topk: 3
+  enc_in_uni_set: False
   # the VFL target of the decoder's queries: the boxes' Gaussian similarity (1 - Hellinger distance),
   # parameter-free and about three times less sensitive to a pixel of offset on a tiny box than
   # IoU, whose target jumps with the box head's normal jitter; iou (D-FINE), giou or nwd to ablate
