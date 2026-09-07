@@ -33,8 +33,8 @@ arithmetic, no ``cdist``), scored exactly with ``assign_metric`` (for ``nwd`` th
 normalized Gaussian Wasserstein distance is the ranking by the plain distance in
 ``(cx, cy, w/2, h/2)`` space). Each ground truth keeps its ``assign_candidates`` best tokens; when
 two ground truths want the same token the better-matching one keeps it and the other moves to its
-next candidate, in vectorized rounds over a compact id space until nobody loses (a boolean host
-sync per round; a few rounds in practice). A ground truth whose candidates all went to others then
+next candidate, in vectorized rounds until nobody loses (a boolean host sync per round; a few
+rounds in practice). A ground truth whose candidates all went to others then
 takes the nearest-centre unclaimed token, so every ground truth ends up with a query of its own
 (``_fallback``). One more host sync per batch (the query counts) plus one boolean when the fallback
 is needed.
@@ -224,31 +224,30 @@ class MaxIoUTransformer(DFINETransformer):
         One-to-one claims from the candidate lists ``[B, M, K]`` (``n_tokens`` marks a dummy): a
         ground truth that loses its current candidate to a better-matching ground truth moves to
         its next one, until nobody loses. Returns the claimed token of every ground truth,
-        ``[B, M]``, ``-1`` where the candidates ran out or the ground truth is padding. Bids run in
-        a compact id space of the candidate tokens.
+        ``[B, M]``, ``-1`` where the candidates ran out or the ground truth is padding.
         """
         b, m, k = cand_idx.shape
         device = cand_idx.device
-        # tokens numbered across the batch, then compacted to the ones that appear as candidates
-        offset = (torch.arange(b, device=device) * (n_tokens + 1))[:, None, None]
-        ids, compact = torch.unique(cand_idx + offset, return_inverse=True)
-        u = ids.numel()
-        compact = compact.view(b, m, k)
+        # tokens numbered across the batch (the dummy included); the bid tables are one row per
+        # token, a few MiB, so nothing to compact
+        u = b * (n_tokens + 1)
+        slots = cand_idx + (torch.arange(b, device=device) * (n_tokens + 1))[:, None, None]
         gt = torch.arange(b * m, device=device).view(b, m)
+        best = cand_val.new_empty((u,))
+        owner = torch.empty((u + 1,), dtype=torch.long, device=device)  # row u: the non-holders' bin
         ptr = torch.zeros((b, m), dtype=torch.long, device=device)
         active = gt_valid.clone()
         # A round: every active ground truth bids on its current candidate; the best bid holds the
         # token and the others move on. Winners can lose later to a better bid that moves in, so
         # the rounds run until nobody loses. Every loss advances a pointer, so k * m rounds bound it.
         for _ in range(k * m + 1):
-            slot = compact.gather(-1, ptr[..., None]).squeeze(-1)  # [B, M]
+            slot = slots.gather(-1, ptr[..., None]).squeeze(-1)  # [B, M]
             val = cand_val.gather(-1, ptr[..., None]).squeeze(-1)
             active &= val.isfinite()  # candidates are best first: past a dummy, only dummies remain
             # the best bid on each slot, then the lowest-index ground truth holding it
-            best = val.new_full((u,), float("-inf")).scatter_reduce(0, slot.flatten(), val.flatten(), "amax")
+            best.fill_(float("-inf")).scatter_reduce_(0, slot.flatten(), val.flatten(), "amax")
             holds = active & (val >= best[slot])
-            owner = torch.full((u + 1,), b * m, dtype=torch.long, device=device)
-            owner = owner.scatter_reduce(0, torch.where(holds, slot, u).flatten(), gt.flatten(), "amin")
+            owner.fill_(b * m).scatter_reduce_(0, torch.where(holds, slot, u).flatten(), gt.flatten(), "amin")
             win = holds & (owner[slot] == gt)
             lose = active & ~win
             if not lose.any():  # one boolean per round
