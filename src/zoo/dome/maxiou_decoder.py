@@ -44,6 +44,7 @@ counts) plus one count per fallback round.
 
 import torch
 import torch.nn.functional as F  # noqa: N812
+from torch.nn.utils.rnn import pad_sequence
 
 from ...core import register
 from ...misc.box_ops import box_cxcywh_to_xyxy
@@ -201,8 +202,9 @@ class MaxIoUTransformer(DFINETransformer):
         idx = rr.mul_(w[:, None]).add_(cc).add_(start[:, None])
         cand = torch.where(inside, idx, n).flatten(2).long()  # [B, M, C]; n is the dummy token
 
-        # the metric's features of every token and ground truth, the candidates' gathered through
-        # a zero row for the dummy token, [B, M, C, 4]
+        # the metric's features of the candidate tokens and the ground truths, [B, M, C, 4] (a
+        # dummy reads token N - 1 and is masked below)
+        token = cand.clamp(max=n - 1)
         if self.assign_metric == "nwd":
             # exp(-W2 / C) is monotone in the Wasserstein distance between the boxes' Gaussians, so
             # ranking by the plain distance in (cx, cy, w/2, h/2) space is the same ranking
@@ -210,14 +212,13 @@ class MaxIoUTransformer(DFINETransformer):
             gt_feat = torch.cat([gt_cxcywh[..., :2], gt_cxcywh[..., 2:] / 2], dim=-1)
         else:
             feat, gt_feat = box_cxcywh_to_xyxy(pred_cxcywh), box_cxcywh_to_xyxy(gt_cxcywh)
-        feat = torch.cat([feat, feat.new_zeros((b, 1, 4))], dim=1)
-        feat = feat.gather(1, cand.flatten(1).unsqueeze(-1).expand(-1, -1, 4)).view(b, m, -1, 4)
+        feat = feat.gather(1, token.flatten(1).unsqueeze(-1).expand(-1, -1, 4)).view(b, m, -1, 4)
         if self.assign_metric == "nwd":
             match = -(feat - gt_feat[:, :, None, :]).norm(dim=-1)
         else:
             iou, giou = _pair_iou_giou(gt_feat[:, :, None, :], feat)
             match = iou if self.assign_metric == "iou" else giou
-        ok = torch.cat([valid, valid.new_zeros(1)])[cand] & gt_valid[..., None]  # dummy, invalid, padding out
+        ok = inside.flatten(2) & valid[token] & gt_valid[..., None]  # dummy, invalid, padding out
         match = match.masked_fill_(~ok, float("-inf"))
         best = match.topk(min(self.assign_candidates, match.shape[-1]), dim=-1)
         return torch.where(best.values.isfinite(), cand.gather(-1, best.indices), n), best.values
@@ -266,22 +267,22 @@ class MaxIoUTransformer(DFINETransformer):
     def _claim(self, targets, pred_cxcywh, valid, spatial_shapes):
         """
         The tokens the ground truths claim: ``[B, M]`` token indices in ground-truth order (``-1``
-        only for padded ground truths), the padded ground-truth boxes ``[B, M, 4]``, the number
-        of real ground truths per image and how many of them needed the fallback, ``[B]``.
+        only for padded ground truths), the padded ground-truth boxes ``[B, M, 4]`` and their
+        validity ``[B, M]``, the number of real ground truths per image and how many of them
+        needed the fallback, ``[B]``.
         """
-        b, n = pred_cxcywh.shape[:2]
+        n = pred_cxcywh.shape[1]
+        device = pred_cxcywh.device
         num_gts = [t["boxes"].shape[0] for t in targets]
-        m = max(num_gts)
-        gt_boxes = pred_cxcywh.new_zeros((b, m, 4))
-        gt_valid = torch.zeros((b, m), dtype=torch.bool, device=pred_cxcywh.device)
-        for i, t in enumerate(targets):
-            gt_boxes[i, : num_gts[i]] = t["boxes"]
-            gt_valid[i, : num_gts[i]] = True
+        gt_boxes = pad_sequence([t["boxes"] for t in targets], batch_first=True).to(pred_cxcywh.dtype)
+        gt_valid = (
+            torch.arange(gt_boxes.shape[1], device=device)[None, :] < torch.tensor(num_gts, device=device)[:, None]
+        )
         cand_idx, cand_val = self._candidates(gt_boxes, gt_valid, pred_cxcywh, valid, spatial_shapes)
         assigned = self._resolve(cand_idx, cand_val, gt_valid, n)
         fallen = ((assigned < 0) & gt_valid).sum(1)  # ground truths whose candidates all went to others
         assigned = self._fallback(assigned, gt_boxes, gt_valid, pred_cxcywh, valid)
-        return assigned, gt_boxes, num_gts, fallen
+        return assigned, gt_boxes, gt_valid, num_gts, fallen
 
     def _fallback(self, assigned, gt_cxcywh, gt_valid, pred_cxcywh, valid):
         """
@@ -397,10 +398,8 @@ class MaxIoUTransformer(DFINETransformer):
                 boxes_unact = inverse_sigmoid(take(all_boxes, index)).masked_fill(pad[..., None], 0)
                 return DecoderInput(contents, boxes_unact, [], [], batch_queries_num)
 
-            assigned, gt_boxes, num_gts, fallen = self._claim(targets, all_boxes, valid, spatial_shapes)
-            m = assigned.shape[1]
-            num_gt = torch.tensor(num_gts, device=device)
-            gt_valid = torch.arange(m, device=device)[None, :] < num_gt[:, None]
+            assigned, gt_boxes, gt_valid, num_gts, fallen = self._claim(targets, all_boxes, valid, spatial_shapes)
+            num_gt = gt_valid.sum(1)
             claimed = assigned.clamp(min=0)  # padding rows point at token 0 and are masked below
             claimed_passed = (take(scores.unsqueeze(-1), claimed).squeeze(-1) > 0) & gt_valid
             # the claimed tokens per level, [B, L]
