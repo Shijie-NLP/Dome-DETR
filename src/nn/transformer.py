@@ -142,6 +142,7 @@ class TransformerDecoderLayer(nn.Module):
         n_points=4,
         cross_attn_method="default",
         layer_scale=None,
+        min_sample_cells=0.0,
     ):
         super().__init__()
         if layer_scale is not None:
@@ -154,7 +155,9 @@ class TransformerDecoderLayer(nn.Module):
         self.norm1 = nn.LayerNorm(d_model)
 
         # cross attention
-        self.cross_attn = MSDeformableAttention(d_model, n_head, n_levels, n_points, method=cross_attn_method)
+        self.cross_attn = MSDeformableAttention(
+            d_model, n_head, n_levels, n_points, method=cross_attn_method, min_sample_cells=min_sample_cells
+        )
         self.dropout2 = nn.Dropout(dropout)
 
         # gate

@@ -195,6 +195,9 @@ class DFINETransformer(nn.Module):
         attn_logn_scale / attn_logn_base: scale the self-attention logits of every image by
             ``log(n) / log(base)``, ``n`` its number of keys (the log-n scaling that keeps the
             attention entropy stable across query counts); ``base`` defaults to ``num_queries``.
+        min_sample_cells: the deformable cross-attention samples within a range proportional to
+            the query's box; with a value above 0 that range is at least so many cells on every
+            level, so a tiny box still reads its surroundings on the coarse levels (0: off).
     """
 
     __share__ = ["num_classes", "eval_spatial_size"]
@@ -228,6 +231,7 @@ class DFINETransformer(nn.Module):
         local_attn_k=0,
         attn_logn_scale=False,
         attn_logn_base=None,
+        min_sample_cells=0.0,
     ):
         super().__init__()
         assert len(feat_channels) <= num_levels
@@ -272,6 +276,7 @@ class DFINETransformer(nn.Module):
             n_levels=num_levels,
             n_points=num_points,
             cross_attn_method=cross_attn_method,
+            min_sample_cells=min_sample_cells,
         )
         decoder_layer = TransformerDecoderLayer(**layer_args)
         decoder_layer_wide = TransformerDecoderLayer(**layer_args, layer_scale=layer_scale)

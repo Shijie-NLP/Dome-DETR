@@ -82,7 +82,7 @@ class MaxIoUTransformer(DFINETransformer):
             at inference alike.
         infer_rule: ``objectness`` (the head's decision, per-image count) or ``topk``
             (``num_queries`` best by objectness).
-        local_attn_k / attn_logn_scale / attn_logn_base: see ``DFINETransformer``.
+        local_attn_k / attn_logn_scale / attn_logn_base / min_sample_cells: see ``DFINETransformer``.
     """
 
     def __init__(
@@ -119,6 +119,7 @@ class MaxIoUTransformer(DFINETransformer):
         local_attn_k=0,
         attn_logn_scale=False,
         attn_logn_base=None,
+        min_sample_cells=0.0,
     ):
         super().__init__(
             num_classes=num_classes,
@@ -148,6 +149,7 @@ class MaxIoUTransformer(DFINETransformer):
             local_attn_k=local_attn_k,
             attn_logn_scale=attn_logn_scale,
             attn_logn_base=attn_logn_base,
+            min_sample_cells=min_sample_cells,
         )
         assert assign_metric in ("gaussian", "nwd", "giou", "iou"), assign_metric
         assert assign_candidates >= 1 and assign_radius >= 0

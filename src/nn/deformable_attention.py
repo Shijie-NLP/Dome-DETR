@@ -81,15 +81,28 @@ class MSDeformableAttention(nn.Module):
     """
     Multi-scale deformable attention. ``num_points`` is one int for every level or a list with
     one entry per level; ``offset_scale`` scales the predicted offsets relative to the reference
-    box size. With ``method='discrete'`` the sampling offsets are frozen.
+    box size. ``min_sample_cells`` (0: off) floors that size, per level, at so many cells of the
+    level: a box smaller than a cell then still spreads its sampling points over its surroundings
+    on every level instead of reading the same cell with all of them. With ``method='discrete'``
+    the sampling offsets are frozen.
     """
 
-    def __init__(self, embed_dim=256, num_heads=8, num_levels=4, num_points=4, method="default", offset_scale=0.5):
+    def __init__(
+        self,
+        embed_dim=256,
+        num_heads=8,
+        num_levels=4,
+        num_points=4,
+        method="default",
+        offset_scale=0.5,
+        min_sample_cells=0.0,
+    ):
         super().__init__()
         self.embed_dim = embed_dim
         self.num_heads = num_heads
         self.num_levels = num_levels
         self.offset_scale = offset_scale
+        self.min_sample_cells = min_sample_cells
 
         if isinstance(num_points, list):
             assert len(num_points) == num_levels, "num_points needs one entry per level"
@@ -100,6 +113,8 @@ class MSDeformableAttention(nn.Module):
 
         num_points_scale = [1 / n for n in num_points_list for _ in range(n)]
         self.register_buffer("num_points_scale", torch.tensor(num_points_scale, dtype=torch.float32))
+        point_level = [level for level, n in enumerate(num_points_list) for _ in range(n)]
+        self.register_buffer("point_level", torch.tensor(point_level), persistent=False)
 
         self.total_points = num_heads * sum(num_points_list)
         self.method = method
@@ -136,7 +151,7 @@ class MSDeformableAttention(nn.Module):
         """
         Args:
             query: ``[bs, query_length, C]``
-            reference_points: ``[bs, query_length, n_levels, 4]`` normalized cxcywh boxes (the
+            reference_points: ``[bs, query_length, 1, 4]`` normalized cxcywh boxes (the
                 2-coordinate point form of Deformable DETR is not supported here).
             value: the per-level values from ``TransformerDecoder.value_op``.
             value_spatial_shapes: the ``(h, w)`` of each level.
@@ -159,7 +174,12 @@ class MSDeformableAttention(nn.Module):
             )
 
         num_points_scale = self.num_points_scale.to(dtype=query.dtype).unsqueeze(-1)
-        offset = sampling_offsets * num_points_scale * reference_points[:, :, None, :, 2:] * self.offset_scale
+        wh = reference_points[:, :, None, :, 2:]  # [bs, len_q, 1, 1, 2], the offsets' unit
+        if self.min_sample_cells > 0:
+            hw = torch.tensor(value_spatial_shapes, dtype=wh.dtype, device=wh.device)  # [n_levels, 2]
+            cells = (self.min_sample_cells / hw.flip(-1))[self.point_level]  # [sum(num_points), 2]
+            wh = torch.maximum(wh, cells)  # at least so many cells of the point's level
+        offset = sampling_offsets * num_points_scale * wh * self.offset_scale
         sampling_locations = reference_points[:, :, None, :, :2] + offset
 
         return self.ms_deformable_attn_core(

@@ -60,6 +60,7 @@ class DomeTransformer(DFINETransformer):
         max_num_select=1500,
         nms_iou_low=0.4,
         nms_iou_high=0.9,
+        min_sample_cells=0.0,
     ):
         super().__init__(
             num_classes=num_classes,
@@ -86,6 +87,7 @@ class DomeTransformer(DFINETransformer):
             reg_scale=reg_scale,
             layer_scale=layer_scale,
             num_queries=max_num_select,
+            min_sample_cells=min_sample_cells,
         )
         self.min_num_select = min_num_select
         self.max_num_select = max_num_select

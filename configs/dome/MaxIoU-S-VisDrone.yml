@@ -44,6 +44,9 @@ MaxIoUTransformer:
   # attention and rescale the logits by log(n)/log(num_queries) so the entropy does not grow with n
   local_attn_k: 64
   attn_logn_scale: False
+  # the deformable cross-attention samples within a range proportional to the query's box; floor
+  # it at so many cells on every level so tiny boxes still read their surroundings (0: off)
+  min_sample_cells: 2
   # how a ground truth ranks the tokens' boxes: gaussian (the same Gaussian similarity as the
   # criterion's quality: scale-invariant, and a small box that just misses a tiny ground truth still
   # beats a coarse-level box that merely contains it, which under giou or iou always wins because
