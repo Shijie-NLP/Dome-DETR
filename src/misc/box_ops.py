@@ -18,6 +18,7 @@ __all__ = [
     "box_xyxy_to_cxcywh",
     "elementwise_box_iou",
     "elementwise_generalized_box_iou",
+    "gaussian_box_similarity",
     "generalized_box_iou",
 ]
 
@@ -71,6 +72,24 @@ def elementwise_box_iou(boxes1: Tensor, boxes2: Tensor) -> tuple[Tensor, Tensor]
     inter = wh[:, 0] * wh[:, 1]
     union = area1 + area2 - inter
     return inter / union, union
+
+
+def gaussian_box_similarity(boxes1: Tensor, boxes2: Tensor, eps: float = 1e-6) -> Tensor:
+    """
+    One minus the Hellinger distance between cxcywh boxes taken as the Gaussians
+    ``N((cx, cy), diag((w/2)^2, (h/2)^2))``, ``[...]`` in [0, 1] over broadcastable ``[..., 4]``
+    inputs: 1 for identical boxes, parameter-free, scale-invariant, smooth in the offset and
+    defined for boxes that do not overlap; about three times less sensitive to a small offset
+    than IoU. Per axis the Bhattacharyya distance is ``dc^2 / (w1^2 + w2^2) + ln((w1^2 + w2^2) /
+    (2 w1 w2)) / 2``, the coefficient ``exp(-distance)`` and the Hellinger distance
+    ``sqrt(1 - coefficient)``.
+    """
+    size1, size2 = boxes1[..., 2:].clamp(min=eps), boxes2[..., 2:].clamp(min=eps)
+    size_sq = size1**2 + size2**2
+    centre = (boxes1[..., :2] - boxes2[..., :2]) ** 2 / size_sq
+    size = 0.5 * torch.log(size_sq / (2 * size1 * size2))
+    coefficient = torch.exp(-(centre + size).sum(-1))
+    return 1 - (1 - coefficient).clamp(min=0).sqrt()
 
 
 def elementwise_generalized_box_iou(boxes1: Tensor, boxes2: Tensor) -> Tensor:

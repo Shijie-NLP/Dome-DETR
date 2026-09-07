@@ -20,6 +20,7 @@ from ...misc.box_ops import (
     box_cxcywh_to_xyxy,
     elementwise_box_iou,
     elementwise_generalized_box_iou,
+    gaussian_box_similarity,
 )
 from .fdr import bbox2distance
 
@@ -145,14 +146,7 @@ class DomeCriterion(nn.Module):
             delta = src_boxes - target_boxes
             w2 = torch.cat([delta[:, :2], delta[:, 2:] / 2], dim=-1).norm(dim=-1)  # in (cx, cy, w/2, h/2)
             return torch.exp(-w2 / self.nwd_c)
-        # gaussian: a box is the Gaussian N((cx, cy), diag((w/2)^2, (h/2)^2)); per axis the
-        # Bhattacharyya distance of two Gaussians is dc^2 / (w1^2 + w2^2) + ln((w1^2 + w2^2) / (2 w1 w2)) / 2,
-        # the coefficient is exp(-distance) and the Hellinger distance sqrt(1 - coefficient)
-        size_sq = src_boxes[:, 2:].clamp(min=1e-6) ** 2 + target_boxes[:, 2:].clamp(min=1e-6) ** 2
-        centre = (src_boxes[:, :2] - target_boxes[:, :2]) ** 2 / size_sq
-        size = 0.5 * torch.log(size_sq / (2 * src_boxes[:, 2:].clamp(min=1e-6) * target_boxes[:, 2:].clamp(min=1e-6)))
-        coefficient = torch.exp(-(centre + size).sum(-1))
-        return 1 - (1 - coefficient).clamp(min=0).sqrt()
+        return gaussian_box_similarity(src_boxes, target_boxes)
 
     def _class_targets(self, src_logits, targets, indices, idx):
         """Per-query target class (``num_classes`` = background) and its one-hot over the real classes."""

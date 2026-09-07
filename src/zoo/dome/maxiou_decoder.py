@@ -13,8 +13,8 @@ logit 0, can serve as the selection rule.
 - The objectness of a token is its highest class logit; logit 0 is the selection rule, no
   threshold to estimate or store.
 - Training (with ground truths in the batch): every ground truth forces one token of its own
-  into the queries, the token whose predicted box matches it best (``assign_metric``: ``nwd``,
-  ``giou`` or ``iou``) among the ``(2 * assign_radius + 1)``-cell windows around its centre cell
+  into the queries, the token whose predicted box matches it best (``assign_metric``:
+  ``gaussian``, ``nwd``, ``giou`` or ``iou``) among the ``(2 * assign_radius + 1)``-cell windows around its centre cell
   on every level (index arithmetic, no ``cdist``). Two ground truths wanting the same token are
   not a matter of assignment (the criterion's Hungarian decides who predicts what) but of
   coverage: every ground truth gets a distinct token, so the second one moves on to its next
@@ -40,7 +40,7 @@ import torch.nn.functional as F  # noqa: N812
 from torch.nn.utils.rnn import pad_sequence
 
 from ...core import register
-from ...misc.box_ops import box_cxcywh_to_xyxy
+from ...misc.box_ops import box_cxcywh_to_xyxy, gaussian_box_similarity
 from .dfine_decoder import DecoderInput, DFINETransformer
 
 __all__ = ["MaxIoUTransformer"]
@@ -67,10 +67,13 @@ def _pair_iou_giou(a_xyxy, b_xyxy):
 class MaxIoUTransformer(DFINETransformer):
     """
     Args (on top of ``DFINETransformer``'s; ``num_queries`` is the most queries an image gets):
-        assign_metric: how a ground truth ranks the tokens' predicted boxes: ``nwd`` (a small box
-            that just misses a tiny ground truth still beats a coarse box that merely contains
-            it), ``giou`` or ``iou`` (under both, any box containing the ground truth beats any
-            box not overlapping it).
+        assign_metric: how a ground truth ranks the tokens' predicted boxes: ``gaussian`` (the
+            boxes' Gaussian similarity, ``box_ops.gaussian_box_similarity``: scale-invariant,
+            and a small box that just misses a tiny ground truth still beats a coarse box that
+            merely contains it), ``nwd`` (the same ranking as the normalized Gaussian Wasserstein
+            distance, i.e. by plain distance in ``(cx, cy, w/2, h/2)`` space: an offset counts in
+            pixels whatever the box size), ``giou`` or ``iou`` (under both, any box containing
+            the ground truth beats any box not overlapping it).
         assign_candidates: tokens each ground truth keeps as candidates, its fallbacks when
             another ground truth took its best one.
         assign_radius: cells around the ground truth's centre cell, per level, that are candidates
@@ -108,7 +111,7 @@ class MaxIoUTransformer(DFINETransformer):
         reg_scale=4.0,
         layer_scale=1,
         num_queries=300,
-        assign_metric="nwd",
+        assign_metric="gaussian",
         assign_candidates=8,
         assign_radius=1,
         min_queries=300,
@@ -146,7 +149,7 @@ class MaxIoUTransformer(DFINETransformer):
             attn_logn_scale=attn_logn_scale,
             attn_logn_base=attn_logn_base,
         )
-        assert assign_metric in ("giou", "iou", "nwd"), assign_metric
+        assert assign_metric in ("gaussian", "nwd", "giou", "iou"), assign_metric
         assert assign_candidates >= 1 and assign_radius >= 0
         assert infer_rule in ("objectness", "topk"), infer_rule
         assert min_queries <= num_queries
@@ -194,7 +197,9 @@ class MaxIoUTransformer(DFINETransformer):
 
         # the metric's features of every token and ground truth, the candidates' gathered through
         # a zero row for the dummy token, [B, M, C, 4]
-        if self.assign_metric == "nwd":
+        if self.assign_metric == "gaussian":
+            feat, gt_feat = pred_cxcywh, gt_cxcywh
+        elif self.assign_metric == "nwd":
             # exp(-W2 / C) is monotone in the Wasserstein distance between the boxes' Gaussians, so
             # ranking by the plain distance in (cx, cy, w/2, h/2) space is the same ranking
             feat = torch.cat([pred_cxcywh[..., :2], pred_cxcywh[..., 2:] / 2], dim=-1)
@@ -203,7 +208,9 @@ class MaxIoUTransformer(DFINETransformer):
             feat, gt_feat = box_cxcywh_to_xyxy(pred_cxcywh), box_cxcywh_to_xyxy(gt_cxcywh)
         feat = torch.cat([feat, feat.new_zeros((b, 1, 4))], dim=1)
         feat = feat.gather(1, cand.flatten(1).unsqueeze(-1).expand(-1, -1, 4)).view(b, m, -1, 4)
-        if self.assign_metric == "nwd":
+        if self.assign_metric == "gaussian":
+            match = gaussian_box_similarity(gt_feat[:, :, None, :], feat)
+        elif self.assign_metric == "nwd":
             match = -(feat - gt_feat[:, :, None, :]).norm(dim=-1)
         else:
             iou, giou = _pair_iou_giou(gt_feat[:, :, None, :], feat)

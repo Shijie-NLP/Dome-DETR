@@ -44,10 +44,11 @@ MaxIoUTransformer:
   # attention and rescale the logits by log(n)/log(num_queries) so the entropy does not grow with n
   local_attn_k: 64
   attn_logn_scale: False
-  # how a ground truth ranks the tokens' boxes: nwd (the AI-TOD line's metric: a small box that just
-  # misses a tiny ground truth still beats a coarse-level box that merely contains it, which under
-  # giou or iou always wins because any non-overlapping box scores at most 0), giou or iou
-  assign_metric: nwd
+  # how a ground truth ranks the tokens' boxes: gaussian (the same Gaussian similarity as the
+  # criterion's quality: scale-invariant, and a small box that just misses a tiny ground truth still
+  # beats a coarse-level box that merely contains it, which under giou or iou always wins because
+  # any non-overlapping box scores at most 0), nwd (the AI-TOD line's metric), giou or iou
+  assign_metric: gaussian
   assign_candidates: 8   # candidates per ground truth: its fallbacks when another took its best token
   assign_radius: 1       # candidates: the 3x3 cells around the ground truth's centre, per level
 
