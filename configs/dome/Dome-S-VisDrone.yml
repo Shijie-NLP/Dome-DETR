@@ -57,13 +57,13 @@ lr_scheduler:
   gamma: 0.8
 
 
-# 160 epochs; augmentation and multi-scale training stop at 108 and the last 52 epochs
+# 160 epochs; augmentation and multi-scale training stop at 150 and the last 10 epochs
 # train on clean images
 epoches: 160
 train_dataloader:
   dataset:
     transforms:
       policy:
-        epoch: 108
+        epoch: 150
   collate_fn:
-    stop_epoch: 108
+    stop_epoch: 150

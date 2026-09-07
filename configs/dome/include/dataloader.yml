@@ -1,32 +1,8 @@
-# Training and validation pipelines at 800 px.
-# This include comes after the dataset file, so its `ops` lists replace the dataset file's:
-# the augmentations that actually run are the ones here.
-#
-# Images are resized with their aspect ratio kept. Training resizes the short side to 800 and takes
-# a random 800x800 crop; validation uses the mmdetection-style 1333x800 (short side 800, long side
-# capped at 1333) on the whole image, batches padded to a multiple of 32. For AI-TOD, whose tiles
-# are 800x800 already, both are no-ops.
+# The batching shared by every dataset: multi-scale training around 800 px and validation batches
+# padded to a multiple of 32. The augmentations are the dataset files' (they depend on the data:
+# VisDrone is oblique drone footage, AI-TOD orthogonal aerial tiles).
 
 train_dataloader:
-  dataset:
-    transforms:
-      ops:
-        - {type: RandomPhotometricDistort, p: 0.5}
-        - {type: RandomZoomOut, fill: 0}
-        - {type: RandomIoUCrop, p: 0.8}
-        - {type: SanitizeBoundingBoxes, min_size: 1}
-        - {type: RandomHorizontalFlip}
-        - {type: Resize, size: 800}  # short side 800, aspect ratio kept
-        - {type: RandomCrop, size: [800, 800]}
-        - {type: SanitizeBoundingBoxes, min_size: 1}
-        - {type: ConvertPILImage, dtype: 'float32', scale: True}
-        - {type: ConvertBoxes, fmt: 'cxcywh', normalize: True}
-      policy:
-        # from this epoch on the listed augmentations are switched off
-        name: stop_epoch
-        epoch: 72
-        ops: ['RandomPhotometricDistort', 'RandomZoomOut', 'RandomIoUCrop']
-
   collate_fn:
     type: BatchImageCollateFunction
     # multi-scale training: each batch is resized to a random scale around base_size, with
@@ -44,11 +20,6 @@ train_dataloader:
 
 
 val_dataloader:
-  dataset:
-    transforms:
-      ops:
-        - {type: Resize, size: 800, max_size: 1333}  # 1333x800: short side 800, long side at most 1333
-        - {type: ConvertPILImage, dtype: 'float32', scale: True}
   collate_fn:
     type: BatchImageCollateFunction
     pad_to_multiple: 32

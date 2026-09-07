@@ -2,6 +2,12 @@ task: detection
 
 # VisDrone2019-DET, read from https://huggingface.co/datasets/shijli/visdrone2019-det
 # (official annotations; 'others' dropped, 'ignored regions' kept as ignore boxes)
+#
+# Images are resized with their aspect ratio kept. Training resizes the short side to 800 and takes
+# a random 800x800 crop; validation uses the mmdetection-style 1333x800 (short side 800, long side
+# capped at 1333) on the whole image. RandomIoUCrop zooms in on a 30% to 100% region, which is the
+# augmentation the tiny objects profit from; no zoom-out, mosaic or mix-up, which shrink them
+# further (the short side of 800 already halves them). Oblique footage: only horizontal flips.
 
 evaluator:
   type: VisDroneEvaluator
@@ -18,26 +24,20 @@ train_dataloader:
     transforms:
       type: Compose
       ops:
-        - {type: Mosaic, size: [800, 800], p: 1.0}
-        - {type: MixUp, alpha: 1.5, p: 0.2}
         - {type: RandomPhotometricDistort, p: 0.5}
-        - {type: RandomZoomOut, fill: 0}
         - {type: RandomIoUCrop, p: 0.8}
         - {type: SanitizeBoundingBoxes, min_size: 1}
         - {type: RandomHorizontalFlip}
-        - {type: Resize, size: [800, 800], }
+        - {type: Resize, size: 800}  # short side 800, aspect ratio kept
+        - {type: RandomCrop, size: [800, 800]}
         - {type: SanitizeBoundingBoxes, min_size: 1}
         - {type: ConvertPILImage, dtype: 'float32', scale: True}
         - {type: ConvertBoxes, fmt: 'cxcywh', normalize: True}
       policy:
+        # from this epoch on the listed augmentations are switched off
         name: stop_epoch
-        epoch: 72 # epoch in [71, ~) stop `ops`
-        ops: ['Mosaic', 'MixUp', 'RandomPhotometricDistort', 'RandomZoomOut', 'RandomIoUCrop']
-  collate_fn:
-    type: BatchImageCollateFunction
-    base_size: 800
-    base_size_repeat: 2
-    stop_epoch: 72 # epoch in [72, ~) stop `multiscales`
+        epoch: 72
+        ops: ['RandomPhotometricDistort', 'RandomIoUCrop']
   shuffle: True
   num_workers: 4
 
@@ -49,9 +49,7 @@ val_dataloader:
     transforms:
       type: Compose
       ops:
-        - {type: Resize, size: [800, 800], }
+        - {type: Resize, size: 800, max_size: 1333}  # 1333x800: short side 800, long side at most 1333
         - {type: ConvertPILImage, dtype: 'float32', scale: True}
-  collate_fn:
-    type: BatchImageCollateFunction
   shuffle: False
   num_workers: 4

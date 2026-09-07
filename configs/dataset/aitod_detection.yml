@@ -2,6 +2,11 @@ task: detection
 
 # AI-TOD-v2, read from https://huggingface.co/datasets/shijli/aitod-v2
 # (official v2 annotations; the AI-TOD protocol trains on train + validation and reports on test)
+#
+# The tiles are 800x800 already, so the resize and the crop only act on the zoomed-in crops of
+# RandomIoUCrop (a 30% to 100% region scaled up: the augmentation the tiny objects profit from).
+# No zoom-out, mosaic or mix-up, which shrink them. Orthogonal aerial imagery: every orientation
+# is as natural as any other, so both flips and the 90-degree rotations are free data.
 
 evaluator:
   type: AITODEvaluator
@@ -18,23 +23,21 @@ train_dataloader:
       type: Compose
       ops:
         - {type: RandomPhotometricDistort, p: 0.5}
-        - {type: RandomZoomOut, fill: 0}
         - {type: RandomIoUCrop, p: 0.8}
         - {type: SanitizeBoundingBoxes, min_size: 1}
         - {type: RandomHorizontalFlip}
-        - {type: Resize, size: [800, 800], }
+        - {type: RandomVerticalFlip}
+        - {type: RandomRotate90}  # 0, 90, 180 or 270 degrees, equally likely
+        - {type: Resize, size: 800}  # short side 800, aspect ratio kept
+        - {type: RandomCrop, size: [800, 800]}
         - {type: SanitizeBoundingBoxes, min_size: 1}
         - {type: ConvertPILImage, dtype: 'float32', scale: True}
         - {type: ConvertBoxes, fmt: 'cxcywh', normalize: True}
       policy:
+        # from this epoch on the listed augmentations are switched off (the flips and rotations stay)
         name: stop_epoch
-        epoch: 72 # epoch in [71, ~) stop `ops`
-        ops: ['RandomPhotometricDistort', 'RandomZoomOut', 'RandomIoUCrop']
-  collate_fn:
-    type: BatchImageCollateFunction
-    base_size: 800
-    base_size_repeat: 2
-    stop_epoch: 72 # epoch in [72, ~) stop `multiscales`
+        epoch: 72
+        ops: ['RandomPhotometricDistort', 'RandomIoUCrop']
   shuffle: True
   num_workers: 4
 
@@ -46,9 +49,7 @@ val_dataloader:
     transforms:
       type: Compose
       ops:
-        - {type: Resize, size: [800, 800], }
+        - {type: Resize, size: 800, max_size: 1333}
         - {type: ConvertPILImage, dtype: 'float32', scale: True}
-  collate_fn:
-    type: BatchImageCollateFunction
   shuffle: False
   num_workers: 4
