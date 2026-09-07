@@ -189,7 +189,7 @@ class DomeCriterion(nn.Module):
         """Sum a ``[B, Q, C]`` per-query loss, ignoring the padded queries of each image, normalized by ``num_boxes``."""
         if batch_queries_num is not None:
             queries = torch.arange(loss.shape[1], device=loss.device)[None, :]
-            valid = queries < torch.as_tensor(batch_queries_num, device=loss.device)[:, None]
+            valid = queries < torch.tensor(batch_queries_num).to(loss.device, non_blocking=True)[:, None]
             loss = loss * valid.unsqueeze(-1)
         return loss.mean(1).sum() * loss.shape[1] / num_boxes
 
@@ -303,8 +303,9 @@ class DomeCriterion(nn.Module):
             batch_scale = 8 / outputs["pred_boxes"].shape[0]
             self.num_pos = (mask.sum() * batch_scale) ** 0.5
             self.num_neg = ((~mask).sum() * batch_scale) ** 0.5
-        loss_pos = loss_match_local[mask].mean() if mask.any() else 0
-        loss_neg = loss_match_local[~mask].mean() if (~mask).any() else 0
+        # the halves' means, 0 for an empty half, without reading the masks on the host
+        loss_pos = (loss_match_local * mask).sum() / mask.sum().clamp(min=1)
+        loss_neg = (loss_match_local * ~mask).sum() / (~mask).sum().clamp(min=1)
         return (loss_pos * self.num_pos + loss_neg * self.num_neg) / (self.num_pos + self.num_neg)
 
     @staticmethod

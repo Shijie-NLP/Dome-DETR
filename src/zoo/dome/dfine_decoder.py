@@ -398,11 +398,19 @@ class DFINETransformer(nn.Module):
     def _generate_anchors(self, spatial_shapes=None, dtype=torch.float32, device="cpu"):
         """
         One anchor box (as logits) per token of every level, ``anchor_grid_size * 2 ** level`` wide;
-        boxes too close to the border are marked invalid.
+        boxes too close to the border are marked invalid. Cached per (shapes, device): a forward
+        pays for them once per input size. (Built on the host as before: a CUDA division by a
+        Python scalar rounds differently and flips border tokens' validity.)
         """
         if spatial_shapes is None:
             eval_h, eval_w = self.eval_spatial_size
             spatial_shapes = [[int(eval_h / s), int(eval_w / s)] for s in self.feat_strides]
+        key = (tuple(tuple(int(x) for x in hw) for hw in spatial_shapes), str(device), dtype)
+        cache = self.__dict__.setdefault("_anchor_cache", {})  # plain attribute: not a buffer, not saved
+        if key in cache:
+            return cache[key]
+        if len(cache) >= 64:  # variable eval sizes: bound the cache
+            cache.clear()
 
         anchors = []
         for lvl, (h, w) in enumerate(spatial_shapes):
@@ -412,10 +420,11 @@ class DFINETransformer(nn.Module):
             wh = torch.ones_like(grid_xy) * self.anchor_grid_size * (2.0**lvl)
             anchors.append(torch.concat([grid_xy, wh], dim=-1).reshape(-1, h * w, 4))
 
-        anchors = torch.concat(anchors, dim=1).to(device)
+        anchors = torch.concat(anchors, dim=1).to(device, non_blocking=True)
         valid_mask = ((anchors > self.eps) * (anchors < 1 - self.eps)).all(-1, keepdim=True)
         anchors = torch.log(anchors / (1 - anchors))
         anchors = torch.where(valid_mask, anchors, torch.inf)
+        cache[key] = (anchors, valid_mask)
         return anchors, valid_mask
 
     # ------------------------------------------------------------------ query initialization
@@ -506,7 +515,9 @@ class DFINETransformer(nn.Module):
         fdr_min_unit = None
         if self.min_refine_cells > 0:  # so many cells of the finest level, normalized, (x, y)
             h, w = spatial_shapes[0]
-            fdr_min_unit = torch.tensor([self.min_refine_cells / w, self.min_refine_cells / h], device=memory.device)
+            fdr_min_unit = torch.tensor([self.min_refine_cells / w, self.min_refine_cells / h]).to(
+                memory.device, non_blocking=True
+            )
 
         out_bboxes, out_logits, out_corners, out_refs, pre_bboxes, pre_logits = self.decoder(
             init_ref_contents,
@@ -536,10 +547,8 @@ class DFINETransformer(nn.Module):
 
         if min(batch_queries_num) < num_queries:
             # padded queries never become detections (the criterion masks them by count anyway)
-            pad = (
-                torch.arange(num_queries, device=memory.device)[None, :]
-                >= torch.tensor(batch_queries_num, device=memory.device)[:, None]
-            )
+            counts = torch.tensor(batch_queries_num).to(memory.device, non_blocking=True)
+            pad = torch.arange(num_queries, device=memory.device)[None, :] >= counts[:, None]
             out_logits = out_logits.masked_fill(pad[None, :, :, None], -1e4)
             pre_logits = pre_logits.masked_fill(pad[:, :, None], -1e4)
 

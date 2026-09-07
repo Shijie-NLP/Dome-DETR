@@ -177,7 +177,7 @@ class MSDeformableAttention(nn.Module):
         num_points_scale = self.num_points_scale.to(dtype=query.dtype).unsqueeze(-1)
         wh = reference_points[:, :, None, :, 2:]  # [bs, len_q, 1, 1, 2], the offsets' unit
         if self.min_sample_cells > 0:
-            hw = torch.tensor(value_spatial_shapes, dtype=wh.dtype, device=wh.device)  # [n_levels, 2]
+            hw = torch.tensor(value_spatial_shapes, dtype=wh.dtype).to(wh.device, non_blocking=True)  # [L, 2]
             # the unit whose offset_scale half is a radius of min_sample_cells cells of the point's level
             cells = (self.min_sample_cells / self.offset_scale / hw.flip(-1))[self.point_level]  # [P, 2]
             wh = torch.maximum(wh, cells)
