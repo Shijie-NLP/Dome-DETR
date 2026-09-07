@@ -48,7 +48,6 @@ from torch.nn.utils.rnn import pad_sequence
 
 from ...core import register
 from ...misc.box_ops import box_cxcywh_to_xyxy
-from ...nn.functional import inverse_sigmoid
 from .dfine_decoder import DecoderInput, DFINETransformer
 
 __all__ = ["MaxIoUTransformer"]
@@ -335,8 +334,7 @@ class MaxIoUTransformer(DFINETransformer):
         """
         anchors, valid_mask = self._generate_anchors(spatial_shapes, device=memory.device)
         valid = valid_mask.reshape(-1)  # [N]
-        if memory.shape[0] > 1:
-            anchors = anchors.repeat(memory.shape[0], 1, 1)
+        anchors = anchors.expand(memory.shape[0], -1, -1)  # [B, N, 4], no copy
         memory = valid_mask.to(memory.dtype) * memory
         output_memory: torch.Tensor = self.enc_output(memory)
         enc_outputs_logits: torch.Tensor = self.enc_score_head(output_memory)  # [B, N, C]
@@ -386,37 +384,47 @@ class MaxIoUTransformer(DFINETransformer):
             return index, pad, batch_queries_num, rule_list, *extra
 
         with torch.no_grad():
-            all_boxes = F.sigmoid(self.enc_bbox_head(output_memory) + anchors)  # no graph over all tokens
             passed = scores > 0  # [B, N], the head's decision
+            num_valid = valid.sum()  # the rule never selects an invalid token
 
             if not training:
-                count = passed.sum(1).clamp(min(self.min_queries, n), min(self.num_queries, n))
+                if self.training:
+                    self.last_assign_stats = None  # a batch without ground truths
+                count = passed.sum(1).clamp(min(self.min_queries, n), min(self.num_queries, n)).minimum(num_valid)
                 index, pad, batch_queries_num, _ = layout(
                     scores.new_empty((b, 0), dtype=torch.long), torch.zeros_like(count), count
                 )
-                contents = take(output_memory, index).masked_fill(pad[..., None], 0)
-                boxes_unact = inverse_sigmoid(take(all_boxes, index)).masked_fill(pad[..., None], 0)
-                return DecoderInput(contents, boxes_unact, [], [], batch_queries_num)
+                contents = take(output_memory, index)
+                boxes_unact = self.enc_bbox_head(contents) + take(anchors, index)  # the head on the queries alone
+                return DecoderInput(
+                    contents.masked_fill(pad[..., None], 0),
+                    boxes_unact.masked_fill(pad[..., None], 0),
+                    [],
+                    [],
+                    batch_queries_num,
+                )
 
+            boxes_unact = self.enc_bbox_head(output_memory) + anchors  # every token's box: the claim needs them
+            all_boxes = F.sigmoid(boxes_unact)
             assigned, gt_boxes, gt_valid, num_gts, fallen = self._claim(targets, all_boxes, valid, spatial_shapes)
             num_gt = gt_valid.sum(1)
             claimed = assigned.clamp(min=0)  # padding rows point at token 0 and are masked below
-            claimed_passed = (take(scores.unsqueeze(-1), claimed).squeeze(-1) > 0) & gt_valid
+            num_selected = (passed.gather(1, claimed) & gt_valid).sum(1)  # claimed tokens the head lets through
             # the claimed tokens per level, [B, L]
             ends = torch.tensor([h * w for h, w in spatial_shapes]).cumsum(0).to(device, non_blocking=True)
             level = F.one_hot(torch.bucketize(claimed, ends, right=True), len(spatial_shapes))
             per_level = level.masked_fill(~gt_valid[..., None], 0).sum(1)
 
             # rule-selected queries: the unclaimed tokens the objectness passes, floored and capped
-            passed_free = passed.sum(1) - claimed_passed.sum(1)
+            passed_free = passed.sum(1) - num_selected
             cap = (self.num_queries - num_gt).clamp(min=self.min_negatives)
-            rule_count = passed_free.clamp(min=self.min_negatives).minimum(cap).clamp(max=n - num_gt)
+            rule_count = passed_free.clamp(min=self.min_negatives).minimum(cap).minimum(num_valid - num_gt)
             index, pad, batch_queries_num, rule_list, selected, fell, *levels = layout(
-                assigned, num_gt, rule_count, claimed_passed.sum(1), fallen, *per_level.unbind(1)
+                assigned, num_gt, rule_count, num_selected, fallen, *per_level.unbind(1)
             )
 
             contents = take(output_memory, index).masked_fill(pad[..., None], 0)
-            boxes_unact = inverse_sigmoid(take(all_boxes, index)).masked_fill(pad[..., None], 0)
+            boxes_unact = take(boxes_unact, index).masked_fill(pad[..., None], 0)
 
             self.last_assign_stats = [
                 {"num_gt": g, "selected": s, "rule": c, "fallback": f, "levels": lv}
