@@ -45,7 +45,7 @@ MaxIoUTransformer:
   attn_logn_scale: False
   # how a ground truth claims a token: giou (default), iou, or nwd (the AI-TOD line's metric)
   assign_metric: giou
-  assign_candidates: 8   # candidates per ground truth, and max conflict-resolution rounds
+  assign_candidates: 8   # candidates per ground truth
   assign_radius: 1       # candidates: the 3x3 cells around the ground truth's centre, per level
   assign_chunk: 256      # ground truths per chunk of the fallback's distance matrix
 

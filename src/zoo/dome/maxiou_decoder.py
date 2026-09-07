@@ -33,11 +33,11 @@ arithmetic, no ``cdist``), scored exactly with ``assign_metric`` (for ``nwd`` th
 normalized Gaussian Wasserstein distance is the ranking by the plain distance in
 ``(cx, cy, w/2, h/2)`` space). Each ground truth keeps its ``assign_candidates`` best tokens; when
 two ground truths want the same token the better-matching one keeps it and the other moves to its
-next candidate, for at most ``assign_candidates`` vectorized rounds over a compact id space, with
-no host sync. A ground truth whose candidates all went to others then
+next candidate, in vectorized rounds over a compact id space until nobody loses (a boolean host
+sync per round; a few rounds in practice). A ground truth whose candidates all went to others then
 takes the nearest-centre unclaimed token, so every ground truth ends up with a query of its own
-(``_fallback``). One host sync per batch (the query counts) plus one boolean when the fallback is
-needed.
+(``_fallback``). One more host sync per batch (the query counts) plus one boolean when the fallback
+is needed.
 """
 
 import torch
@@ -74,8 +74,7 @@ class MaxIoUTransformer(DFINETransformer):
     Args (on top of ``DFINETransformer``'s; ``num_queries`` is the most queries an image gets):
         assign_metric: ``giou`` (default: unlike IoU it still ranks tokens whose box does not
             overlap a tiny ground truth), ``iou`` or ``nwd``.
-        assign_candidates: tokens each ground truth keeps as candidates, and the maximum number of
-            conflict-resolution rounds.
+        assign_candidates: tokens each ground truth keeps as candidates.
         assign_radius: cells around the ground truth's centre cell, per level, that are candidates
             (1: a 3x3 window on each level).
         assign_chunk: ground truths per chunk of the fallback's distance matrix (memory).
@@ -224,9 +223,9 @@ class MaxIoUTransformer(DFINETransformer):
         """
         One-to-one claims from the candidate lists ``[B, M, K]`` (``n_tokens`` marks a dummy): a
         ground truth that loses its current candidate to a better-matching ground truth moves to
-        its next one. Returns the claimed token of every ground truth, ``[B, M]``, ``-1`` where the
-        candidates ran out or the ground truth is padding. Bids run in a compact id space of the
-        candidate tokens and never touch the host.
+        its next one, until nobody loses. Returns the claimed token of every ground truth,
+        ``[B, M]``, ``-1`` where the candidates ran out or the ground truth is padding. Bids run in
+        a compact id space of the candidate tokens.
         """
         b, m, k = cand_idx.shape
         device = cand_idx.device
@@ -238,22 +237,26 @@ class MaxIoUTransformer(DFINETransformer):
         gt = torch.arange(b * m, device=device).view(b, m)
         ptr = torch.zeros((b, m), dtype=torch.long, device=device)
         active = gt_valid.clone()
-        for round_ in range(k + 1):
+        # A round: every active ground truth bids on its current candidate; the best bid holds the
+        # token and the others move on. Winners can lose later to a better bid that moves in, so
+        # the rounds run until nobody loses. Every loss advances a pointer, so k * m rounds bound it.
+        for _ in range(k * m + 1):
             slot = compact.gather(-1, ptr[..., None]).squeeze(-1)  # [B, M]
             val = cand_val.gather(-1, ptr[..., None]).squeeze(-1)
-            # the best finite bid on each slot, then the lowest-index ground truth holding it
+            active &= val.isfinite()  # candidates are best first: past a dummy, only dummies remain
+            # the best bid on each slot, then the lowest-index ground truth holding it
             best = val.new_full((u,), float("-inf")).scatter_reduce(0, slot.flatten(), val.flatten(), "amax")
-            holds = active & val.isfinite() & (val >= best[slot])
+            holds = active & (val >= best[slot])
             owner = torch.full((u + 1,), b * m, dtype=torch.long, device=device)
             owner = owner.scatter_reduce(0, torch.where(holds, slot, u).flatten(), gt.flatten(), "amin")
             win = holds & (owner[slot] == gt)
-            if round_ == k:
-                break  # the last evaluation decides; its losers stay unresolved
             lose = active & ~win
+            if not lose.any():  # one boolean per round
+                break
             ptr = ptr + lose.long()
-            active = active & (ptr < k)
+            active &= ptr < k
             ptr = ptr.clamp(max=k - 1)
-        # winners of the last evaluation hold distinct tokens by construction
+        # the winners hold distinct tokens by construction
         tok = cand_idx.gather(-1, ptr[..., None]).squeeze(-1)
         return torch.where(win, tok, torch.full_like(tok, -1))
 
