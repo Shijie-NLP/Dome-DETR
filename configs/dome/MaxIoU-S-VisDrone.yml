@@ -36,8 +36,8 @@ MaxIoUTransformer:
   # the encoder's class logits are trained on 0/1 targets (class-balanced BCE, the claimed token's
   # class positive); their maximum is the objectness that picks the queries in training and
   # inference alike at its decision boundary, logit 0
-  min_negatives: 100   # training: the least rule-selected queries per image
-  min_queries: 100     # inference: the least queries per image; num_queries is only a memory guard
+  min_queries: 300     # the least queries per image, training (claimed tokens included) and inference
+  min_negatives: 0     # training: the least rule-selected queries on top, for images with >= 300 gts
   infer_rule: objectness   # or topk, the plain D-FINE selection
   # query self-attention: each query sees its local_attn_k nearest queries (0: all); or keep full
   # attention and rescale the logits by log(n)/log(num_queries) so the entropy does not grow with n

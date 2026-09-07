@@ -20,8 +20,9 @@ the queries in training and inference alike; the decoder alone decides localizat
   many claimed tokens lie on each level (``levels``: a drift of tiny objects' claims towards
   coarse levels shows here).
 - Decoder queries, training: the claimed tokens (forced) plus every other token the objectness
-  selects, floored at ``min_negatives`` of the latter and capped so an image has at most
-  ``max(num_queries, #gt + min_negatives)`` queries. Every query is a real token with its own
+  selects, floored so an image has at least ``min_queries`` queries (the same floor as at
+  inference; ``min_negatives`` of them unforced) and capped so it has at most
+  ``max(num_queries, #gt + min_negatives)``. Every query is a real token with its own
   content and predicted box; the decoder's Hungarian matching labels them. Images differ in query
   count (padded to the largest, ``batch_queries_num`` tells the criterion).
 - Inference: the tokens the objectness selects, clamped to ``[min_queries, num_queries]`` by its
@@ -81,8 +82,11 @@ class MaxIoUTransformer(DFINETransformer):
         assign_radius: cells around the ground truth's centre cell, per level, that are candidates
             (1: a 3x3 window on each level).
         assign_chunk: ground truths per chunk of the fallback's distance matrix (memory).
-        min_negatives: the least rule-selected (unforced) queries an image gets in training.
-        min_queries: the least queries an image gets at inference.
+        min_queries: the least queries an image gets, in training (claimed tokens included) and at
+            inference alike.
+        min_negatives: the least rule-selected (unforced) queries an image gets in training, on
+            top of ``min_queries``: a floor for images with about ``min_queries`` ground truths
+            or more, which would otherwise train the decoder with no negative query.
         infer_rule: ``objectness`` (the head's decision, per-image count) or ``topk``
             (``num_queries`` best by objectness).
         local_attn_k / attn_logn_scale / attn_logn_base: see ``DFINETransformer``.
@@ -418,8 +422,9 @@ class MaxIoUTransformer(DFINETransformer):
 
             # rule-selected queries: the unclaimed tokens the objectness passes, floored and capped
             passed_free = passed.sum(1) - num_selected
+            floor = (self.min_queries - num_gt).clamp(min=self.min_negatives)
             cap = (self.num_queries - num_gt).clamp(min=self.min_negatives)
-            rule_count = passed_free.clamp(min=self.min_negatives).minimum(cap).minimum(num_valid - num_gt)
+            rule_count = passed_free.maximum(floor).minimum(cap).minimum(num_valid - num_gt)
             index, pad, batch_queries_num, rule_list, selected, fell, *levels = layout(
                 assigned, num_gt, rule_count, num_selected, fallen, *per_level.unbind(1)
             )
