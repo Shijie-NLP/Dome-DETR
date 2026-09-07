@@ -7,11 +7,12 @@ Ground-truth-claimed query initialization (working name ``MaxIoUTransformer``): 
 encoder's class scores are trained as plain 0/1 targets and their maximum, an objectness, picks
 the queries in training and inference alike; the decoder alone decides localization quality.
 
-- Encoder, dense: every token predicts a box; each ground truth claims the token whose box
-  matches it best (``giou`` by default, ``iou`` or ``nwd``), one token per ground truth. The
-  encoder's score head keeps its class logits but is trained with a class-balanced BCE on 0/1
-  targets, 1 on the claimed token's ground-truth class and 0 on every other (token, class) entry
-  (``loss_obj``, no IoU-aware target); the claimed tokens also get the box losses (``enc_dense``).
+- Encoder: every token predicts a box; each ground truth claims the token whose box matches it
+  best (``giou`` by default, ``iou`` or ``nwd``), one token per ground truth. The encoder is
+  trained on the queries alone, as D-FINE's on its top-k (``enc_queries``): its score head keeps
+  its class logits, trained with a class-balanced BCE on 0/1 targets, 1 on a claimed token's
+  ground-truth class and 0 on every other (query, class) entry (``loss_obj``, no IoU-aware
+  target); the claimed tokens also get the box losses. Tokens outside the query set get no loss.
   No Hungarian on the encoder side. The objectness of a token is its highest class logit, and
   the decision boundary, logit 0, is the selection rule: no threshold to estimate or store.
   ``last_assign_stats`` reports, per image, the claimed tokens the head already lets through
@@ -345,7 +346,7 @@ class MaxIoUTransformer(DFINETransformer):
         """
         Training (with ground truths in the batch): every ground truth's claimed token, then the
         other tokens the objectness passes, by its logit, padded to the largest count in the
-        batch, plus the encoder's dense outputs for the criterion (``extra``). Inference: the
+        batch, plus the encoder's outputs on them for the criterion (``extra``). Inference: the
         tokens the objectness passes, clamped to ``[min_queries, num_queries]`` by its logit, or
         the plain top-k by objectness with ``infer_rule='topk'``.
         """
@@ -431,18 +432,14 @@ class MaxIoUTransformer(DFINETransformer):
                 for g, s, c, f, *lv in zip(num_gts, selected, rule_list, fell, *levels)
             ]
 
-        # the encoder's dense outputs: every token's class logits, and the claimed tokens' boxes
-        # with a graph; the criterion trains both against the claim
-        claimed_bbox = F.sigmoid(self.enc_bbox_head(take(output_memory, claimed)) + take(anchors, claimed))
-        dense_boxes = all_boxes.scatter(
-            1,
-            claimed.unsqueeze(-1).expand(-1, -1, 4),
-            torch.where(gt_valid[..., None], claimed_bbox, take(all_boxes, claimed)),
-        )
-        enc_dense = {
-            "pred_logits": enc_outputs_logits,
-            "pred_boxes": dense_boxes,
-            "valid": valid,
-            "indices": [(assigned[i, : num_gts[i]], torch.arange(num_gts[i], device=device)) for i in range(b)],
+        # the encoder's outputs on the queries, with a graph, for the criterion: the class logits
+        # of every query (the claimed tokens positive, the rest negative, padding left out) and the
+        # boxes of the claimed tokens alone. Those are the query prefix in ground-truth order, so
+        # one index pair, (query position, ground truth) = (j, j), serves both
+        enc_queries = {
+            "pred_logits": take(enc_outputs_logits, index),  # [B, Q, C]
+            "pred_boxes": F.sigmoid(self.enc_bbox_head(take(output_memory, claimed)) + take(anchors, claimed)),
+            "valid": ~pad,
+            "indices": [(torch.arange(g, device=device),) * 2 for g in num_gts],
         }
-        return DecoderInput(contents, boxes_unact, [], [], batch_queries_num, extra={"enc_dense": enc_dense})
+        return DecoderInput(contents, boxes_unact, [], [], batch_queries_num, extra={"enc_queries": enc_queries})
