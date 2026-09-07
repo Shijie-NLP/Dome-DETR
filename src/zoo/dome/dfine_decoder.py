@@ -556,7 +556,7 @@ class DFINETransformer(nn.Module):
         num_queries = max(batch_queries_num)
         if min(batch_queries_num) == num_queries:
             return None
-        counts = torch.tensor(batch_queries_num, device=device)
+        counts = torch.tensor(batch_queries_num).to(device, non_blocking=True)  # no stream sync
         real = torch.arange(num_queries, device=device)[None, :] < counts[:, None]  # [B, Q]
         mask = real[:, :, None] != real[:, None, :]  # True blocks attention
         return mask.repeat_interleave(self.nhead, dim=0)
@@ -573,7 +573,7 @@ class DFINETransformer(nn.Module):
         b, q = boxes_unact.shape[:2]
         k = min(self.local_attn_k, q)
         device = boxes_unact.device
-        counts = torch.tensor(batch_queries_num, device=device)
+        counts = torch.tensor(batch_queries_num).to(device, non_blocking=True)  # no stream sync
         real = torch.arange(q, device=device)[None, :] < counts[:, None]  # [B, Q]
         centres = F.sigmoid(boxes_unact[..., :2].float())
         dist = torch.cdist(centres, centres)  # [B, Q, Q]
@@ -592,7 +592,7 @@ class DFINETransformer(nn.Module):
         """With ``attn_logn_scale``: the per-image ``[B, 1, 1]`` factor ``log(n) / log(base)``."""
         if not self.attn_logn_scale:
             return None
-        n = torch.tensor(batch_queries_num, dtype=torch.float32, device=device).clamp(min=2)
+        n = torch.tensor(batch_queries_num, dtype=torch.float32).to(device, non_blocking=True).clamp(min=2)
         if self.local_attn_k > 0:
             n = n.clamp(max=self.local_attn_k)
         return (n.log() / math.log(self.attn_logn_base)).view(-1, 1, 1)
