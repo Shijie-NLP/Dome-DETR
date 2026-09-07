@@ -9,7 +9,7 @@ import torch.nn.functional as F  # noqa: N812
 from scipy.optimize import linear_sum_assignment
 
 from ...core import register
-from ...misc.box_ops import box_cxcywh_to_xyxy, generalized_box_iou
+from ...misc.box_ops import box_cxcywh_to_xyxy, gaussian_box_similarity, generalized_box_iou
 
 __all__ = ["HungarianMatcher"]
 
@@ -18,20 +18,24 @@ __all__ = ["HungarianMatcher"]
 class HungarianMatcher(nn.Module):
     """
     One-to-one assignment of predictions to ground-truth boxes, per image, by the Hungarian
-    algorithm on a cost of ``cost_class * class + cost_bbox * L1 + cost_giou * (-GIoU)``.
-    The class cost is the focal-style cost of the target class when ``use_focal_loss`` is set
-    (the config's top-level flag), else ``-softmax probability``. Predictions left unmatched are
-    background.
+    algorithm on a cost of ``cost_class * class + cost_bbox * L1 + cost_giou * (-GIoU) +
+    cost_gaussian * (1 - Gaussian similarity)`` (``weight_dict``; a missing or zero weight
+    skips the term). The class cost is the focal-style cost of the target class when
+    ``use_focal_loss`` is set (the config's top-level flag), else ``-softmax probability``. The
+    Gaussian term (``box_ops.gaussian_box_similarity``) still tells apart candidates that do not
+    overlap a tiny ground truth, where GIoU saturates and the normalized L1 is negligible.
+    Predictions left unmatched are background.
     """
 
     __share__ = ["use_focal_loss"]
 
     def __init__(self, weight_dict, use_focal_loss=False, alpha=0.25, gamma=2.0):
         super().__init__()
-        self.cost_class = weight_dict["cost_class"]
-        self.cost_bbox = weight_dict["cost_bbox"]
-        self.cost_giou = weight_dict["cost_giou"]
-        assert self.cost_class != 0 or self.cost_bbox != 0 or self.cost_giou != 0, "all costs cant be 0"
+        self.cost_class = weight_dict.get("cost_class", 0)
+        self.cost_bbox = weight_dict.get("cost_bbox", 0)
+        self.cost_giou = weight_dict.get("cost_giou", 0)
+        self.cost_gaussian = weight_dict.get("cost_gaussian", 0)
+        assert any((self.cost_class, self.cost_bbox, self.cost_giou, self.cost_gaussian)), "all costs cant be 0"
 
         self.use_focal_loss = use_focal_loss
         self.alpha = alpha
@@ -65,10 +69,13 @@ class HungarianMatcher(nn.Module):
         else:
             cost_class = -logits.softmax(-1)[:, tgt_ids]
 
-        cost_bbox = torch.cdist(out_bbox, tgt_bbox, p=1)
-        cost_giou = -generalized_box_iou(box_cxcywh_to_xyxy(out_bbox), box_cxcywh_to_xyxy(tgt_bbox))
-
-        cost = self.cost_bbox * cost_bbox + self.cost_class * cost_class + self.cost_giou * cost_giou
+        cost = self.cost_class * cost_class + self.cost_bbox * torch.cdist(out_bbox, tgt_bbox, p=1)
+        if self.cost_giou:
+            cost = cost - self.cost_giou * generalized_box_iou(
+                box_cxcywh_to_xyxy(out_bbox), box_cxcywh_to_xyxy(tgt_bbox)
+            )
+        if self.cost_gaussian:
+            cost = cost + self.cost_gaussian * (1 - gaussian_box_similarity(out_bbox[:, None, :], tgt_bbox[None, :, :]))
         cost = cost.view(bs, num_queries, -1)
         if batch_queries_num is not None:  # padded queries cost more than any real one
             counts = torch.tensor(batch_queries_num).to(cost.device, non_blocking=True)

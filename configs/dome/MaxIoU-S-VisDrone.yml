@@ -71,6 +71,11 @@ DomeCriterion:
   # parameter-free and about three times less sensitive to a pixel of offset on a tiny box than
   # IoU, whose target jumps with the box head's normal jitter; iou (D-FINE), giou or nwd to ablate
   quality: gaussian
+  # the matching cost's localization term: the Gaussian similarity instead of GIoU, which saturates
+  # once a candidate misses a tiny ground truth (and the normalized L1 is negligible there), so the
+  # class cost alone would decide; cost_giou: 2, cost_gaussian: 0 restores D-FINE's
+  matcher:
+    weight_dict: {cost_class: 2, cost_bbox: 5, cost_giou: 0, cost_gaussian: 2}
 
 
 optimizer:
