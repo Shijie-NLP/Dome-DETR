@@ -42,6 +42,7 @@ MaxIoUTransformer:
   # class positive); their maximum is the objectness that picks the queries in training and
   # inference alike at its decision boundary, logit 0
   min_queries: 300     # the least queries per image, training (forced tokens included) and inference
+  min_negatives: 100   # training: the least unforced queries on top of the forced tokens (crowds)
   infer_rule: objectness   # or topk, the plain D-FINE selection
   # query self-attention: each query sees its local_attn_k nearest queries (0: all); or keep full
   # attention and rescale the logits by log(n)/log(num_queries) so the entropy does not grow with n

@@ -20,8 +20,10 @@ logit 0, can serve as the selection rule.
   coverage: every ground truth gets a distinct token, so the second one moves on to its next
   candidate (``assign_candidates`` per ground truth; the rare one whose candidates all went to
   others takes the nearest free token). The rest of the queries are the unforced tokens the
-  objectness passes, and the count is clamped to ``[min_queries, num_queries]``. Images differ
-  in query count (padded to the largest, ``batch_queries_num`` tells the criterion).
+  objectness passes, floored so that an image has at least ``min_queries`` queries and at least
+  ``min_negatives`` unforced ones (a crowd would otherwise train the decoder on forced tokens
+  alone until the head passes some), and capped at ``num_queries``. Images differ in query
+  count (padded to the largest, ``batch_queries_num`` tells the criterion).
 - Inference: the tokens the objectness passes, clamped to ``[min_queries, num_queries]`` by its
   logit, so the query count is per image; ``num_queries`` is only a memory guard. As the head
   learns to pass the forced tokens, the training set converges to the inference set plus a
@@ -80,6 +82,9 @@ class MaxIoUTransformer(DFINETransformer):
             (1: a 3x3 window on each level).
         min_queries: the least queries an image gets, in training (forced tokens included) and
             at inference alike.
+        min_negatives: training: the least unforced queries an image gets on top of its forced
+            tokens, the best unpassed tokens by objectness (the negatives nearest the decision
+            boundary), for images with about ``min_queries`` ground truths or more.
         infer_rule: ``objectness`` (the head's decision, per-image count) or ``topk``
             (``num_queries`` best by objectness).
         local_attn_k / attn_logn_scale / attn_logn_base / min_sample_cells / min_refine_cells /
@@ -116,6 +121,7 @@ class MaxIoUTransformer(DFINETransformer):
         assign_candidates=8,
         assign_radius=1,
         min_queries=300,
+        min_negatives=100,
         infer_rule="objectness",
         local_attn_k=0,
         attn_logn_scale=False,
@@ -159,11 +165,12 @@ class MaxIoUTransformer(DFINETransformer):
         assert assign_metric in ("gaussian", "nwd", "giou", "iou"), assign_metric
         assert assign_candidates >= 1 and assign_radius >= 0
         assert infer_rule in ("objectness", "topk"), infer_rule
-        assert min_queries <= num_queries
+        assert min_queries <= num_queries and min_negatives >= 0
         self.assign_metric = assign_metric
         self.assign_candidates = assign_candidates
         self.assign_radius = assign_radius
         self.min_queries = min_queries
+        self.min_negatives = min_negatives
         self.infer_rule = infer_rule
         # diagnostics of the last training forward, per image: ground truths, how many of their
         # forced tokens the objectness already lets through, the rule-selected queries and the
@@ -347,9 +354,11 @@ class MaxIoUTransformer(DFINETransformer):
             num_gt = forced.sum(1)
             num_selected = (forced & passed).sum(1)  # forced tokens the head lets through
             per_level = torch.stack([f.sum(1) for f in forced.split([h * w for h, w in spatial_shapes], 1)], 1)
-            # the forced tokens plus the unforced ones the head passes, floored and capped (a
-            # crowd beyond num_queries keeps its forced tokens; they are valid by construction)
-            count = (num_gt + (passed & ~forced).sum(1)).clamp(min=floor).minimum(num_gt.clamp(min=cap))
+            # the forced tokens plus the unforced ones the head passes, floored at min_queries and
+            # at min_negatives unforced ones, capped at num_queries (a crowd beyond it keeps its
+            # forced tokens and its min_negatives; they are valid by construction)
+            least = (num_gt + self.min_negatives).clamp(min=floor)
+            count = (num_gt + (passed & ~forced).sum(1)).maximum(least).minimum(least.clamp(min=cap))
             count = count.minimum(num_valid)
             index, pad, batch_queries_num, selected, *levels = select(
                 scores.masked_fill(forced, float("inf")), count, num_selected, *per_level.unbind(1)
