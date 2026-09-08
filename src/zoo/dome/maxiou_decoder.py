@@ -31,7 +31,10 @@ them can serve as the selection rule.
   queries and the forced tokens per level (``levels``: a drift of tiny objects' tokens towards
   coarse levels shows here).
 
-Host syncs per batch: the query counts.
+Cost: the projection and the class head run on every token once, without a graph, for the
+selection, and with the box head again on the queries alone with one; no full-token activation
+is kept for the backward pass (D-FINE keeps the projection's and the class head's). Host syncs
+per batch: the query counts.
 """
 
 import math
@@ -253,21 +256,6 @@ class MaxIoUTransformer(DFINETransformer):
 
     # ------------------------------------------------------------------ query selection
 
-    def _encoder_tokens(self, memory, spatial_shapes):
-        """
-        Every token's projected content, class logits ``[B, N, C]`` (with a graph), its objectness
-        (the highest class logit, detached, invalid tokens -inf), anchor and validity.
-        """
-        anchors, valid_mask = self._generate_anchors(spatial_shapes, device=memory.device)
-        valid = valid_mask.reshape(-1)  # [N]
-        if memory.shape[0] > 1:
-            anchors = anchors.repeat(memory.shape[0], 1, 1)
-        memory = valid_mask.to(memory.dtype) * memory
-        output_memory: torch.Tensor = self.enc_output(memory)
-        enc_outputs_logits: torch.Tensor = self.enc_score_head(output_memory)  # [B, N, C]
-        scores = enc_outputs_logits.detach().max(-1).values.masked_fill(~valid[None, :], float("-inf"))
-        return output_memory, enc_outputs_logits, scores, anchors, valid
-
     def _get_decoder_input(self, memory, spatial_shapes, encoder_out, targets=None):
         """
         Training (with ground truths in the batch): every ground truth's forced tokens plus the
@@ -281,9 +269,11 @@ class MaxIoUTransformer(DFINETransformer):
         if not training and self.infer_rule == "topk":
             return super()._get_decoder_input(memory, spatial_shapes, encoder_out, targets)
 
-        output_memory, enc_outputs_logits, scores, anchors, valid = self._encoder_tokens(memory, spatial_shapes)
-        b, n = scores.shape
+        b, n = memory.shape[:2]
         device = memory.device
+        anchors, valid_mask = self._generate_anchors(spatial_shapes, device=device)
+        valid = valid_mask.reshape(-1)  # [N]
+        anchors = anchors.expand(b, -1, -1)  # [B, N, 4], a view
 
         def take(x, index):
             return x.gather(1, index.unsqueeze(-1).expand(-1, -1, x.shape[-1]))
@@ -301,9 +291,17 @@ class MaxIoUTransformer(DFINETransformer):
             return index, pad, batch_queries_num, *extra
 
         with torch.no_grad():
+            # every token's projected content and objectness (the highest class logit, invalid
+            # tokens -inf), without a graph. The invalid tokens are not zeroed first as in D-FINE:
+            # none is ever selected, so their outputs go unread (a [B, N, D] copy saved)
+            output_memory = self.enc_output(memory)
+            scores = self.enc_score_head(output_memory).max(-1).values.masked_fill(~valid, float("-inf"))
             passed = scores > self.obj_logit  # [B, N], the tokens that pass
             num_valid = valid.sum()  # the rule never selects an invalid token
             floor, cap = min(self.min_queries, n), min(self.num_queries, n)
+
+            def boxes_unact_of(index):
+                return self.enc_bbox_head(take(output_memory, index)) + take(anchors, index)
 
             if not training:
                 if self.training:
@@ -311,23 +309,15 @@ class MaxIoUTransformer(DFINETransformer):
                 count = passed.sum(1).clamp(floor, cap).minimum(num_valid)
                 index, pad, batch_queries_num = select(scores, count)
                 contents = take(output_memory, index)
-                boxes_unact = self.enc_bbox_head(contents) + take(anchors, index)  # the head on the queries alone
                 return DecoderInput(
                     contents.masked_fill(pad[..., None], 0),
-                    boxes_unact.masked_fill(pad[..., None], 0),
+                    boxes_unact_of(index).masked_fill(pad[..., None], 0),
                     [],
                     [],
                     batch_queries_num,
                 )
 
-            # the box head on the tokens the pick and the queries need, not on every token (a
-            # 960x960 input has 76k). In fp32 with autocast off: under autocast this no-grad call
-            # would cache the head's half-precision weights without a graph, and the
-            # graph-bearing call on the queries below would reuse them and reach no parameter
-            def boxes_unact_of(index):
-                with torch.autocast(device.type, enabled=False):
-                    return self.enc_bbox_head(take(output_memory, index).float()) + take(anchors, index)
-
+            # the box head on the candidates alone, not on every token (a 960x960 input has 76k)
             forced, num_gts = self._forced(
                 targets, lambda index: F.sigmoid(boxes_unact_of(index)), n, valid, spatial_shapes
             )  # [B, N]
@@ -342,15 +332,21 @@ class MaxIoUTransformer(DFINETransformer):
             index, pad, batch_queries_num, num_forced, selected, *levels = select(
                 scores.masked_fill(forced, float("inf")), count, num_forced, num_selected, *per_level.unbind(1)
             )
-            contents = take(output_memory, index).masked_fill(pad[..., None], 0)
-            boxes_init = boxes_unact_of(index).masked_fill(pad[..., None], 0)
             self.last_assign_stats = [
                 {"num_gt": g, "forced": f, "selected": s, "rule": q - f, "levels": lv}
                 for g, f, s, q, *lv in zip(num_gts, num_forced, selected, batch_queries_num, *levels)
             ]
+        # under autocast, the no-grad calls above cached the heads' half-precision weights without
+        # a graph; the calls below would reuse them and reach no parameter
+        torch.clear_autocast_cache()
 
-        # the encoder's predictions on the queries, with a graph: D-FINE's enc_aux_outputs, which
-        # the criterion Hungarian-matches (padding is masked there)
-        enc_logits = take(enc_outputs_logits, index)
-        enc_boxes = F.sigmoid(self.enc_bbox_head(take(output_memory, index)) + take(anchors, index))
-        return DecoderInput(contents, boxes_init, [enc_boxes], [enc_logits], batch_queries_num)
+        # the projection and the heads on the queries alone, with a graph: the queries' contents
+        # and boxes (detached) and D-FINE's enc_aux_outputs, which the criterion matches (padding
+        # is masked there)
+        queries = take(memory, index) * valid[index].to(memory.dtype)[..., None]
+        output = self.enc_output(queries)
+        enc_logits = self.enc_score_head(output)
+        boxes_unact = self.enc_bbox_head(output) + take(anchors, index)
+        contents = output.detach().masked_fill(pad[..., None], 0)
+        boxes_init = boxes_unact.detach().masked_fill(pad[..., None], 0)
+        return DecoderInput(contents, boxes_init, [F.sigmoid(boxes_unact)], [enc_logits], batch_queries_num)
