@@ -20,6 +20,30 @@ from ..misc.visualizer import SAVE_TEST_VISUALIZE_RESULT, PredictionDumper, dump
 from ..optim import ModelEMA, Warmup
 
 
+def query_stats(model, outputs) -> dict[str, float]:
+    """
+    A training batch's query selection, averaged over its images, for the meters: ``queries``
+    (queries per image, every decoder) and, from a decoder that reports ``last_assign_stats``
+    (MaxIoUTransformer), ``gt`` (ground truths per image), ``forced_passed`` (the share of the
+    forced tokens the objectness already lets through: the rule's recall in training), ``rule``
+    (the unforced queries per image) and ``forced_s{stride}`` (the share of the forced tokens on
+    each level: a drift of tiny objects' tokens towards coarse levels shows here).
+    """
+    counts = outputs.get("batch_queries_num")
+    stats = {"queries": sum(counts) / len(counts)} if counts else {}
+    decoder = getattr(dist_utils.de_parallel(model), "decoder", None)
+    assign = getattr(decoder, "last_assign_stats", None)
+    if not assign:
+        return stats
+    n, gts = len(assign), max(sum(a["num_gt"] for a in assign), 1)
+    stats["gt"] = gts / n
+    stats["forced_passed"] = sum(a["selected"] for a in assign) / gts
+    stats["rule"] = sum(a["rule"] for a in assign) / n
+    for level, stride in enumerate(decoder.feat_strides):
+        stats[f"forced_s{stride}"] = sum(a["levels"][level] for a in assign) / gts
+    return stats
+
+
 def to_device(targets: list[dict], device) -> list[dict]:
     """The per-image target dicts with every tensor moved to ``device`` (asynchronously from pinned memory)."""
     return [{k: v.to(device, non_blocking=True) for k, v in t.items()} for t in targets]
@@ -88,6 +112,7 @@ def train_one_epoch(
         loss_dict = criterion(outputs, targets, **metas)
         loss: torch.Tensor = sum(loss_dict.values())
         optimizer_step(loss, model, optimizer, scaler, max_norm)
+        selection = query_stats(model, outputs)
 
         if ema is not None:
             ema.update(model)
@@ -104,7 +129,7 @@ def train_one_epoch(
             sys.exit(1)
 
         metric_logger.update(loss=loss_value, **loss_dict_reduced)
-        metric_logger.update(lr=optimizer.param_groups[0]["lr"])
+        metric_logger.update(lr=optimizer.param_groups[0]["lr"], **selection)
 
         if writer and dist_utils.is_main_process() and global_step % 10 == 0:
             writer.add_scalar("Loss/total", loss_value.item(), global_step)
@@ -112,6 +137,8 @@ def train_one_epoch(
                 writer.add_scalar(f"Lr/pg_{j}", pg["lr"], global_step)
             for k, v in loss_dict_reduced.items():
                 writer.add_scalar(f"Loss/{k}", v.item(), global_step)
+            for k, v in selection.items():
+                writer.add_scalar(f"Queries/{k}", v, global_step)
 
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
@@ -146,11 +173,10 @@ def evaluate(
     metric_logger = MetricLogger(delimiter="  ")
     header = "Test:"
 
-    # DeFE statistics: how often the predicted query budget covers the ground truth, and its mean
-    use_defe = getattr(dist_utils.de_parallel(model).encoder, "use_defe", False)
-    total_defe_samples = 0
-    ample_defe_predictions = 0
-    total_anchor_num = 0
+    # the query selection over the set: the queries per image, and how often an image gets at
+    # least as many queries as it has ground truths (DeFE's budget, the objectness rule, ...)
+    queries_per_image = []
+    ample_images = 0
 
     with PredictionDumper(SAVE_TEST_VISUALIZE_RESULT) as dumper:
         for samples, targets in metric_logger.log_every(data_loader, 10, header):
@@ -170,20 +196,30 @@ def evaluate(
             res = {target["image_id"].item(): output for target, output in zip(targets, results)}
             coco_evaluator.update(res)
 
-            if use_defe:
-                pred_defe = outputs["batch_queries_num"][0]
-                if pred_defe >= targets[0]["labels"].shape[0]:
-                    ample_defe_predictions += 1
-                total_defe_samples += 1
-                total_anchor_num += pred_defe
+            counts = outputs.get("batch_queries_num")
+            if counts:
+                queries_per_image.extend(counts)
+                ample_images += sum(int(c >= t["labels"].shape[0]) for c, t in zip(counts, targets))
 
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
 
-    if use_defe and total_defe_samples:
-        print("defe Ample Rate:", ample_defe_predictions / total_defe_samples)
-        print("defe Average Anchor Number:", total_anchor_num / total_defe_samples)
+    query_summary = None
+    if queries_per_image:
+        gathered = dist_utils.all_gather((queries_per_image, ample_images))
+        queries_per_image = [q for qs, _ in gathered for q in qs]
+        ample = sum(a for _, a in gathered) / len(queries_per_image)
+        query_summary = [
+            sum(queries_per_image) / len(queries_per_image),
+            min(queries_per_image),
+            max(queries_per_image),
+            ample,
+        ]
+        print(
+            f"queries per image: mean {query_summary[0]:.1f}, min {query_summary[1]}, max {query_summary[2]}; "
+            f"images with at least as many queries as ground truths: {100 * ample:.1f}%"
+        )
 
     coco_evaluator.synchronize_between_processes()
     coco_evaluator.accumulate()
@@ -194,5 +230,7 @@ def evaluate(
         stats["coco_eval_bbox"] = coco_evaluator.coco_eval["bbox"].stats.tolist()
     if "segm" in coco_evaluator.iou_types:
         stats["coco_eval_masks"] = coco_evaluator.coco_eval["segm"].stats.tolist()
+    if query_summary is not None:
+        stats["queries"] = query_summary  # mean, min, max per image, and the ample share
 
     return stats, coco_evaluator
