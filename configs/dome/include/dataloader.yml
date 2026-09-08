@@ -28,3 +28,4 @@ val_dataloader:
   total_batch_size: 16
   num_workers: 4
   pin_memory: True
+  persistent_workers: True   # the workers outlive an evaluation: no start-up on every epoch's
