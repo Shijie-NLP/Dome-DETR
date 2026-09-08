@@ -10,7 +10,7 @@ import time
 import torch
 
 from ..misc import dist_utils, stats
-from ._solver import BaseSolver
+from ._solver import BaseSolver, load_checkpoint
 from .det_engine import evaluate, train_one_epoch
 
 
@@ -19,10 +19,12 @@ class DetSolver(BaseSolver):
     Detection training in two stages, split at the collate function's ``stop_epoch``.
 
     Stage 1 trains with augmentation and multi-scale batches, keeping ``last.pth`` and the best
-    validation AP so far as ``best_stg1.pth``. Stage 2 reloads that best checkpoint, restarts the
-    EMA with ``ema_restart_decay`` and trains on clean single-scale batches, keeping its best as
-    ``best_stg2.pth``. When stage 2 goes ``patience`` epochs without a new best, it reloads
-    ``best_stg1.pth`` again with a slightly smaller EMA decay and tries once more.
+    validation AP so far as ``best_stg1.pth``. Stage 2 reloads that checkpoint's weights, EMA and
+    optimizer state, restarts the EMA with ``ema_restart_decay`` and trains on clean single-scale
+    batches, keeping its best as ``best_stg2.pth``. When stage 2 goes ``patience`` epochs without
+    a new best, it reloads ``best_stg1.pth`` again with a slightly smaller EMA decay and tries
+    once more. A reload leaves the learning rate schedule where training is: restoring the
+    checkpoint's schedulers would rewind the rate past its milestones, as upstream did.
     """
 
     metric = "coco_eval_bbox"  # the evaluator's stats; AP@[.5:.95] is entry 0
@@ -56,6 +58,7 @@ class DetSolver(BaseSolver):
 
             if epoch == stage2_start:
                 self._reload_best_stage1(epoch, ema_decay=cfg.ema_restart_decay)
+                not_improved = 0  # the patience counts stage-2 epochs alone
 
             print("Train starting...")
             train_stats = train_one_epoch(
@@ -162,13 +165,20 @@ class DetSolver(BaseSolver):
         module = self.ema.module if self.ema else self.model
         return evaluate(module, self.criterion, self.postprocessor, self.val_dataloader, self.evaluator, self.device)
 
+    RELOADED = ("model", "ema", "optimizer")  # what a stage-2 reload takes from the checkpoint
+
     def _reload_best_stage1(self, epoch, ema_decay):
-        """Restart from the best stage-1 checkpoint (weights, optimizer and schedulers) with a new EMA decay."""
+        """Restart from the best stage-1 checkpoint's weights, EMA and optimizer state with a new EMA decay."""
         path = self.output_dir / "best_stg1.pth"
         if not path.exists():
             raise FileNotFoundError(f"stage 2 starts at epoch {epoch} but there is no {path} to reload")
         dist_utils.barrier()
-        self.load_resume_state(str(path))
+        print(f"Reload {path} ({', '.join(self.RELOADED)}) at epoch {epoch}")
+        state = load_checkpoint(str(path))
+        rates = [group["lr"] for group in self.optimizer.param_groups]  # the optimizer state carries its own
+        self.load_state_dict({k: v for k, v in state.items() if k in self.RELOADED})
+        for group, lr in zip(self.optimizer.param_groups, rates):
+            group["lr"] = lr
         if self.ema is not None and ema_decay is not None:
             self.ema.decay = ema_decay
             print(f"Refresh EMA at epoch {epoch} with decay {self.ema.decay}")
