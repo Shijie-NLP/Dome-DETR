@@ -166,6 +166,16 @@ class HybridEncoder(nn.Module):
         """
         return {}
 
+    def _pos_embed(self, w: int, h: int, device) -> torch.Tensor:
+        """The position embedding of a ``w`` x ``h`` grid on ``device``, built once per size (multi-scale training draws a handful)."""
+        cache = self.__dict__.setdefault("_pos_embed_cache", {})  # a plain attribute: not a buffer, not saved
+        key = (w, h, str(device))
+        if key not in cache:
+            if len(cache) >= 64:
+                cache.clear()
+            cache[key] = build_2d_sincos_position_embedding(w, h, self.hidden_dim, self.pe_temperature).to(device)
+        return cache[key]
+
     def forward(self, feats, img_inputs, targets=None):
         assert len(feats) == len(self.in_channels)
         proj_feats = [self.input_proj[i](feat) for i, feat in enumerate(feats)]
@@ -180,10 +190,10 @@ class HybridEncoder(nn.Module):
                 h, w = proj_feats[enc_ind].shape[2:]
                 src_flatten = proj_feats[enc_ind].flatten(2).permute(0, 2, 1)  # [B, HW, C]
                 if self.training or self.eval_spatial_size is None:
-                    pos_embed = build_2d_sincos_position_embedding(w, h, self.hidden_dim, self.pe_temperature)
+                    pos_embed = self._pos_embed(w, h, src_flatten.device)
                 else:
-                    pos_embed = self.pos_embeds[i]
-                memory = self.encoder[i](src_flatten, pos_embed=pos_embed.to(src_flatten.device))
+                    pos_embed = self.pos_embeds[i].to(src_flatten.device)
+                memory = self.encoder[i](src_flatten, pos_embed=pos_embed)
                 proj_feats[enc_ind] = memory.permute(0, 2, 1).reshape(-1, self.hidden_dim, h, w).contiguous()
 
         if not self.use_hybrid:
