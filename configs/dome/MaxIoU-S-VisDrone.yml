@@ -89,6 +89,10 @@ DomeCriterion:
   # the pair quality (VFL target, FGL weight, obj_target): IoU as in D-FINE. The Gaussian
   # similarity gave a score that no longer tracked how tight a box is (AP50 up, AP75 down)
   quality: iou
+  # the encoder's objectness targets (obj_target: quality) use the Gaussian similarity instead:
+  # that score only picks the tokens worth refining, and a tiny box one width off, IoU 0 like the
+  # background, still scores 0.4 there (the decoder's IoU targets are what rank tight boxes first)
+  enc_quality: gaussian
 
 
 optimizer:
