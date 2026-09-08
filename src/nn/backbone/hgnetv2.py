@@ -34,6 +34,40 @@ class StageConfig(NamedTuple):
     layer_num: int
 
 
+class _LearnableAffine(torch.autograd.Function):
+    """
+    ``scale * relu(x) + bias`` (``relu=True``) or ``scale * x + bias``, in the dtype of ``x``.
+
+    The plain expression promotes a half-precision activation to the parameters' float32 (they
+    are 1-element tensors, not scalars), so under autocast every block wrote a float32
+    activation that the next conv cast back: a third of the backbone's time and 0.7 GiB of its
+    activations at batch 8, 960x960. This keeps only its output, which the following conv keeps
+    anyway, and recovers what it needs in the backward from it: the map is affine and ``scale``
+    never nears 0 (the pretrained values lie in 0.12 .. 3.9), and with the ReLU folded in, an
+    input the ReLU zeroed comes back as exactly ``bias``. The parameters' gradients are reduced
+    in float32.
+    """
+
+    @staticmethod
+    def forward(ctx, x, scale, bias, relu):
+        if relu:
+            x = torch.relu(x)
+        y = torch.addcmul(bias.to(x.dtype), x, scale.to(x.dtype))
+        ctx.save_for_backward(y, scale, bias)
+        ctx.relu = relu
+        return y
+
+    @staticmethod
+    def backward(ctx, grad):
+        y, scale, bias = ctx.saved_tensors
+        x = (y - bias.to(y.dtype)) / scale.to(y.dtype)  # the (rectified) input
+        grad_scale = torch.sum(grad.float() * x).reshape(scale.shape)  # the products in float32 too
+        grad_bias = torch.sum(grad, dtype=torch.float32).reshape(bias.shape)
+        if ctx.relu:
+            grad = grad * (x > 0)
+        return grad * scale.to(grad.dtype), grad_scale, grad_bias, None
+
+
 class LearnableAffineBlock(nn.Module):
     """``scale * x + bias`` with a learnable scalar each; follows every activation when ``use_lab`` is on."""
 
@@ -42,8 +76,8 @@ class LearnableAffineBlock(nn.Module):
         self.scale = nn.Parameter(torch.tensor([scale_value]))
         self.bias = nn.Parameter(torch.tensor([bias_value]))
 
-    def forward(self, x):
-        return self.scale * x + self.bias
+    def forward(self, x, relu=False):
+        return _LearnableAffine.apply(x, self.scale, self.bias, relu)
 
 
 class ConvBNAct(nn.Module):
@@ -59,7 +93,10 @@ class ConvBNAct(nn.Module):
         self.lab = LearnableAffineBlock() if use_act and use_lab else nn.Identity()
 
     def forward(self, x):
-        return self.lab(self.act(self.bn(self.conv(x))))
+        x = self.bn(self.conv(x))
+        if isinstance(self.lab, LearnableAffineBlock):
+            return self.lab(x, relu=True)  # the ReLU folded in: one activation kept instead of two
+        return self.lab(self.act(x))
 
 
 class LightConvBNAct(nn.Module):
