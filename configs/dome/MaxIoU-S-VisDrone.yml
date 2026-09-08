@@ -1,10 +1,10 @@
 # MaxIoU-S on VisDrone2019-DET: the D-FINE-S baseline recipe (plain HybridEncoder, no DeFE / MWAS)
 # with the ground-truth-forced query selection and no denoising. At training every ground truth
-# forces the assign_k encoder tokens whose boxes match it best into the queries and the best
-# unforced tokens by objectness fill up to min_queries; at inference the objectness alone
-# selects. Everything past the selection is D-FINE's (Hungarian matching), except that the
-# encoder's class logits are trained as plain 0/1 objectness (enc_losses) so that logit 0 is the
-# selection rule.
+# forces the assign_k encoder tokens whose boxes match it best into the queries, the rest are the
+# tokens that pass the objectness threshold, and the best unpassed tokens fill up to min_queries;
+# at inference the objectness alone selects. Everything past the selection is D-FINE's (Hungarian matching), except that the
+# encoder's class logits are trained as plain 0/1 objectness (enc_losses) so that a probability
+# threshold on them is the selection rule.
 
 __include__: [
   '../dataset/visdrone_detection.yml',
@@ -44,9 +44,11 @@ MaxIoUTransformer:
   num_denoising: 0   # the ground truths' claimed tokens replace the denoising queries
   # the encoder's class logits are trained on 0/1 targets (a plain BCE, each ground truth's most
   # similar query positive on its class); their maximum is the objectness that picks the queries
-  # in training and inference alike at its decision boundary, logit 0
-  min_queries: 300     # the least queries per image: training (the forced tokens, then the best
-                       # unforced by objectness) and inference alike
+  # in training and inference alike: a token passes when its sigmoid exceeds obj_threshold (0.5
+  # is the head's decision boundary, logit 0)
+  min_queries: 300     # the least queries per image: training (the forced and passed tokens, then
+                       # the best unpassed by objectness) and inference alike
+  obj_threshold: 0.3
   infer_rule: objectness   # or topk, the plain D-FINE selection
   # query self-attention: each query sees its local_attn_k nearest queries (0: all); or keep full
   # attention and rescale the logits by log(n)/log(num_queries) so the entropy does not grow with n

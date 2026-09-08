@@ -7,22 +7,25 @@ whose query selection replaces the top-k by objectness, with no denoising querie
 past the selection is D-FINE's: the encoder's predictions on the queries and the decoder's
 outputs are Hungarian-matched by the criterion. The one difference in the losses is on the
 encoder side, where the class logits are trained as plain 0/1 objectness (``loss_obj``, no
-IoU-aware target, ``enc_losses`` of ``DomeCriterion``), so that their decision boundary,
-logit 0, can serve as the selection rule.
+IoU-aware target, ``enc_losses`` of ``DomeCriterion``), so that a probability threshold on
+them can serve as the selection rule.
 
-- The objectness of a token is its highest class logit; logit 0 is the selection rule, no
-  threshold to estimate or store.
+- The objectness of a token is its highest class logit; a token passes when its sigmoid exceeds
+  ``obj_threshold`` (0.5: the head's decision boundary, logit 0).
 - Training (with ground truths in the batch): every ground truth forces the ``assign_k`` tokens
   whose predicted boxes match it best (``assign_metric``: ``gaussian``, ``nwd``, ``giou`` or
   ``iou``) among the ``(2 * assign_radius + 1)``-cell windows around its centre cell on every
   level (index arithmetic, no ``cdist``) into the queries. No assignment: a token several ground
-  truths want is forced once, and the criterion's matching decides who predicts what. An image
-  short of ``min_queries`` queries fills up with the best unforced tokens by objectness. Images
-  differ in query count (padded to the largest, ``batch_queries_num`` tells the criterion); a
-  crowd whose forced tokens exceed ``num_queries`` keeps them all.
-- Inference: the tokens the objectness passes, clamped to ``[min_queries, num_queries]`` by its
-  logit, so the query count is per image; ``num_queries`` is only a memory guard.
-  ``infer_rule='topk'`` restores the plain top-k by objectness.
+  truths want is forced once, and the criterion's matching decides who predicts what. The rest
+  of the queries are the unforced tokens that pass the objectness threshold; an image short of
+  ``min_queries`` queries fills up with the best unpassed tokens by objectness, and one beyond
+  ``num_queries`` keeps its forced tokens and the best passed ones up to it. Images differ in
+  query count (padded to the largest, ``batch_queries_num`` tells the criterion).
+- Inference: the tokens that pass the objectness threshold, clamped to ``[min_queries,
+  num_queries]`` by the logit, so the query count is per image; ``num_queries`` is only a memory
+  guard. As the head learns to pass the forced tokens, the training set converges to the
+  inference set plus a vanishing forced part. ``infer_rule='topk'`` restores the plain top-k by
+  objectness.
 - ``last_assign_stats`` reports, per image, the ground truths, the forced tokens, how many of
   them the head already lets through (``selected``, its recall in training), the rule-selected
   queries and the forced tokens per level (``levels``: a drift of tiny objects' tokens towards
@@ -30,6 +33,8 @@ logit 0, can serve as the selection rule.
 
 Host syncs per batch: the query counts.
 """
+
+import math
 
 import torch
 import torch.nn.functional as F  # noqa: N812
@@ -73,9 +78,11 @@ class MaxIoUTransformer(DFINETransformer):
         assign_k: tokens each ground truth forces into the queries, its most similar ones.
         assign_radius: cells around the ground truth's centre cell, per level, that are candidates
             (1: a 3x3 window on each level).
-        min_queries: the least queries an image gets, in training (the forced tokens, then the
-            best unforced tokens by objectness) and at inference alike.
-        infer_rule: ``objectness`` (the head's decision, per-image count) or ``topk``
+        min_queries: the least queries an image gets, in training (the forced tokens and the
+            passed ones, then the best unpassed tokens by objectness) and at inference alike.
+        obj_threshold: the objectness probability (the highest class logit's sigmoid) a token
+            passes at; 0.5 is the head's decision boundary, logit 0.
+        infer_rule: ``objectness`` (the tokens that pass, per-image count) or ``topk``
             (``num_queries`` best by objectness).
         local_attn_k / attn_logn_scale / attn_logn_base / min_sample_cells / min_refine_cells /
             anchor_grid_size: see ``DFINETransformer``.
@@ -111,6 +118,7 @@ class MaxIoUTransformer(DFINETransformer):
         assign_k=4,
         assign_radius=1,
         min_queries=300,
+        obj_threshold=0.5,
         infer_rule="objectness",
         local_attn_k=0,
         attn_logn_scale=False,
@@ -154,11 +162,13 @@ class MaxIoUTransformer(DFINETransformer):
         assert assign_metric in ("gaussian", "nwd", "giou", "iou"), assign_metric
         assert assign_k >= 1 and assign_radius >= 0
         assert infer_rule in ("objectness", "topk"), infer_rule
-        assert min_queries <= num_queries
+        assert min_queries <= num_queries and 0 < obj_threshold < 1
         self.assign_metric = assign_metric
         self.assign_k = assign_k
         self.assign_radius = assign_radius
         self.min_queries = min_queries
+        self.obj_threshold = obj_threshold
+        self.obj_logit = math.log(obj_threshold / (1 - obj_threshold))  # the threshold on the logit
         self.infer_rule = infer_rule
         # diagnostics of the last training forward, per image: ground truths, forced tokens, how
         # many of them the objectness already lets through, the rule-selected queries and the
@@ -260,11 +270,12 @@ class MaxIoUTransformer(DFINETransformer):
 
     def _get_decoder_input(self, memory, spatial_shapes, encoder_out, targets=None):
         """
-        Training (with ground truths in the batch): every ground truth's forced tokens, then the
-        best unforced tokens by objectness up to ``min_queries``, padded to the largest count in
-        the batch, plus the encoder's predictions on the queries for the criterion. Inference: the
-        tokens the objectness passes, clamped to ``[min_queries, num_queries]`` by its logit, or
-        the plain top-k by objectness with ``infer_rule='topk'``.
+        Training (with ground truths in the batch): every ground truth's forced tokens plus the
+        unforced tokens that pass the objectness threshold, filled up to ``min_queries`` and
+        capped at ``num_queries`` by the logit, padded to the largest count in the batch, plus
+        the encoder's predictions on the queries for the criterion. Inference: the tokens that
+        pass the threshold, clamped to ``[min_queries, num_queries]`` by the logit, or the plain
+        top-k by objectness with ``infer_rule='topk'``.
         """
         training = self.training and targets is not None and max(t["boxes"].shape[0] for t in targets) > 0
         if not training and self.infer_rule == "topk":
@@ -290,7 +301,7 @@ class MaxIoUTransformer(DFINETransformer):
             return index, pad, batch_queries_num, *extra
 
         with torch.no_grad():
-            passed = scores > 0  # [B, N], the head's decision
+            passed = scores > self.obj_logit  # [B, N], the tokens that pass
             num_valid = valid.sum()  # the rule never selects an invalid token
             floor, cap = min(self.min_queries, n), min(self.num_queries, n)
 
@@ -323,10 +334,11 @@ class MaxIoUTransformer(DFINETransformer):
             num_forced = forced.sum(1)
             num_selected = (forced & passed).sum(1)  # forced tokens the head lets through
             per_level = torch.stack([f.sum(1) for f in forced.split([h * w for h, w in spatial_shapes], 1)], 1)
-            # the forced tokens, then the best unforced ones by objectness up to min_queries (a
-            # crowd whose forced tokens exceed num_queries keeps them all; they are valid by
-            # construction)
-            count = num_forced.clamp(min=floor).minimum(num_valid)
+            # the forced tokens plus the unforced ones that pass, floored at min_queries and
+            # capped at num_queries (a crowd whose forced tokens exceed it keeps them all; they
+            # are valid by construction)
+            count = (num_forced + (passed & ~forced).sum(1)).clamp(min=floor).minimum(num_forced.clamp(min=cap))
+            count = count.minimum(num_valid)
             index, pad, batch_queries_num, num_forced, selected, *levels = select(
                 scores.masked_fill(forced, float("inf")), count, num_forced, num_selected, *per_level.unbind(1)
             )
