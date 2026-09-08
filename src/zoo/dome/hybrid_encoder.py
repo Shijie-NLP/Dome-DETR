@@ -23,7 +23,7 @@ import torch.nn.functional as F  # noqa: N812
 
 from ...core import register
 from ...misc.visualizer import dump_feature_map
-from ...nn.blocks import ConvNormLayerFuse, RepNCSPELAN4, SCDown
+from ...nn.blocks import ConvNormLayerFuse, LightFusion, RepNCSPELAN4, SCDown
 from ...nn.checkpoint import checkpoint_module
 from ...nn.position_encoding import build_2d_sincos_position_embedding
 from ...nn.transformer import TransformerEncoder, TransformerEncoderLayer
@@ -40,6 +40,10 @@ class HybridEncoder(nn.Module):
         use_encoder_idx / num_encoder_layers / nhead / dim_feedforward / dropout / enc_act /
             pe_temperature: the intra-scale transformer applied to the listed levels.
         expansion / depth_mult / act: width, depth and activation of the pyramid's fusion blocks.
+        fine_fusion: the top-down fusion block of the finest level, where the maps are largest:
+            ``elan`` (the same ``RepNCSPELAN4`` as the other levels), ``slim`` (the ELAN block
+            with its inner width halved to ``hidden_dim``) or ``light`` (``blocks.LightFusion``:
+            a 1x1 fuse, a depthwise 3x3 and a 1x1, a quarter of the ELAN block's FLOPs).
         use_hybrid: run the top-down / bottom-up pyramid; off, the projected levels are returned.
         checkpoint_fusion: in training, recompute the fusion blocks' activations in the backward
             pass instead of keeping them (the stride-4 level's are most of the encoder's memory).
@@ -71,6 +75,7 @@ class HybridEncoder(nn.Module):
         eval_spatial_size=None,
         use_hybrid=True,
         checkpoint_fusion=False,
+        fine_fusion="elan",
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -85,6 +90,8 @@ class HybridEncoder(nn.Module):
         self.out_strides = feat_strides
         self.use_hybrid = use_hybrid
         self.checkpoint_fusion = checkpoint_fusion
+        assert fine_fusion in ("elan", "slim", "light"), fine_fusion
+        self.fine_fusion = fine_fusion
         self.dim_feedforward = dim_feedforward
 
         # channel projection
@@ -115,12 +122,19 @@ class HybridEncoder(nn.Module):
 
         if self.use_hybrid:
             fusion = dict(c3=hidden_dim * 2, c4=round(expansion * hidden_dim // 2), n=round(3 * depth_mult), act=act)
-            # top-down: lateral 1x1 on the coarser level, upsample, fuse with the finer one
+            # top-down: lateral 1x1 on the coarser level, upsample, fuse with the finer one; the
+            # last block fuses into the finest level
             self.lateral_convs = nn.ModuleList()
             self.fpn_blocks = nn.ModuleList()
-            for _ in range(len(in_channels) - 1):
+            for i in range(len(in_channels) - 1):
                 self.lateral_convs.append(ConvNormLayerFuse(hidden_dim, hidden_dim, 1, 1))
-                self.fpn_blocks.append(RepNCSPELAN4(hidden_dim * 2, hidden_dim, **fusion))
+                finest = i == len(in_channels) - 2
+                if finest and fine_fusion == "light":
+                    self.fpn_blocks.append(LightFusion(hidden_dim * 2, hidden_dim, act=act))
+                elif finest and fine_fusion == "slim":
+                    self.fpn_blocks.append(RepNCSPELAN4(hidden_dim * 2, hidden_dim, **{**fusion, "c3": hidden_dim}))
+                else:
+                    self.fpn_blocks.append(RepNCSPELAN4(hidden_dim * 2, hidden_dim, **fusion))
             # bottom-up: downsample the finer level, fuse with the coarser one
             self.downsample_convs = nn.ModuleList()
             self.pan_blocks = nn.ModuleList()

@@ -22,6 +22,7 @@ __all__ = [
     "ChannelAttention",
     "ConvNormLayerFuse",
     "DepthwiseSeparableConv",
+    "LightFusion",
     "RepNCSPELAN4",
     "SCDown",
     "VGGBlock",
@@ -166,6 +167,25 @@ class CSPLayer(nn.Module):
 
     def forward(self, x):
         return self.conv3(self.bottlenecks(self.conv1(x)) + self.conv2(x))
+
+
+class LightFusion(nn.Module):
+    """
+    A light fusion block: a 1x1 conv folds the concatenated inputs to ``c2`` channels, and a
+    depthwise 3x3 with a 1x1 mixes them spatially and across channels (conv-BN-act each). For
+    a pyramid level too large for ``RepNCSPELAN4``: at 960x960 the stride-4 level's ELAN block
+    is a third of the encoder's time and memory, most of it the two wide 1x1 convs and their
+    norms on 240x240 maps; this block is a quarter of its FLOPs.
+    """
+
+    def __init__(self, c1, c2, bias=False, act="silu"):
+        super().__init__()
+        self.fuse = ConvNormLayerFuse(c1, c2, 1, 1, bias=bias, act=act)
+        self.spatial = ConvNormLayerFuse(c2, c2, 3, 1, g=c2, bias=bias, act=act)
+        self.mix = ConvNormLayerFuse(c2, c2, 1, 1, bias=bias, act=act)
+
+    def forward(self, x):
+        return self.mix(self.spatial(self.fuse(x)))
 
 
 class RepNCSPELAN4(nn.Module):

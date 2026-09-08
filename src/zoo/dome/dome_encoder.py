@@ -59,6 +59,8 @@ class DomeHybridEncoder(HybridEncoder):
         act="silu",
         eval_spatial_size=None,
         use_hybrid=True,
+        checkpoint_fusion=False,
+        fine_fusion="elan",
         defe_type="light",
         use_mwas=True,
         mwas_window_size=10,
@@ -79,6 +81,8 @@ class DomeHybridEncoder(HybridEncoder):
             act=act,
             eval_spatial_size=eval_spatial_size,
             use_hybrid=use_hybrid,
+            checkpoint_fusion=checkpoint_fusion,
+            fine_fusion=fine_fusion,
         )
         self.defe_type = defe_type
         self.use_mwas = use_mwas
