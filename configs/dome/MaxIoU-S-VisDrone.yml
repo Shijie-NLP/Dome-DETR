@@ -30,6 +30,9 @@ HybridEncoder:
   in_channels: [64, 256, 512, 1024]
   depth_mult: .34
   expansion: 0.5
+  # the stride-4 fusion blocks' activations are most of the encoder's memory: recompute them in
+  # the backward pass (a few percent slower) so a single 32 GB GPU takes a larger batch
+  checkpoint_fusion: True
 
 MaxIoUTransformer:
   num_layers: 3
