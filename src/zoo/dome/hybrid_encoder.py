@@ -24,6 +24,7 @@ import torch.nn.functional as F  # noqa: N812
 from ...core import register
 from ...misc.visualizer import dump_feature_map
 from ...nn.blocks import ConvNormLayerFuse, RepNCSPELAN4, SCDown
+from ...nn.checkpoint import checkpoint_module
 from ...nn.position_encoding import build_2d_sincos_position_embedding
 from ...nn.transformer import TransformerEncoder, TransformerEncoderLayer
 
@@ -40,6 +41,8 @@ class HybridEncoder(nn.Module):
             pe_temperature: the intra-scale transformer applied to the listed levels.
         expansion / depth_mult / act: width, depth and activation of the pyramid's fusion blocks.
         use_hybrid: run the top-down / bottom-up pyramid; off, the projected levels are returned.
+        checkpoint_fusion: in training, recompute the fusion blocks' activations in the backward
+            pass instead of keeping them (the stride-4 level's are most of the encoder's memory).
         eval_spatial_size: (h, w) at evaluation, to precompute the position embeddings; unset,
             they are built for whatever size arrives.
 
@@ -67,6 +70,7 @@ class HybridEncoder(nn.Module):
         act="silu",
         eval_spatial_size=None,
         use_hybrid=True,
+        checkpoint_fusion=False,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -80,6 +84,7 @@ class HybridEncoder(nn.Module):
         self.out_channels = [hidden_dim for _ in range(len(in_channels))]
         self.out_strides = feat_strides
         self.use_hybrid = use_hybrid
+        self.checkpoint_fusion = checkpoint_fusion
         self.dim_feedforward = dim_feedforward
 
         # channel projection
@@ -171,6 +176,11 @@ class HybridEncoder(nn.Module):
             out["feats"] = proj_feats
             return out
 
+        def fuse(block, feats):
+            if self.checkpoint_fusion and self.training and torch.is_grad_enabled():
+                return checkpoint_module(block, *feats, fn=lambda *f: block(torch.concat(f, dim=1)))
+            return block(torch.concat(feats, dim=1))
+
         # top-down: coarsest level first, each finer level fused with the upsampled result
         inner_outs = [proj_feats[-1]]
         for i, idx in enumerate(range(len(self.in_channels) - 1, 0, -1)):
@@ -178,13 +188,13 @@ class HybridEncoder(nn.Module):
             feat_low = proj_feats[idx - 1]
             inner_outs[0] = feat_high
             upsample_feat = F.interpolate(feat_high, size=feat_low.shape[2:], mode="bilinear", align_corners=True)
-            inner_outs.insert(0, self.fpn_blocks[i](torch.concat([upsample_feat, feat_low], dim=1)))
+            inner_outs.insert(0, fuse(self.fpn_blocks[i], [upsample_feat, feat_low]))
 
         # bottom-up: finest level first, each coarser level fused with the downsampled result
         outs = [inner_outs[0]]
         for i in range(len(self.in_channels) - 1):
             downsample_feat = self.downsample_convs[i](outs[-1])
-            outs.append(self.pan_blocks[i](torch.concat([downsample_feat, inner_outs[i + 1]], dim=1)))
+            outs.append(fuse(self.pan_blocks[i], [downsample_feat, inner_outs[i + 1]]))
 
         out["feats"] = outs
         return out
