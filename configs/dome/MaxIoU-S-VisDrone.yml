@@ -5,11 +5,12 @@
 # Training: every ground truth forces the assign_k encoder tokens whose predicted boxes match it
 # best into the queries; the other queries are the tokens whose objectness passes obj_threshold,
 # filled up to min_queries with the best unpassed tokens. Inference: the objectness alone selects.
-# Everything past the selection is D-FINE's (Hungarian matching, VFL, FDR) with the Gaussian
-# similarity as the pair quality and matching cost. The encoder's class logits are trained as
-# objectness with a class-balanced BCE: each ground truth's enc_topk most similar queries are its
-# positives, targeted at their GIoU, everything else at 0, the positive half weighing a quarter
-# of the negative half, and logit 0 (obj_threshold 0.5) is the selection rule.
+# Everything past the selection is D-FINE's (Hungarian matching, VFL with IoU targets, FDR),
+# except that the matching cost's localization term is the Gaussian similarity rather than GIoU.
+# The encoder's class logits are trained as objectness with a class-balanced BCE: each ground
+# truth's enc_topk most similar queries are its positives, targeted at their Gaussian similarity
+# (a gradient even when a tiny box does not overlap), everything else at 0, the positive half
+# weighing a quarter of the negative half, and logit 0 (obj_threshold 0.5) is the selection rule.
 
 __include__: [
   '../dataset/visdrone_detection.yml',
@@ -93,14 +94,17 @@ DomeCriterion:
   obj_loss: balanced
   obj_pos_weight: 0.25
   obj_quality_weight: True
-  # each positive is targeted at its pair's GIoU (clamped at 0, at most the IoU): a token whose
-  # box is off its ground truth learns a low score, and a loose one a lower one than with 1
+  # each positive is targeted at its pair's quality rather than 1, so a token whose box is off
+  # its ground truth learns a lower score. The encoder's quality is the Gaussian similarity: a
+  # tiny box one width off, IoU 0 like the background, still scores 0.4 there, so the score keeps
+  # a gradient towards the object where IoU or GIoU (clamped at 0) would have none
   obj_target: quality
   enc_quality: gaussian
-  # the decoder's pair quality (VFL target, FGL weight) and the matching cost: the Gaussian
-  # similarity, as in the run this recipe restates (2026-09-08); iou with cost_giou 2 and
-  # cost_gaussian 0 is D-FINE's, which ranked tight boxes better (AP75) at the same AP
-  quality: giou
+  # the decoder's pair quality (VFL target, FGL weight) is IoU as in D-FINE: its score has to
+  # rank tight boxes first (the Gaussian similarity there cost 2 points of AP75). The matching
+  # cost keeps the Gaussian term instead of GIoU, which saturates once a candidate misses a tiny
+  # ground truth (and the normalized L1 is negligible there), so the class cost alone would decide
+  quality: iou
   matcher:
     weight_dict: {cost_class: 2, cost_bbox: 5, cost_giou: 0, cost_gaussian: 2}
 
