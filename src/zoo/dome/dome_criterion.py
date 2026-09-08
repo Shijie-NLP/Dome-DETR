@@ -119,9 +119,10 @@ class SetStack(NamedTuple):
     suffixes: list[str]
     q_valid: Tensor | None
     is_dn: bool
+    quality: str | None = None  # the quality metric of this stack's matched pairs; None: the criterion's
 
     @classmethod
-    def build(cls, sets, suffixes, q_valid, is_dn=False):
+    def build(cls, sets, suffixes, q_valid, is_dn=False, quality=None):
         logits = torch.stack([s["pred_logits"] for s in sets])
         boxes = torch.stack([s["pred_boxes"] for s in sets])
         with_corners = [s for s in sets if "pred_corners" in s]
@@ -154,6 +155,7 @@ class SetStack(NamedTuple):
             suffixes,
             q_valid,
             is_dn,
+            quality,
         )
 
     @property
@@ -216,6 +218,10 @@ class DomeCriterion(nn.Module):
             and defined for boxes that do not overlap; about three times less sensitive to a
             small offset than IoU, which is what tiny objects need).
         nwd_c: the ``nwd`` constant, in normalized units (0.016 is 12.8 px of an 800 px image).
+        enc_quality: the quality metric of the encoder sets' pairs instead (``None``: ``quality``).
+            The decoder's score must rank tight boxes first (IoU), while the encoder's only picks
+            the tokens worth refining, where a near miss on a tiny box should still count for
+            something: ``gaussian`` keeps a box one width off at 0.4 where IoU is already 0.
         boxes_weight_format: ``None``, ``iou`` or ``giou``: weight the GIoU loss and the VFL / MAL
             targets by the matched pairs' (G)IoU instead of ``quality``.
         defe_density_map_weight, density_recall_penalty: the density-map loss weight, and how
@@ -256,6 +262,7 @@ class DomeCriterion(nn.Module):
         reg_max=32,
         quality="iou",
         nwd_c=0.016,
+        enc_quality=None,
         boxes_weight_format=None,
         defe_density_map_weight=4,
         density_recall_penalty=0.3,
@@ -282,7 +289,9 @@ class DomeCriterion(nn.Module):
         self.enc_topk = enc_topk
         self.enc_in_uni_set = enc_in_uni_set
         assert quality in ("iou", "giou", "nwd", "gaussian"), quality
+        assert enc_quality in (None, "iou", "giou", "nwd", "gaussian"), enc_quality
         self.quality = quality
+        self.enc_quality = enc_quality
         self.nwd_c = nwd_c
         self.boxes_weight_format = boxes_weight_format
         self.alpha = alpha
@@ -316,18 +325,19 @@ class DomeCriterion(nn.Module):
             src_boxes = stack.boxes.reshape(-1, 4)[(pairs.set_idx * b + pairs.batch_idx) * q + pairs.query_idx]
             target_boxes = targets.boxes.reshape(-1, 4)[pairs.batch_idx * targets.boxes.shape[1] + pairs.target_idx]
             with torch.no_grad():
-                quality = self._matched_quality(src_boxes, target_boxes)
+                quality = self._matched_quality(src_boxes, target_boxes, stack.quality)
             self.matched[key] = (src_boxes, target_boxes, quality)
         return self.matched[key]
 
-    def _matched_quality(self, src_boxes, target_boxes):
-        """The localization quality of matched pairs of cxcywh boxes, ``[K]`` in [0, 1], by ``quality``."""
-        if self.quality == "iou":
+    def _matched_quality(self, src_boxes, target_boxes, metric=None):
+        """The localization quality of matched pairs of cxcywh boxes, ``[K]`` in [0, 1], by ``metric`` (default ``quality``)."""
+        metric = metric or self.quality
+        if metric == "iou":
             return elementwise_box_iou(box_cxcywh_to_xyxy(src_boxes), box_cxcywh_to_xyxy(target_boxes))[0]
-        if self.quality == "giou":
+        if metric == "giou":
             giou = elementwise_generalized_box_iou(box_cxcywh_to_xyxy(src_boxes), box_cxcywh_to_xyxy(target_boxes))
             return giou.clamp(min=0)
-        if self.quality == "nwd":
+        if metric == "nwd":
             delta = src_boxes - target_boxes
             w2 = torch.cat([delta[:, :2], delta[:, 2:] / 2], dim=-1).norm(dim=-1)  # in (cx, cy, w/2, h/2)
             return torch.exp(-w2 / self.nwd_c)
@@ -691,7 +701,9 @@ class DomeCriterion(nn.Module):
         losses = self._stack_losses(stack, padded, self.losses, own, shared, num_boxes, num_go, ("boxes", "local"), fdr)
 
         # the encoder sets: their own losses, and outside the union their own matches and pair counts
-        enc_stack = SetStack.build(enc_sets, [f"_enc_{i}" for i in range(len(enc_sets))], padded.q_valid)
+        enc_stack = SetStack.build(
+            enc_sets, [f"_enc_{i}" for i in range(len(enc_sets))], padded.q_valid, quality=self.enc_quality
+        )
         enc_losses = self.losses if self.enc_losses is None else self.enc_losses
         if self.enc_in_uni_set:
             enc_args = (enc_own, Pairs.from_flat(union).tiled(enc_stack.num_sets), num_boxes, num_go, ("boxes",))
