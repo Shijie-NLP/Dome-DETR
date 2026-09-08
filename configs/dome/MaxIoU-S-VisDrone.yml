@@ -41,9 +41,9 @@ MaxIoUTransformer:
   num_points: [6, 4, 3, 3]
   num_queries: 2000    # the most queries an image gets (memory guard, training and inference)
   num_denoising: 0   # the ground truths' claimed tokens replace the denoising queries
-  # the encoder's class logits are trained on 0/1 targets (class-balanced BCE, the claimed token's
-  # class positive); their maximum is the objectness that picks the queries in training and
-  # inference alike at its decision boundary, logit 0
+  # the encoder's class logits are trained on 0/1 targets (a plain BCE, each ground truth's most
+  # similar query positive on its class); their maximum is the objectness that picks the queries
+  # in training and inference alike at its decision boundary, logit 0
   min_queries: 300     # the least queries per image, training (forced tokens included) and inference
   min_negatives: 100   # training: the least unforced queries on top of the forced tokens (crowds)
   infer_rule: objectness   # or topk, the plain D-FINE selection
@@ -71,16 +71,20 @@ MaxIoUTransformer:
 
 DomeCriterion:
   enc_losses: ['obj', 'boxes']   # the encoder's queries: plain 0/1 objectness (no IoU target) and boxes
-  # the encoder's queries are candidates, not detections: every ground truth's enc_topk most similar
-  # queries are its positives (one-to-many), so an object keeps a few passing tokens instead of one
-  # peak; their matches stay out of the union matching, which would make the decoder's box losses
-  # one-to-many too. enc_matching: hungarian, enc_in_uni_set: True restores D-FINE's
+  # the encoder's queries: every ground truth's single most similar query (by Gaussian similarity,
+  # the metric the forced selection uses, so it is nearly always the forced token itself) is its
+  # positive; enc_topk: 3 makes it one-to-many, a few passing tokens per object instead of one
+  # peak, at the price of a head that passes the objects' whole neighbourhoods. The matches stay
+  # out of the union matching (with topk > 1 it would make the decoder's box losses one-to-many
+  # too). enc_matching: hungarian, enc_in_uni_set: True restores D-FINE's
   enc_matching: topk
-  enc_topk: 3
+  enc_topk: 1
   enc_in_uni_set: False
-  # the positives' targets stay 1 (every one of the enc_topk tokens must pass, for recall) but their
-  # shares of the loss follow their Gaussian similarity: a token whose box is well off pushes less
-  obj_quality_weight: True
+  # the objectness loss: a plain BCE, the positives' target 1, everything else 0, no reweighting,
+  # so logit 0 is the posterior's boundary under the queries' own share of objects. balanced (the
+  # halves weighted 1/2 each, obj_pos_weight and obj_quality_weight on top) puts the boundary at
+  # the likelihood ratio instead, which passes thousands of tokens per image
+  obj_loss: plain
   # the VFL target of the decoder's queries: the boxes' Gaussian similarity (1 - Hellinger distance),
   # parameter-free and about three times less sensitive to a pixel of offset on a tiny box than
   # IoU, whose target jumps with the box head's normal jitter; iou (D-FINE), giou or nwd to ablate
