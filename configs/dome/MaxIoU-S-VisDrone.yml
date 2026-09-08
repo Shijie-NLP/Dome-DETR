@@ -59,7 +59,7 @@ MaxIoUTransformer:
   # A token several ground truths want is forced once; the criterion decides who predicts what.
   # One per ground truth: every extra forced token is a near-duplicate the loss labels negative
   assign_metric: gaussian
-  assign_k: 1
+  assign_k: 2
   assign_radius: 1
 
   # query self-attention restricted to each query's local_attn_k nearest queries by initial box
@@ -96,11 +96,11 @@ DomeCriterion:
   # each positive is targeted at its pair's GIoU (clamped at 0, at most the IoU): a token whose
   # box is off its ground truth learns a low score, and a loose one a lower one than with 1
   obj_target: quality
-  enc_quality: giou
+  enc_quality: gaussian
   # the decoder's pair quality (VFL target, FGL weight) and the matching cost: the Gaussian
   # similarity, as in the run this recipe restates (2026-09-08); iou with cost_giou 2 and
   # cost_gaussian 0 is D-FINE's, which ranked tight boxes better (AP75) at the same AP
-  quality: gaussian
+  quality: giou
   matcher:
     weight_dict: {cost_class: 2, cost_bbox: 5, cost_giou: 0, cost_gaussian: 2}
 
