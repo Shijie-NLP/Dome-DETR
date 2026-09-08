@@ -6,13 +6,14 @@ Modified from D-FINE (https://github.com/Peterande/D-FINE)
 Copyright (c) 2024 The D-FINE Authors. All Rights Reserved.
 """
 
-import copy
 from contextlib import contextmanager
+from typing import NamedTuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F  # noqa: N812
 import torchvision
+from torch import Tensor
 
 from ...core import register
 from ...misc import dist_utils
@@ -23,9 +24,146 @@ from ...misc.box_ops import (
     gaussian_box_similarity,
 )
 from .fdr import bbox2distance
-from .matcher import topk_matching
+from .matcher import padded_targets, topk_matching
 
 __all__ = ["DomeCriterion"]
+
+
+class Targets(NamedTuple):
+    """A batch's ground truths padded to ``[B, M]``: see ``matcher.padded_targets``."""
+
+    labels: Tensor  # [B, M]
+    boxes: Tensor  # [B, M, 4]
+    gt_valid: Tensor  # [B, M]
+    q_valid: Tensor  # [B, Q], the real (unpadded) queries of every image
+
+
+class Pairs(NamedTuple):
+    """
+    The matched pairs of a set stack as flat index tensors, sorted by set: pair ``k`` matches
+    query ``query_idx[k]`` of image ``batch_idx[k]`` in set ``set_idx[k]`` to that image's
+    ground truth ``target_idx[k]`` (an index into the padded targets). ``counts`` is the number
+    of pairs of every set, on the host.
+    """
+
+    set_idx: Tensor
+    batch_idx: Tensor
+    query_idx: Tensor
+    target_idx: Tensor
+    counts: list[int]
+
+    @classmethod
+    def from_lists(cls, indices_lists, device):
+        """From one per-image list of ``(pred_idx, target_idx)`` per set, as the matcher returns them."""
+        lengths = [[src.shape[0] for src, _ in indices] for indices in indices_lists]
+        counts = [sum(lens) for lens in lengths]
+        set_idx = torch.arange(len(indices_lists)).repeat_interleave(torch.tensor(counts, dtype=torch.long))
+        batch_idx = torch.cat(
+            [torch.arange(len(lens)).repeat_interleave(torch.tensor(lens, dtype=torch.long)) for lens in lengths]
+        )
+        query_idx = torch.cat([src for indices in indices_lists for src, _ in indices])
+        target_idx = torch.cat([tgt for indices in indices_lists for _, tgt in indices])
+        return cls(
+            set_idx.to(device, non_blocking=True),
+            batch_idx.to(device, non_blocking=True),
+            query_idx,
+            target_idx,
+            counts,
+        )
+
+    @classmethod
+    def shared(cls, indices, num_sets, device):
+        """The same per-image matching for every one of ``num_sets`` sets."""
+        one = cls.from_lists([indices], device)
+        k = one.counts[0]
+        set_idx = torch.arange(num_sets, device=device).repeat_interleave(k)
+        return cls(
+            set_idx,
+            one.batch_idx.repeat(num_sets),
+            one.query_idx.repeat(num_sets),
+            one.target_idx.repeat(num_sets),
+            [k] * num_sets,
+        )
+
+    def first_sets(self, n):
+        """The pairs of the first ``n`` sets."""
+        k = sum(self.counts[:n])
+        return Pairs(self.set_idx[:k], self.batch_idx[:k], self.query_idx[:k], self.target_idx[:k], self.counts[:n])
+
+
+class SetStack(NamedTuple):
+    """
+    Prediction sets of the same shape stacked along a leading set dimension, so that one loss
+    computation covers them all: ``logits [S, B, Q, C]`` and ``boxes [S, B, Q, 4]`` of every
+    set; ``corners [S', B, Q, 4 * (reg_max + 1)]`` and ``refs [S', B, Q, 4]`` of the first ``S'``
+    sets, which carry FDR's edge distributions (``None`` when none does); the distillation
+    teacher of those sets, if any, with ``has_teacher`` / ``is_teacher`` per set (a set is its own
+    teacher in the denoising stack; its distillation loss is zero); the loss suffix per set;
+    ``q_valid`` (``None``: every query is real); and whether the sets are denoising ones.
+    """
+
+    logits: Tensor
+    boxes: Tensor
+    corners: Tensor | None
+    refs: Tensor | None
+    teacher_corners: Tensor | None
+    teacher_logits: Tensor | None
+    has_teacher: list[bool]
+    is_teacher: list[bool]
+    suffixes: list[str]
+    q_valid: Tensor | None
+    is_dn: bool
+
+    @classmethod
+    def build(cls, sets, suffixes, q_valid, is_dn=False):
+        logits = torch.stack([s["pred_logits"] for s in sets])
+        boxes = torch.stack([s["pred_boxes"] for s in sets])
+        with_corners = [s for s in sets if "pred_corners" in s]
+        assert with_corners == sets[: len(with_corners)], "the sets with edge distributions come first"
+        corners = refs = teacher_corners = teacher_logits = None
+        has_teacher, is_teacher = [], []
+        if with_corners:
+            corners = torch.stack([s["pred_corners"] for s in with_corners])
+            refs = torch.stack([s["ref_points"] for s in with_corners]).detach()
+            teacher_corners = next(
+                (s["teacher_corners"] for s in with_corners if s.get("teacher_corners") is not None), None
+            )
+            teacher_logits = next(
+                (s["teacher_logits"] for s in with_corners if s.get("teacher_logits") is not None), None
+            )
+            has_teacher = [s.get("teacher_corners") is not None for s in with_corners]
+            is_teacher = [
+                teacher_corners is not None and s["pred_corners"].data_ptr() == teacher_corners.data_ptr()
+                for s in with_corners
+            ]
+        return cls(
+            logits,
+            boxes,
+            corners,
+            refs,
+            teacher_corners,
+            teacher_logits,
+            has_teacher,
+            is_teacher,
+            suffixes,
+            q_valid,
+            is_dn,
+        )
+
+    @property
+    def num_sets(self):
+        return self.logits.shape[0]
+
+    @property
+    def num_corner_sets(self):
+        return 0 if self.corners is None else self.corners.shape[0]
+
+
+def _per_set_sum(values: Tensor, counts: list[int]) -> Tensor:
+    """The sum of ``values`` (one per pair, sorted by set) within each set, ``[S]``."""
+    if len(set(counts)) == 1:
+        return values.view(len(counts), -1).sum(1)
+    return torch.stack([v.sum() for v in values.split(counts)])
 
 
 @register()
@@ -41,6 +179,10 @@ class DomeCriterion(nn.Module):
     ``enc_losses`` when given), and the weighted terms are returned with a suffix naming the set
     (``_aux_0``, ``_pre``, ``_enc_0``, ``_dn_0``, ...). Padded queries (``batch_queries_num``)
     are never matched and count in no loss.
+
+    Sets of one kind (the decoder layers with the pre-outputs, the encoder sets, the denoising
+    sets) are stacked (``SetStack``) and their matches flattened (``Pairs``), so every loss runs
+    once over a whole stack and reduces per set.
 
     Args:
         matcher: the Hungarian matcher (injected from the config).
@@ -138,29 +280,22 @@ class DomeCriterion(nn.Module):
         self._clear_cache()
 
     def _clear_cache(self):
-        # per-forward caches: the FGL targets are the same for every decoder layer (all layers
-        # regress from the first layer's reference boxes), and so are the DDF normalisers
-        self.fgl_targets, self.fgl_targets_dn = None, None
+        # per-forward caches: the DDF normalisers of the decoder stack, reused by the denoising
+        # stack, and the matched pairs' boxes and quality, gathered once per (stack, pairs)
         self.num_pos, self.num_neg = None, None
-        self.matched = {}  # (set, matching) -> the matched pairs, gathered once per forward
+        self.matched = {}
 
     # ------------------------------------------------------------------ matched pairs
 
-    @staticmethod
-    def _get_src_permutation_idx(indices):
-        """The (batch, query) index of every matched prediction."""
-        batch_idx = torch.cat([torch.full_like(src, i) for i, (src, _) in enumerate(indices)])
-        src_idx = torch.cat([src for (src, _) in indices])
-        return batch_idx, src_idx
-
-    def _matched_boxes(self, outputs, targets, indices):
-        """The matched predictions' index, their boxes and the target boxes they are matched to (cxcywh)."""
-        key = (id(outputs), id(indices))
+    def _matched(self, stack: SetStack, pairs: Pairs, targets: Targets):
+        """The matched predictions' boxes ``[K, 4]``, the target boxes they are matched to, and their quality (detached)."""
+        key = (id(stack), id(pairs))
         if key not in self.matched:
-            idx = self._get_src_permutation_idx(indices)
-            src_boxes = outputs["pred_boxes"][idx]
-            target_boxes = torch.cat([t["boxes"][i] for t, (_, i) in zip(targets, indices)], dim=0)
-            self.matched[key] = (idx, src_boxes, target_boxes)
+            src_boxes = stack.boxes[pairs.set_idx, pairs.batch_idx, pairs.query_idx]
+            target_boxes = targets.boxes[pairs.batch_idx, pairs.target_idx]
+            with torch.no_grad():
+                quality = self._matched_quality(src_boxes, target_boxes)
+            self.matched[key] = (src_boxes, target_boxes, quality)
         return self.matched[key]
 
     def _matched_quality(self, src_boxes, target_boxes):
@@ -176,148 +311,163 @@ class DomeCriterion(nn.Module):
             return torch.exp(-w2 / self.nwd_c)
         return gaussian_box_similarity(src_boxes, target_boxes)
 
-    def _class_targets(self, src_logits, targets, indices, idx):
-        """Per-query target class (``num_classes`` = background) and its one-hot over the real classes."""
-        target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])
-        target_classes = torch.full(src_logits.shape[:2], self.num_classes, dtype=torch.int64, device=src_logits.device)
-        target_classes[idx] = target_classes_o
-        one_hot = F.one_hot(target_classes, num_classes=self.num_classes + 1)[..., :-1]
-        return target_classes, one_hot
+    def _class_targets(self, stack: SetStack, pairs: Pairs, targets: Targets):
+        """Per (set, query) target class ``[S, B, Q]`` (``num_classes`` = background) and its one-hot over the real classes."""
+        classes = torch.full(stack.logits.shape[:3], self.num_classes, dtype=torch.int64, device=stack.logits.device)
+        classes[pairs.set_idx, pairs.batch_idx, pairs.query_idx] = targets.labels[pairs.batch_idx, pairs.target_idx]
+        one_hot = F.one_hot(classes, num_classes=self.num_classes + 1)[..., :-1]
+        return classes, one_hot
 
-    @staticmethod
-    def _reduce_query_loss(loss, batch_queries_num, num_boxes):
-        """Sum a ``[B, Q, C]`` per-query loss, ignoring the padded queries of each image, normalized by ``num_boxes``."""
-        if batch_queries_num is not None:
-            queries = torch.arange(loss.shape[1], device=loss.device)[None, :]
-            valid = queries < torch.tensor(batch_queries_num).to(loss.device, non_blocking=True)[:, None]
-            loss = loss * valid.unsqueeze(-1)
-        return loss.mean(1).sum() * loss.shape[1] / num_boxes
+    def _reduce_query_loss(self, loss: Tensor, stack: SetStack, num_boxes):
+        """Sum a ``[S, B, Q, C]`` per-query loss over each set, ignoring the padded queries, normalized by ``num_boxes``."""
+        if stack.q_valid is not None:
+            loss = loss * stack.q_valid[None, :, :, None]
+        return loss.sum((1, 2, 3)) / num_boxes
 
     # ------------------------------------------------------------------ classification losses
 
-    def loss_labels_focal(self, outputs, targets, indices, num_boxes, batch_queries_num=None, **kwargs):
-        src_logits = outputs["pred_logits"]
-        idx = self._get_src_permutation_idx(indices)
-        _, target = self._class_targets(src_logits, targets, indices, idx)
-        target = target.to(src_logits.dtype)  # the one-hot is int64; BCE needs a float target
-        loss = torchvision.ops.sigmoid_focal_loss(src_logits, target, self.alpha, self.gamma, reduction="none")
-        return {"loss_focal": self._reduce_query_loss(loss, batch_queries_num, num_boxes)}
+    def loss_labels_focal(self, stack, pairs, num_boxes, targets, **kwargs):
+        _, target = self._class_targets(stack, pairs, targets)
+        target = target.to(stack.logits.dtype)  # the one-hot is int64; BCE needs a float target
+        loss = torchvision.ops.sigmoid_focal_loss(stack.logits, target, self.alpha, self.gamma, reduction="none")
+        return {"loss_focal": self._reduce_query_loss(loss, stack, num_boxes)}
 
-    def _iou_aware_targets(self, outputs, targets, indices, values):
+    def _iou_aware_targets(self, stack, pairs, targets, values):
         """Shared by VFL and MAL: the one-hot targets with the matched quality (or ``values``) as the positive score."""
-        src_logits = outputs["pred_logits"]
-        idx, src_boxes, target_boxes = self._matched_boxes(outputs, targets, indices)
-        ious = self._matched_quality(src_boxes, target_boxes).detach() if values is None else values
-        target_classes, target = self._class_targets(src_logits, targets, indices, idx)
-        target_score = torch.zeros_like(target_classes, dtype=src_logits.dtype)
-        target_score[idx] = ious.to(target_score.dtype)
-        return src_logits, target, target_score.unsqueeze(-1) * target
+        logits = stack.logits
+        _, _, quality = self._matched(stack, pairs, targets)
+        ious = quality if values is None else values
+        classes, target = self._class_targets(stack, pairs, targets)
+        target_score = torch.zeros_like(classes, dtype=logits.dtype)
+        target_score[pairs.set_idx, pairs.batch_idx, pairs.query_idx] = ious.to(target_score.dtype)
+        return logits, target, target_score.unsqueeze(-1) * target
 
-    def loss_labels_vfl(self, outputs, targets, indices, num_boxes, values=None, batch_queries_num=None, **kwargs):
-        src_logits, target, target_score = self._iou_aware_targets(outputs, targets, indices, values)
+    def loss_labels_vfl(self, stack, pairs, num_boxes, targets, values=None, **kwargs):
+        src_logits, target, target_score = self._iou_aware_targets(stack, pairs, targets, values)
         pred_score = F.sigmoid(src_logits).detach()
         weight = self.alpha * pred_score.pow(self.gamma) * (1 - target) + target_score
         loss = F.binary_cross_entropy_with_logits(src_logits, target_score, weight=weight, reduction="none")
-        return {"loss_vfl": self._reduce_query_loss(loss, batch_queries_num, num_boxes)}
+        return {"loss_vfl": self._reduce_query_loss(loss, stack, num_boxes)}
 
-    def loss_labels_mal(self, outputs, targets, indices, num_boxes, values=None, batch_queries_num=None, **kwargs):
-        src_logits, target, target_score = self._iou_aware_targets(outputs, targets, indices, values)
+    def loss_labels_mal(self, stack, pairs, num_boxes, targets, values=None, **kwargs):
+        src_logits, target, target_score = self._iou_aware_targets(stack, pairs, targets, values)
         pred_score = F.sigmoid(src_logits).detach()
         target_score = target_score.pow(self.gamma)
         neg_weight = 1.0 if self.mal_alpha is None else self.mal_alpha
         weight = neg_weight * pred_score.pow(self.gamma) * (1 - target) + target
         loss = F.binary_cross_entropy_with_logits(src_logits, target_score, weight=weight, reduction="none")
-        return {"loss_mal": self._reduce_query_loss(loss, batch_queries_num, num_boxes)}
+        return {"loss_mal": self._reduce_query_loss(loss, stack, num_boxes)}
+
+    def loss_obj(self, stack, pairs, num_boxes, targets, **kwargs):
+        """
+        Plain 0/1 classification, no IoU-aware target: a class-balanced BCE over every (query,
+        class) entry of each set's ``pred_logits [B, Q, C]``. The matched queries are positive on
+        their ground-truth class (class 0 when ``C`` is 1), every other entry negative; each half
+        is normalized to weight 1/2 (the positives' shares equal, or with ``obj_quality_weight``
+        in proportion to their ``quality``) and the positive half scaled by ``obj_pos_weight``, so
+        the decision boundary is logit 0. Padded queries are left out.
+        """
+        logits = stack.logits.float()  # the weights are built in fp32 under autocast too
+        s, b, q = pairs.set_idx, pairs.batch_idx, pairs.query_idx
+        cls = targets.labels[b, pairs.target_idx] if logits.shape[-1] > 1 else torch.zeros_like(q)
+        target = torch.zeros_like(logits)
+        target[s, b, q, cls] = 1.0
+        share = torch.zeros(logits.shape[:3], device=logits.device)  # each positive query's share of the positive half
+        share[s, b, q] = 1.0
+        if self.obj_quality_weight:
+            share[s, b, q] = self._matched(stack, pairs, targets)[2].to(share.dtype)
+        keep = torch.ones_like(logits, dtype=torch.bool)
+        if stack.q_valid is not None:
+            keep &= stack.q_valid[None, :, :, None]
+        pos, neg = (target > 0) & keep, (target == 0) & keep
+        share = share[..., None] * pos  # [S, B, Q, C], the positives' shares
+        pos_weight = 0.5 * self.obj_pos_weight * share / share.sum((1, 2, 3)).clamp(min=1e-6)[:, None, None, None]
+        neg_weight = 0.5 / neg.sum((1, 2, 3)).clamp(min=1)[:, None, None, None]
+        weight = pos_weight * pos + neg_weight * neg
+        loss = F.binary_cross_entropy_with_logits(logits, target, weight=weight, reduction="none")
+        return {"loss_obj": loss.sum((1, 2, 3))}
 
     # ------------------------------------------------------------------ box losses
 
-    def loss_boxes(self, outputs, targets, indices, num_boxes, boxes_weight=None, **kwargs):
+    def loss_boxes(self, stack, pairs, num_boxes, targets, boxes_weight=None, **kwargs):
         """L1 and GIoU losses of the matched pairs (boxes are normalized cxcywh)."""
-        _, src_boxes, target_boxes = self._matched_boxes(outputs, targets, indices)
-        loss_bbox = F.l1_loss(src_boxes, target_boxes, reduction="none").sum() / num_boxes
+        src_boxes, target_boxes, _ = self._matched(stack, pairs, targets)
+        loss_bbox = _per_set_sum((src_boxes - target_boxes).abs().sum(-1), pairs.counts) / num_boxes
         loss_giou = 1 - elementwise_generalized_box_iou(box_cxcywh_to_xyxy(src_boxes), box_cxcywh_to_xyxy(target_boxes))
         if boxes_weight is not None:
             loss_giou = loss_giou * boxes_weight
-        return {"loss_bbox": loss_bbox, "loss_giou": loss_giou.sum() / num_boxes}
+        return {"loss_bbox": loss_bbox, "loss_giou": _per_set_sum(loss_giou, pairs.counts) / num_boxes}
 
-    def loss_local(self, outputs, targets, indices, num_boxes, T=5, **kwargs):  # noqa: N803
+    def loss_local(self, stack, pairs, num_boxes, targets, fdr, T=5, **kwargs):  # noqa: N803
         """
-        FDR's Fine-Grained Localization (FGL) loss on the matched pairs' edge distributions, and,
-        when the set carries ``teacher_corners`` (the last layer's), the Decoupled Distillation
-        Focal (DDF) loss towards them.
+        FDR's Fine-Grained Localization (FGL) loss on the matched pairs' edge distributions of
+        the sets that have them, and, for those with a distillation teacher, the Decoupled
+        Distillation Focal (DDF) loss towards it. ``pairs`` are those sets' pairs.
         """
-        if "pred_corners" not in outputs:
+        if stack.corners is None:
             return {}
-        idx, src_boxes, target_boxes = self._matched_boxes(outputs, targets, indices)
-        pred_corners = outputs["pred_corners"][idx].reshape(-1, self.reg_max + 1)
-        ref_points = outputs["ref_points"][idx].detach()
-        is_dn = "is_dn" in outputs
-
-        cache = "fgl_targets_dn" if is_dn else "fgl_targets"
-        if getattr(self, cache) is None:
-            with torch.no_grad():
-                distances = bbox2distance(
-                    ref_points,
-                    box_cxcywh_to_xyxy(target_boxes),
-                    self.reg_max,
-                    outputs["reg_scale"],
-                    outputs["up"],
-                    min_unit=outputs.get("fdr_min_unit"),
-                )
-            setattr(self, cache, distances)
-        target_corners, weight_right, weight_left = getattr(self, cache)
-
-        ious = self._matched_quality(src_boxes, target_boxes)
-        weight_targets = ious.unsqueeze(-1).repeat(1, 4).reshape(-1).detach()
-        losses = {
-            "loss_fgl": self.unimodal_distribution_focal_loss(
-                pred_corners, target_corners, weight_right, weight_left, weight_targets, avg_factor=num_boxes
+        s, b, q = pairs.set_idx, pairs.batch_idx, pairs.query_idx
+        src_boxes, target_boxes, quality = self._matched(stack, pairs, targets)
+        pred_corners = stack.corners[s, b, q].reshape(-1, self.reg_max + 1)  # [K * 4, bins]
+        with torch.no_grad():
+            target_corners, weight_right, weight_left = bbox2distance(
+                stack.refs[s, b, q],
+                box_cxcywh_to_xyxy(target_boxes),
+                self.reg_max,
+                fdr["reg_scale"],
+                fdr["up"],
+                min_unit=fdr["min_unit"],
             )
-        }
-        if "teacher_corners" in outputs:
-            losses["loss_ddf"] = self._loss_ddf(outputs, idx, ious, T, is_dn)
+        weight_targets = quality.unsqueeze(-1).expand(-1, 4).reshape(-1)
+        fgl = self.unimodal_distribution_focal_loss(
+            pred_corners, target_corners, weight_right, weight_left, weight_targets
+        )
+        losses = {"loss_fgl": _per_set_sum(fgl, [c * 4 for c in pairs.counts]) / num_boxes}
+        if stack.teacher_corners is not None:
+            losses["loss_ddf"] = self._loss_ddf(stack, pairs, quality, T)
         return losses
 
-    def _loss_ddf(self, outputs, idx, ious, T, is_dn):  # noqa: N803
-        """KL distillation of every query's edge distributions towards the teacher's, at temperature ``T``."""
-        pred_corners = outputs["pred_corners"].reshape(-1, self.reg_max + 1)
-        target_corners = outputs["teacher_corners"].reshape(-1, self.reg_max + 1)
-        if pred_corners.data_ptr() == target_corners.data_ptr():
-            return pred_corners.sum() * 0  # the teacher layer itself (the same storage)
+    def _loss_ddf(self, stack: SetStack, pairs: Pairs, quality: Tensor, T):  # noqa: N803
+        """KL distillation of every query's edge distributions towards the teacher's, at temperature ``T``, ``[S']``."""
+        num_sets, b, q = stack.corners.shape[:3]
+        pred_corners = stack.corners.reshape(num_sets, b, q, 4, -1)
+        target_corners = stack.teacher_corners.detach().reshape(b, q, 4, -1)
 
-        # matched queries are weighted by their IoU, the others by the teacher's confidence
-        weight_targets_local = outputs["teacher_logits"].sigmoid().max(dim=-1)[0]
-        mask = torch.zeros_like(weight_targets_local, dtype=torch.bool)
-        mask[idx] = True
-        mask = mask.unsqueeze(-1).repeat(1, 1, 4).reshape(-1)
-        weight_targets_local[idx] = ious.reshape_as(weight_targets_local[idx]).to(weight_targets_local.dtype)
-        weight_targets_local = weight_targets_local.unsqueeze(-1).repeat(1, 1, 4).reshape(-1).detach()
+        # matched queries are weighted by their quality, the others by the teacher's confidence
+        weight = stack.teacher_logits.sigmoid().max(dim=-1)[0].expand(num_sets, -1, -1).clone()
+        weight[pairs.set_idx, pairs.batch_idx, pairs.query_idx] = quality.to(weight.dtype)
+        mask = torch.zeros(num_sets, b, q, dtype=torch.bool, device=weight.device)
+        mask[pairs.set_idx, pairs.batch_idx, pairs.query_idx] = True
+        weight, mask = weight[..., None].expand(-1, -1, -1, 4).detach(), mask[..., None].expand(-1, -1, -1, 4)
 
         kl = nn.KLDivLoss(reduction="none")(
-            F.log_softmax(pred_corners / T, dim=1), F.softmax(target_corners.detach() / T, dim=1)
+            F.log_softmax(pred_corners / T, dim=-1), F.softmax(target_corners / T, dim=-1)
         ).sum(-1)
-        loss_match_local = weight_targets_local * (T**2) * kl
+        loss_match_local = weight * (T**2) * kl  # [S', B, Q, 4]
 
-        if not is_dn:
+        if not stack.is_dn:
             # balance the matched and unmatched halves; sqrt-scaled so that the GPU batch size does not matter
-            batch_scale = 8 / outputs["pred_boxes"].shape[0]
-            self.num_pos = (mask.sum() * batch_scale) ** 0.5
-            self.num_neg = ((~mask).sum() * batch_scale) ** 0.5
+            batch_scale = 8 / b
+            self.num_pos = (mask.sum((1, 2, 3)) * batch_scale) ** 0.5
+            self.num_neg = ((~mask).sum((1, 2, 3)) * batch_scale) ** 0.5
         # the halves' means, 0 for an empty half, without reading the masks on the host
-        loss_pos = (loss_match_local * mask).sum() / mask.sum().clamp(min=1)
-        loss_neg = (loss_match_local * ~mask).sum() / (~mask).sum().clamp(min=1)
-        return (loss_pos * self.num_pos + loss_neg * self.num_neg) / (self.num_pos + self.num_neg)
+        loss_pos = (loss_match_local * mask).sum((1, 2, 3)) / mask.sum((1, 2, 3)).clamp(min=1)
+        loss_neg = (loss_match_local * ~mask).sum((1, 2, 3)) / (~mask).sum((1, 2, 3)).clamp(min=1)
+        loss = (loss_pos * self.num_pos + loss_neg * self.num_neg) / (self.num_pos + self.num_neg)
+        # a set that is its own teacher (the last denoising layer) distils nothing
+        own = torch.tensor([0.0 if t else 1.0 for t in stack.is_teacher], device=loss.device)
+        return loss * own
 
     @staticmethod
-    def unimodal_distribution_focal_loss(pred, label, weight_right, weight_left, weight=None, avg_factor=None):
-        """Cross-entropy against the two bins around each target position, weighted by their distance to it."""
+    def unimodal_distribution_focal_loss(pred, label, weight_right, weight_left, weight=None):
+        """Cross-entropy against the two bins around each target position, weighted by their distance to it, per element."""
         dis_left = label.long()
         dis_right = dis_left + 1
         loss = F.cross_entropy(pred, dis_left, reduction="none") * weight_left.reshape(-1)
         loss = loss + F.cross_entropy(pred, dis_right, reduction="none") * weight_right.reshape(-1)
         if weight is not None:
             loss = loss * weight.float()
-        return loss.sum() / avg_factor if avg_factor is not None else loss.sum()
+        return loss
 
     # ------------------------------------------------------------------ DeFE losses
 
@@ -350,39 +500,9 @@ class DomeCriterion(nn.Module):
             losses["defe_reg_loss"] = (penalty * diff**2).mean()
         return losses
 
-    def loss_obj(self, outputs, targets, indices, num_boxes, batch_queries_num=None, **kwargs):
-        """
-        Plain 0/1 classification, no IoU-aware target: a class-balanced BCE over every (query,
-        class) entry of ``pred_logits [B, Q, C]``. The matched queries are positive on their
-        ground-truth class (class 0 when ``C`` is 1), every other entry negative; each half is
-        normalized to weight 1/2 (the positives' shares equal, or with ``obj_quality_weight`` in
-        proportion to their ``quality``) and the positive half scaled by ``obj_pos_weight``, so
-        the decision boundary is logit 0. Padded queries are left out.
-        """
-        logits = outputs["pred_logits"].float()  # the weights are built in fp32 under autocast too
-        target = torch.zeros_like(logits)
-        share = torch.zeros(logits.shape[:2], device=logits.device)  # each positive query's share of the positive half
-        for i, (src, tgt) in enumerate(indices):
-            cls = targets[i]["labels"][tgt] if logits.shape[-1] > 1 else torch.zeros_like(tgt)
-            target[i, src, cls] = 1.0
-            share[i, src] = 1.0
-        if self.obj_quality_weight:
-            idx, src_boxes, target_boxes = self._matched_boxes(outputs, targets, indices)
-            share[idx] = self._matched_quality(src_boxes.detach(), target_boxes).to(share.dtype)
-        keep = torch.ones_like(logits, dtype=torch.bool)
-        if batch_queries_num is not None:
-            counts = torch.tensor(batch_queries_num).to(logits.device, non_blocking=True)
-            keep &= (torch.arange(logits.shape[1], device=logits.device)[None, :] < counts[:, None])[..., None]
-        pos, neg = (target > 0) & keep, (target == 0) & keep
-        weight = torch.zeros_like(logits)
-        share = share[..., None].expand_as(logits)[pos]
-        weight[pos] = 0.5 * self.obj_pos_weight * share / share.sum().clamp(min=1e-6)
-        weight[neg] = 0.5 / neg.sum().clamp(min=1)
-        return {"loss_obj": F.binary_cross_entropy_with_logits(logits, target, weight=weight, reduction="sum")}
-
     # ------------------------------------------------------------------ assembling
 
-    def get_loss(self, loss, outputs, targets, indices, num_boxes, **kwargs):
+    def get_loss(self, loss, stack, pairs, num_boxes, targets, **kwargs):
         loss_map = {
             "boxes": self.loss_boxes,
             "focal": self.loss_labels_focal,
@@ -392,13 +512,13 @@ class DomeCriterion(nn.Module):
             "local": self.loss_local,
         }
         assert loss in loss_map, f"do you really want to compute {loss} loss?"
-        return loss_map[loss](outputs, targets, indices, num_boxes, **kwargs)
+        return loss_map[loss](stack, pairs, num_boxes, targets, **kwargs)
 
-    def get_loss_meta_info(self, loss, outputs, targets, indices):
+    def get_loss_meta_info(self, loss, stack, pairs, targets):
         """With ``boxes_weight_format``, the matched pairs' (G)IoU as the weight / target score of a loss."""
         if self.boxes_weight_format is None:
             return {}
-        _, src_boxes, target_boxes = self._matched_boxes(outputs, targets, indices)
+        src_boxes, target_boxes, _ = self._matched(stack, pairs, targets)
         src_xyxy, tgt_xyxy = box_cxcywh_to_xyxy(src_boxes.detach()), box_cxcywh_to_xyxy(target_boxes)
         if self.boxes_weight_format == "iou":
             iou = elementwise_box_iou(src_xyxy, tgt_xyxy)[0]
@@ -412,28 +532,38 @@ class DomeCriterion(nn.Module):
             return {"values": iou}
         return {}
 
-    def _weighted_losses(
-        self, outputs, targets, indices, num_boxes, suffix, uni_losses, shared, batch_queries_num, losses=None
-    ):
+    def _stack_losses(self, stack, targets, losses, own, shared, num_boxes, num_shared, uni_losses, fdr=None):
         """
-        Every configured loss (``losses``, default the criterion's) on one prediction set,
-        weighted and suffixed. Losses named in ``uni_losses`` use the union matches and count in
-        ``shared`` instead of ``indices`` / ``num_boxes``.
+        Every loss in ``losses`` over a stack, weighted and suffixed per set. Losses named in
+        ``uni_losses`` use the union matching ``shared`` and its pair count ``num_shared``
+        instead of the sets' ``own`` pairs and ``num_boxes`` (a float, or one per set).
         """
         result = {}
-        for loss in self.losses if losses is None else losses:
-            ind, nb = shared if (self.use_uni_set and loss in uni_losses) else (indices, num_boxes)
-            meta = self.get_loss_meta_info(loss, outputs, targets, ind)
-            l_dict = self.get_loss(loss, outputs, targets, ind, nb, batch_queries_num=batch_queries_num, **meta)
-            result.update({k + suffix: v * self.weight_dict[k] for k, v in l_dict.items() if k in self.weight_dict})
+        local_pairs = {}
+        for loss in losses:
+            pairs, nb = (shared, num_shared) if (self.use_uni_set and loss in uni_losses) else (own, num_boxes)
+            if loss == "local":  # the sets with edge distributions come first
+                if id(pairs) not in local_pairs:
+                    local_pairs[id(pairs)] = pairs.first_sets(stack.num_corner_sets)
+                pairs = local_pairs[id(pairs)]
+            meta = self.get_loss_meta_info(loss, stack, pairs, targets)
+            per_set = self.get_loss(loss, stack, pairs, nb, targets, fdr=fdr, **meta)
+            for k, v in per_set.items():
+                if k not in self.weight_dict:
+                    continue
+                for s, suffix in enumerate(stack.suffixes[: v.shape[0]]):
+                    if k == "loss_ddf" and not stack.has_teacher[s]:
+                        continue
+                    result[k + suffix] = v[s] * self.weight_dict[k]
         return result
 
     @staticmethod
     def _average_over_ranks(count, device) -> float:
         """A count averaged over the distributed ranks, at least 1."""
+        if not dist_utils.is_dist_available_and_initialized():
+            return float(max(count, 1))
         count = torch.as_tensor([count], dtype=torch.float, device=device)
-        if dist_utils.is_dist_available_and_initialized():
-            torch.distributed.all_reduce(count)
+        torch.distributed.all_reduce(count)
         return torch.clamp(count / dist_utils.get_world_size(), min=1).item()
 
     @staticmethod
@@ -480,15 +610,12 @@ class DomeCriterion(nn.Module):
         return dn_match_indices
 
     @contextmanager
-    def _class_agnostic(self, targets):
+    def _class_agnostic(self, targets: Targets):
         """Score against a single class: every label becomes 0 and ``num_classes`` is 1 for the duration."""
         num_classes = self.num_classes
         self.num_classes = 1
-        agnostic_targets = copy.deepcopy(targets)
-        for t in agnostic_targets:
-            t["labels"] = torch.zeros_like(t["labels"])
         try:
-            yield agnostic_targets
+            yield targets._replace(labels=torch.zeros_like(targets.labels))
         finally:
             self.num_classes = num_classes
 
@@ -496,73 +623,62 @@ class DomeCriterion(nn.Module):
         assert "aux_outputs" in outputs, "DomeCriterion needs the decoder's auxiliary outputs (aux_loss: True)"
         device = outputs["pred_logits"].device
         batch_queries_num = outputs.get("batch_queries_num")
+        num_queries = outputs["pred_logits"].shape[1]
         self._clear_cache()
+        padded = Targets(*padded_targets(targets, num_queries, batch_queries_num))
+        fdr = {"up": outputs.get("up"), "reg_scale": outputs.get("reg_scale"), "min_unit": outputs.get("fdr_min_unit")}
 
         # match every prediction set in one go, and build the union matching for the box losses
         hungarian_enc = self.enc_matching == "hungarian"
         sets = [outputs, *outputs["aux_outputs"], outputs["pre_outputs"]]
+        suffixes = ["", *(f"_aux_{i}" for i in range(len(outputs["aux_outputs"]))), "_pre"]
+        enc_sets = outputs["enc_aux_outputs"]
         matched = self.matcher.match_sets(
-            sets + (outputs["enc_aux_outputs"] if hungarian_enc else []), targets, batch_queries_num=batch_queries_num
+            sets + (enc_sets if hungarian_enc else []), targets, batch_queries_num=batch_queries_num
         )
-        indices, cached_indices = matched[0], matched[1 : len(sets)]
+        indices = matched[: len(sets)]
         if hungarian_enc:
-            cached_indices_enc = matched[len(sets) :]
+            indices_enc = matched[len(sets) :]
         else:
-            cached_indices_enc = [
-                topk_matching(o, targets, self.enc_topk, batch_queries_num) for o in outputs["enc_aux_outputs"]
-            ]
+            indices_enc = [topk_matching(o, targets, self.enc_topk, batch_queries_num) for o in enc_sets]
         num_targets = [len(t["labels"]) for t in targets]
         indices_go = self._union_indices(
-            matched[: len(sets)] + (cached_indices_enc if self.enc_in_uni_set else []),
-            outputs["pred_logits"].shape[1],
-            num_targets,
+            indices + (indices_enc if self.enc_in_uni_set else []), num_queries, num_targets
         )
-        shared = (indices_go, self._average_over_ranks(sum(len(x[0]) for x in indices_go), device))
+        num_go = self._average_over_ranks(sum(len(x[0]) for x in indices_go), device)
         num_boxes = self._average_over_ranks(sum(num_targets), device)
 
-        def block(set_outputs, set_targets, set_indices, suffix, uni_losses=("boxes", "local"), **overrides):
-            args = dict(num_boxes=num_boxes, shared=shared, batch_queries_num=batch_queries_num)
-            args.update(overrides)
-            return self._weighted_losses(
-                set_outputs, set_targets, set_indices, suffix=suffix, uni_losses=uni_losses, **args
-            )
-
-        losses = block(outputs, targets, indices, "")
-
-        for i, aux in enumerate(outputs["aux_outputs"]):
-            if "local" in self.losses:
-                aux["up"], aux["reg_scale"] = outputs["up"], outputs["reg_scale"]
-                aux["fdr_min_unit"] = outputs.get("fdr_min_unit")
-            losses.update(block(aux, targets, cached_indices[i], f"_aux_{i}"))
-
-        losses.update(block(outputs["pre_outputs"], targets, cached_indices[-1], "_pre"))
+        # the decoder's sets: their own matches for the classification losses, the union for the boxes
+        stack = SetStack.build(sets, suffixes, padded.q_valid)
+        own = Pairs.from_lists(indices, device)
+        shared = Pairs.shared(indices_go, stack.num_sets, device)
+        losses = self._stack_losses(stack, padded, self.losses, own, shared, num_boxes, num_go, ("boxes", "local"), fdr)
 
         # the encoder sets: their own losses, and outside the union their own matches and pair counts
-        def enc_args(i):
-            if self.enc_in_uni_set:
-                return dict(uni_losses=("boxes",), losses=self.enc_losses)
-            pairs = self._average_over_ranks(sum(len(x[0]) for x in cached_indices_enc[i]), device)
-            return dict(uni_losses=(), losses=self.enc_losses, num_boxes=pairs)
-
-        if outputs["enc_meta"]["class_agnostic"]:
-            with self._class_agnostic(targets) as enc_targets:
-                for i, enc in enumerate(outputs["enc_aux_outputs"]):
-                    losses.update(block(enc, enc_targets, cached_indices_enc[i], f"_enc_{i}", **enc_args(i)))
+        enc_stack = SetStack.build(enc_sets, [f"_enc_{i}" for i in range(len(enc_sets))], padded.q_valid)
+        enc_own = Pairs.from_lists(indices_enc, device)
+        enc_losses = self.losses if self.enc_losses is None else self.enc_losses
+        if self.enc_in_uni_set:
+            enc_args = (enc_own, Pairs.shared(indices_go, enc_stack.num_sets, device), num_boxes, num_go, ("boxes",))
         else:
-            for i, enc in enumerate(outputs["enc_aux_outputs"]):
-                losses.update(block(enc, targets, cached_indices_enc[i], f"_enc_{i}", **enc_args(i)))
+            pairs = [self._average_over_ranks(sum(len(x[0]) for x in ind), device) for ind in indices_enc]
+            enc_args = (enc_own, enc_own, torch.tensor(pairs, device=device), None, ())
+        if outputs["enc_meta"]["class_agnostic"]:
+            with self._class_agnostic(padded) as enc_targets:
+                losses.update(self._stack_losses(enc_stack, enc_targets, enc_losses, *enc_args, fdr))
+        else:
+            losses.update(self._stack_losses(enc_stack, padded, enc_losses, *enc_args, fdr))
 
         if "dn_outputs" in outputs:
             indices_dn = self.get_cdn_matched_indices(outputs["dn_meta"], targets)
+            dn_sets = [*outputs["dn_outputs"], outputs["dn_pre_outputs"]]
+            dn_suffixes = [*(f"_dn_{i}" for i in range(len(outputs["dn_outputs"]))), "_dn_pre"]
+            dn_stack = SetStack.build(dn_sets, dn_suffixes, None, is_dn=True)
+            dn_pairs = Pairs.shared(indices_dn, dn_stack.num_sets, device)
             dn_num_boxes = num_boxes * outputs["dn_meta"]["dn_num_group"]
-            dn_args = dict(uni_losses=(), num_boxes=dn_num_boxes, batch_queries_num=None)
-            for i, dn in enumerate(outputs["dn_outputs"]):
-                if "local" in self.losses:
-                    dn["is_dn"] = True
-                    dn["up"], dn["reg_scale"] = outputs["up"], outputs["reg_scale"]
-                    dn["fdr_min_unit"] = outputs.get("fdr_min_unit")
-                losses.update(block(dn, targets, indices_dn, f"_dn_{i}", **dn_args))
-            losses.update(block(outputs["dn_pre_outputs"], targets, indices_dn, "_dn_pre", **dn_args))
+            losses.update(
+                self._stack_losses(dn_stack, padded, self.losses, dn_pairs, dn_pairs, dn_num_boxes, None, (), fdr)
+            )
 
         if "defe" in outputs:
             losses.update(self.loss_defe(outputs["defe"], targets))
