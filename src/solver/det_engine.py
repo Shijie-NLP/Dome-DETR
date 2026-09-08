@@ -44,6 +44,17 @@ def query_stats(model, outputs) -> dict[str, float]:
     return stats
 
 
+def release_cached_memory() -> None:
+    """
+    Hand the caching allocator's free blocks back to the driver. Training and evaluation
+    allocate differently shaped tensors, so the blocks one leaves cached rarely fit the other
+    and the two pools add up; on a Windows GPU the driver then pages into system memory rather
+    than failing, and a step that took 0.2 s takes 30. Called between the two.
+    """
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 def to_device(targets: list[dict], device) -> list[dict]:
     """The per-image target dicts with every tensor moved to ``device`` (asynchronously from pinned memory)."""
     return [{k: v.to(device, non_blocking=True) for k, v in t.items()} for t in targets]
@@ -169,6 +180,7 @@ def evaluate(
     model.eval()
     criterion.eval()
     coco_evaluator.cleanup()
+    release_cached_memory()
 
     metric_logger = MetricLogger(delimiter="  ")
     header = "Test:"
@@ -233,4 +245,5 @@ def evaluate(
     if query_summary is not None:
         stats["queries"] = query_summary  # mean, min, max per image, and the ample share
 
+    release_cached_memory()
     return stats, coco_evaluator
