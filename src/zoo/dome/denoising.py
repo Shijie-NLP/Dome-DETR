@@ -23,7 +23,6 @@ def get_contrastive_denoising_training_group(
     label_noise_ratio=0.5,
     box_noise_scale=1.0,
     batch_queries_num=None,
-    num_heads=8,
 ):
     """
     Contrastive denoising queries (DINO / RT-DETR): the ground-truth boxes of every image,
@@ -32,8 +31,8 @@ def get_contrastive_denoising_training_group(
     at random. Returns their class embeddings, their boxes as logits, the self-attention mask, and
     a ``dn_meta`` dict (``dn_positive_idx``, ``dn_num_group``, ``dn_num_split``).
 
-    The attention mask has one row block per head and image (``[num_heads * bs, T, T]``): the
-    matching queries cannot see the denoising queries, denoising groups cannot see each other,
+    The attention mask is ``[bs, 1, T, T]``, True where attention is blocked (the same for
+    every head): the matching queries cannot see the denoising queries, denoising groups cannot see each other,
     and, with ``batch_queries_num`` (the real query count of every image, the rest being
     padding), padding queries and real queries are hidden from one another. Padding queries still
     see themselves so their softmax stays finite.
@@ -51,7 +50,7 @@ def get_contrastive_denoising_training_group(
         input_query_class = torch.full([bs, 0], num_classes, dtype=torch.int32, device=device)
         input_query_logits = class_embed(input_query_class)
         input_query_bbox_unact = inverse_sigmoid(torch.zeros([bs, 0, 4], device=device))
-        attn_mask = torch.zeros([num_queries, num_queries], dtype=torch.bool, device=device)
+        attn_mask = torch.zeros([bs, 1, num_queries, num_queries], dtype=torch.bool, device=device)
         dn_meta = {"dn_positive_idx": None, "dn_num_group": 0, "dn_num_split": [0, num_queries]}
         return input_query_logits, input_query_bbox_unact, attn_mask, dn_meta
 
@@ -109,15 +108,14 @@ def get_contrastive_denoising_training_group(
         if i > 0:
             base_attn_mask[group_start:group_end, :group_start] = True
 
-    attn_mask = base_attn_mask.unsqueeze(0).repeat(num_heads * bs, 1, 1)  # [num_heads * bs, T, T]
+    attn_mask = base_attn_mask[None, None].repeat(bs, 1, 1, 1)  # [bs, 1, T, T]
 
     if batch_queries_num is not None:
         for b, valid_queries in enumerate(batch_queries_num):
             padding_start = num_denoising + valid_queries
             if padding_start < tgt_size:
-                heads = slice(b * num_heads, (b + 1) * num_heads)
-                attn_mask[heads, :padding_start, padding_start:] = True  # real queries do not see padding
-                attn_mask[heads, padding_start:, :padding_start] = True  # padding does not see real queries
+                attn_mask[b, 0, :padding_start, padding_start:] = True  # real queries do not see padding
+                attn_mask[b, 0, padding_start:, :padding_start] = True  # padding does not see real queries
 
     dn_meta = {
         "dn_positive_idx": dn_positive_idx,

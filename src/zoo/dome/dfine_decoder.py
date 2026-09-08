@@ -509,7 +509,6 @@ class DFINETransformer(nn.Module):
                 label_noise_ratio=self.label_noise_ratio,
                 box_noise_scale=self.box_noise_scale,
                 batch_queries_num=batch_queries_num,
-                num_heads=self.nhead,
             )
             init_ref_points_unact = torch.concat([denoising_bbox_unact, init_ref_points_unact], dim=1)
             init_ref_contents = torch.concat([denoising_logits, init_ref_contents], dim=1)
@@ -517,6 +516,13 @@ class DFINETransformer(nn.Module):
             attn_mask = self._padding_attn_mask(batch_queries_num, memory.device)
         num_dn = dn_meta["dn_num_split"][0] if dn_meta is not None else 0
         attn_mask = self._local_attn_mask(attn_mask, dec_in.boxes_unact, batch_queries_num, num_dn)
+        if attn_mask is not None:
+            # the additive mask scaled_dot_product_attention takes, built once for every layer in
+            # the attention's dtype (a boolean one would be converted in every layer, slower)
+            dtype = torch.get_autocast_dtype(memory.device.type) if torch.is_autocast_enabled() else torch.float32
+            attn_mask = torch.zeros(attn_mask.shape, dtype=dtype, device=memory.device).masked_fill(
+                attn_mask, -torch.inf
+            )
         q_scale = self._logn_scale(batch_queries_num, memory.device)
         fdr_min_unit = None
         if self.min_refine_cells > 0:  # so many cells of the finest level, normalized, (x, y)
@@ -593,24 +599,24 @@ class DFINETransformer(nn.Module):
 
     def _padding_attn_mask(self, batch_queries_num, device):
         """
-        Without denoising queries: a ``[num_heads * B, Q, Q]`` self-attention mask hiding every
-        image's padded queries from its real ones and vice versa (padding still sees itself), or
-        ``None`` when no image is padded.
+        Without denoising queries: a ``[B, 1, Q, Q]`` self-attention mask (True blocks, the same
+        for every head) hiding every image's padded queries from its real ones and vice versa
+        (padding still sees itself), or ``None`` when no image is padded.
         """
         num_queries = max(batch_queries_num)
         if min(batch_queries_num) == num_queries:
             return None
         counts = torch.tensor(batch_queries_num).to(device, non_blocking=True)  # no stream sync
         real = torch.arange(num_queries, device=device)[None, :] < counts[:, None]  # [B, Q]
-        mask = real[:, :, None] != real[:, None, :]  # True blocks attention
-        return mask.repeat_interleave(self.nhead, dim=0)
+        return (real[:, :, None] != real[:, None, :])[:, None]
 
     def _local_attn_mask(self, attn_mask, boxes_unact, batch_queries_num, num_dn):
         """
         With ``local_attn_k``: the self-attention mask restricting every matching query to its
         ``local_attn_k`` nearest matching queries by initial box centre (itself always allowed,
-        padding never), merged into ``attn_mask`` (the denoising or padding mask, or ``None``).
-        The denoising block of ``attn_mask``, if any, is left as it is.
+        padding never), merged into ``attn_mask`` (the ``[B, 1, Q, Q]`` denoising or padding
+        mask, True blocks, or ``None``). The denoising block of ``attn_mask``, if any, is left as
+        it is.
         """
         if self.local_attn_k <= 0:
             return attn_mask
@@ -625,11 +631,11 @@ class DFINETransformer(nn.Module):
         blocked = torch.ones((b, q, q), dtype=torch.bool, device=device)
         blocked.scatter_(2, dist.topk(k, dim=-1, largest=False).indices, False)
         blocked &= ~torch.eye(q, dtype=torch.bool, device=device)[None]  # every row keeps itself
-        blocked = blocked.repeat_interleave(self.nhead, dim=0)  # [B * heads, Q, Q]
+        blocked = blocked[:, None]  # [B, 1, Q, Q]
         if attn_mask is None:
             return blocked
         attn_mask = attn_mask.clone()
-        attn_mask[:, num_dn:, num_dn:] |= blocked
+        attn_mask[:, :, num_dn:, num_dn:] |= blocked
         return attn_mask
 
     def _logn_scale(self, batch_queries_num, device):

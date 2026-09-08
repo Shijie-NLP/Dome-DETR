@@ -11,6 +11,7 @@ import copy
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F  # noqa: N812
 import torch.nn.init as init
 
 from .backbone.common import get_activation
@@ -184,6 +185,25 @@ class TransformerDecoderLayer(nn.Module):
     def forward_ffn(self, tgt):
         return self.linear2(self.dropout3(self.activation(self.linear1(tgt))))
 
+    def _self_attention(self, q, k, v, attn_mask):
+        """
+        ``self_attn`` (an ``nn.MultiheadAttention``, kept for its parameters) run through
+        ``scaled_dot_product_attention`` with ``attn_mask`` ``[B, 1, Q, Q]`` (additive, ``-inf``
+        where a query may not attend) broadcast over the heads. ``nn.MultiheadAttention.forward``
+        takes the mask per head and turns a boolean one into a ``[B * heads, Q, Q]`` additive one
+        in every layer.
+        """
+        mha = self.self_attn
+        b, n, d = q.shape
+        w_q, w_k, w_v = mha.in_proj_weight.chunk(3)
+        b_q, b_k, b_v = mha.in_proj_bias.chunk(3)
+        q = F.linear(q, w_q, b_q).view(b, n, mha.num_heads, -1).transpose(1, 2)
+        k = F.linear(k, w_k, b_k).view(b, n, mha.num_heads, -1).transpose(1, 2)
+        v = F.linear(v, w_v, b_v).view(b, n, mha.num_heads, -1).transpose(1, 2)
+        dropout = mha.dropout if self.training else 0.0
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=dropout)
+        return mha.out_proj(out.transpose(1, 2).reshape(b, n, d))
+
     def forward(
         self,
         target,
@@ -198,7 +218,7 @@ class TransformerDecoderLayer(nn.Module):
         q = k = self.with_pos_embed(target, query_pos_embed)
         if self_attn_q_scale is not None:
             q = q * self_attn_q_scale
-        target2, _ = self.self_attn(q, k, value=target, attn_mask=attn_mask, need_weights=False)  # SDPA path
+        target2 = self._self_attention(q, k, target, attn_mask)
         target = self.norm1(target + self.dropout1(target2))
 
         # cross attention
