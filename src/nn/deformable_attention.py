@@ -45,8 +45,12 @@ def ms_deformable_attention_core(
     sampling_grids = 2 * sampling_locations - 1 if method == "default" else sampling_locations
     sampling_grids = sampling_grids.permute(0, 2, 1, 3, 4).flatten(0, 1)
     sampling_locations_list = sampling_grids.split(num_points_list, dim=-2)
+    attn_weights = attention_weights.permute(0, 2, 1, 3).reshape(bs * n_head, 1, len_q, sum(num_points_list))
+    attn_weights_list = attn_weights.split(num_points_list, dim=-1)
 
-    sampling_value_list = []
+    # the weighted sum accumulated level by level: no [bs * n_head, c, len_q, sum(num_points)]
+    # concatenation of the samples, nor its split in the backward pass
+    output = None
     for level, (h, w) in enumerate(value_spatial_shapes):
         value_l = value[level].reshape(bs * n_head, c, h, w)
         sampling_grid_l: torch.Tensor = sampling_locations_list[level]
@@ -69,12 +73,10 @@ def ms_deformable_attention_core(
         else:
             raise ValueError(f"unknown deformable attention method {method!r}")
 
-        sampling_value_list.append(sampling_value_l)
+        weighted = (sampling_value_l * attn_weights_list[level]).sum(-1)  # [bs * n_head, c, len_q]
+        output = weighted if output is None else output + weighted
 
-    attn_weights = attention_weights.permute(0, 2, 1, 3).reshape(bs * n_head, 1, len_q, sum(num_points_list))
-    weighted_sample_locs = torch.concat(sampling_value_list, dim=-1) * attn_weights
-    output = weighted_sample_locs.sum(-1).reshape(bs, n_head * c, len_q)
-    return output.permute(0, 2, 1)
+    return output.reshape(bs, n_head * c, len_q).permute(0, 2, 1)
 
 
 class MSDeformableAttention(nn.Module):
