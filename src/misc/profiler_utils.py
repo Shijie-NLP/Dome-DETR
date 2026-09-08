@@ -4,8 +4,6 @@ Copyright (c) 2025 The Dome-DETR Authors. All Rights Reserved.
 
 import copy
 
-from calflops import calculate_flops
-
 
 def stats(cfg, input_shape: tuple = (1, 3, 640, 640)) -> tuple[int, dict]:
     """
@@ -13,6 +11,10 @@ def stats(cfg, input_shape: tuple = (1, 3, 640, 640)) -> tuple[int, dict]:
     ``base_size`` of the collate function (``input_shape`` when the config has none). Returns the
     count and a one-line summary for the log.
     """
+    # imported here: calflops pulls in transformers and scikit-learn, 2.5 s that every dataloader
+    # worker would otherwise pay on start-up (importing the dataset module imports the package)
+    from calflops import calculate_flops
+
     base_size = cfg.train_dataloader.collate_fn.base_size
     if isinstance(base_size, (list, tuple)):
         input_shape = (1, 3, base_size[0], base_size[1])
