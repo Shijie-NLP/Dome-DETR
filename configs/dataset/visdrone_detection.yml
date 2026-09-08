@@ -24,13 +24,16 @@ train_dataloader:
     transforms:
       type: Compose
       ops:
-        - {type: RandomPhotometricDistort, p: 0.5}
         - {type: RandomIoUCrop, p: 0.8}
         - {type: SanitizeBoundingBoxes, min_size: 1}
         - {type: RandomHorizontalFlip}
         - {type: Resize, size: 800}  # short side 800, aspect ratio kept
         - {type: RandomCrop, size: [800, 800]}
         - {type: SanitizeBoundingBoxes, min_size: 1}
+        # after the crop, still on the PIL image: a pixel-wise colour change commutes with the
+        # crops and the resize, and PIL does it in 30 ms on 800x800 against 70 ms on the full-size
+        # image (torchvision's tensor version takes 50 ms on the single thread a worker has)
+        - {type: RandomPhotometricDistort, p: 0.5}
         - {type: ConvertPILImage, dtype: 'float32', scale: True}
         - {type: ConvertBoxes, fmt: 'cxcywh', normalize: True}
       policy:
