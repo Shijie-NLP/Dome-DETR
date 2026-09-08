@@ -6,9 +6,10 @@ Ground-truth-forced query selection (working name ``MaxIoUTransformer``): a ``DF
 whose query selection replaces the top-k by objectness, with no denoising queries. Everything
 past the selection is D-FINE's: the encoder's predictions on the queries and the decoder's
 outputs are Hungarian-matched by the criterion. The one difference in the losses is on the
-encoder side, where the class logits are trained as plain 0/1 objectness (``loss_obj``, no
-IoU-aware target, ``enc_losses`` of ``DomeCriterion``), so that a probability threshold on
-them can serve as the selection rule.
+encoder side, where the class logits are trained as objectness (``loss_obj`` of
+``DomeCriterion``'s ``enc_losses``: a plain BCE towards 1 or, with ``obj_target='quality'``,
+towards the matched pair's IoU), so that a probability threshold on them can serve as the
+selection rule.
 
 - The objectness of a token is its highest class logit; a token passes when its sigmoid exceeds
   ``obj_threshold`` (0.5: the head's decision boundary, logit 0).

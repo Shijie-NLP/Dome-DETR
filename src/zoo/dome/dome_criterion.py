@@ -217,7 +217,11 @@ class DomeCriterion(nn.Module):
         mal_alpha: the negative weight of the MAL loss (``None``: 1).
         use_uni_set: match the box and localization losses against the union of the matches of
             every prediction set (D-FINE's 'go' indices) rather than each set's own.
-        obj_loss: the form of the 0/1 classification loss ``loss_obj`` (the matched queries'
+        obj_target: the positives' target of ``loss_obj``: ``one`` (0/1 classification) or
+            ``quality`` (the matched pair's ``quality``, IoU by default: a positive whose box is
+            off its ground truth is trained towards a low score, so that the objectness reflects
+            how well the token's box fits, not only that a token was matched).
+        obj_loss: the form of the classification loss ``loss_obj`` (the matched queries'
             ground-truth class positive, every other (query, class) entry negative): ``plain``,
             the BCE of every entry summed and normalized by the ground truth count like the other
             classification losses, whose decision boundary (logit 0) is the posterior's under the
@@ -255,6 +259,7 @@ class DomeCriterion(nn.Module):
         enc_matching="hungarian",
         enc_topk=1,
         enc_in_uni_set=True,
+        obj_target="one",
         obj_loss="plain",
         obj_quality_weight=False,
         obj_pos_weight=1.0,
@@ -281,7 +286,9 @@ class DomeCriterion(nn.Module):
         self.density_recall_penalty = density_recall_penalty
         self.mal_alpha = mal_alpha
         self.use_uni_set = use_uni_set
+        assert obj_target in ("one", "quality"), obj_target
         assert obj_loss in ("plain", "balanced"), obj_loss
+        self.obj_target = obj_target
         self.obj_loss = obj_loss
         self.obj_quality_weight = obj_quality_weight
         self.obj_pos_weight = obj_pos_weight
@@ -368,18 +375,24 @@ class DomeCriterion(nn.Module):
 
     def loss_obj(self, stack, pairs, num_boxes, targets, **kwargs):
         """
-        0/1 classification, no IoU-aware target, over every (query, class) entry of each set's
-        ``pred_logits [B, Q, C]``: the matched queries are positive on their ground-truth class
-        (class 0 when ``C`` is 1), every other entry negative, padded queries left out. ``plain``
-        is the BCE of the entries, summed and normalized by ``num_boxes``; ``balanced`` normalizes
-        each half to weight 1/2 (the positives' shares equal, or with ``obj_quality_weight`` in
-        proportion to their ``quality``) and scales the positive half by ``obj_pos_weight``.
+        Objectness classification over every (query, class) entry of each set's ``pred_logits
+        [B, Q, C]``: the matched queries are positive on their ground-truth class (class 0 when
+        ``C`` is 1), with target 1 or, with ``obj_target='quality'``, their pair's quality; every
+        other entry negative, padded queries left out. ``plain`` is the BCE of the entries, summed
+        and normalized by ``num_boxes``; ``balanced`` normalizes each half to weight 1/2 (the
+        positives' shares equal, or with ``obj_quality_weight`` in proportion to their
+        ``quality``) and scales the positive half by ``obj_pos_weight``.
         """
         logits = stack.logits.float()  # the weights are built in fp32 under autocast too
         s, b, q = pairs.set_idx, pairs.batch_idx, pairs.query_idx
         cls = targets.labels[b, pairs.target_idx] if logits.shape[-1] > 1 else torch.zeros_like(q)
+        pos = torch.zeros_like(logits, dtype=torch.bool)
+        pos[s, b, q, cls] = True
         target = torch.zeros_like(logits)
-        target[s, b, q, cls] = 1.0
+        if self.obj_target == "quality":
+            target[s, b, q, cls] = self._matched(stack, pairs, targets)[2].to(target.dtype)
+        else:
+            target[s, b, q, cls] = 1.0
         if self.obj_loss == "plain":
             loss = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
             return {"loss_obj": self._reduce_query_loss(loss, stack, num_boxes)}
@@ -391,7 +404,7 @@ class DomeCriterion(nn.Module):
         keep = torch.ones_like(logits, dtype=torch.bool)
         if stack.q_valid is not None:
             keep &= stack.q_valid[None, :, :, None]
-        pos, neg = (target > 0) & keep, (target == 0) & keep
+        pos, neg = pos & keep, ~pos & keep
         share = share[..., None] * pos  # [S, B, Q, C], the positives' shares
         pos_weight = 0.5 * self.obj_pos_weight * share / share.sum((1, 2, 3)).clamp(min=1e-6)[:, None, None, None]
         neg_weight = 0.5 / neg.sum((1, 2, 3)).clamp(min=1)[:, None, None, None]
