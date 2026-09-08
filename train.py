@@ -61,8 +61,6 @@ def main(args) -> None:
     if (args.resume or args.tuning) and "HGNetv2" in cfg.yaml_cfg:
         cfg.yaml_cfg["HGNetv2"]["pretrained"] = False
 
-    print("cfg: ", cfg.__dict__)
-
     solver = TASKS[cfg.yaml_cfg["task"]](cfg)
 
     if args.test_only:

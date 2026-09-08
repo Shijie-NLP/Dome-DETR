@@ -8,6 +8,7 @@ from datetime import datetime
 from pathlib import Path
 
 import torch
+import yaml
 
 from ..core import BaseConfig
 from ..misc import dist_utils
@@ -70,6 +71,11 @@ class BaseSolver:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         if dist_utils.is_main_process():
             tee_console(self.output_dir / "console.log")  # the console, kept next to log.txt
+            # the resolved config (includes and command line merged) opens the log and is kept as
+            # config.yml, so two runs can be diffed
+            config = yaml.safe_dump({**cfg.yaml_cfg, "output_dir": str(self.output_dir)}, sort_keys=False)
+            (self.output_dir / "config.yml").write_text(config, encoding="utf-8")
+            print("config:\n" + config)
         self.writer = cfg.writer
 
         if self.writer:
