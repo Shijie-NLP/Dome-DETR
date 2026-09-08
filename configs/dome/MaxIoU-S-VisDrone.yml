@@ -55,9 +55,10 @@ MaxIoUTransformer:
   # it at so many cells on every level (1: the neighbouring cells) so tiny boxes still read their
   # surroundings (0: off)
   min_sample_cells: 1
-  # the FDR layers move the box edges within a range proportional to the first layer's box; let
-  # every edge move at least so many cells of the finest level whatever the box size (0: off)
-  min_refine_cells: 2
+  # the FDR layers move the box edges within a range proportional to the first layer's box; with
+  # min_refine_cells: 2 every edge could move at least 2 cells of the finest level whatever the box
+  # size, but that floors the finest bin at 2 px, which costs the tiniest boxes their AP75 (0: off)
+  min_refine_cells: 0
   # the first level's anchor box as a fraction of the image, doubling per level: 0.025 is 5 cells of
   # the stride-4 level (20 px at 800), D-FINE's ratio; its 0.05 default was meant for a stride-8 level
   anchor_grid_size: 0.025
@@ -85,15 +86,12 @@ DomeCriterion:
   # halves weighted 1/2 each, obj_pos_weight and obj_quality_weight on top) puts the boundary at
   # the likelihood ratio instead, which passes thousands of tokens per image
   obj_loss: plain
-  # the VFL target of the decoder's queries: the boxes' Gaussian similarity (1 - Hellinger distance),
-  # parameter-free and about three times less sensitive to a pixel of offset on a tiny box than
-  # IoU, whose target jumps with the box head's normal jitter; iou (D-FINE), giou or nwd to ablate
-  quality: gaussian
-  # the matching cost's localization term: the Gaussian similarity instead of GIoU, which saturates
-  # once a candidate misses a tiny ground truth (and the normalized L1 is negligible there), so the
-  # class cost alone would decide; cost_giou: 2, cost_gaussian: 0 restores D-FINE's
-  matcher:
-    weight_dict: {cost_class: 2, cost_bbox: 5, cost_giou: 0, cost_gaussian: 2}
+  # the VFL target of the decoder's queries and the matching cost's localization term: D-FINE's IoU
+  # and GIoU. The Gaussian similarity (quality: gaussian; matcher weight_dict cost_giou: 0,
+  # cost_gaussian: 2), three times less sensitive to a pixel of offset on a tiny box, gave a score
+  # that no longer tracked how tight a box is: at epoch 6 AP50 was 5 points above Dome-S and AP75
+  # 2 points below, on the same AP
+  quality: iou
 
 
 optimizer:
