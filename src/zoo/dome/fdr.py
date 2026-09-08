@@ -85,27 +85,21 @@ def translate_gt(gt, reg_max, reg_scale, up):
     diffs = function_values.unsqueeze(0) - gt.unsqueeze(1)
     indices = (torch.sum(diffs <= 0, dim=1) - 1).float()
 
-    weight_right = torch.zeros_like(indices)
-    weight_left = torch.zeros_like(indices)
+    # the weights of every value at once, selected with where: boolean indexing would sync the
+    # host six times to size its results
+    below, above = indices < 0, indices >= reg_max
+    valid = ~below & ~above
+    bins = indices.clamp(0, reg_max - 1).long()  # in range for every value; the invalid ones are discarded below
+    left_diffs = torch.abs(gt - function_values[bins])
+    right_diffs = torch.abs(function_values[bins + 1] - gt)
+    weight_right = torch.where(valid, left_diffs / (left_diffs + right_diffs), 0.0)
+    weight_left = torch.where(valid, 1.0 - weight_right, 0.0)
 
-    valid_idx_mask = (indices >= 0) & (indices < reg_max)
-    valid_indices = indices[valid_idx_mask].long()
-    left_values = function_values[valid_indices]
-    right_values = function_values[valid_indices + 1]
-    left_diffs = torch.abs(gt[valid_idx_mask] - left_values)
-    right_diffs = torch.abs(right_values - gt[valid_idx_mask])
-    weight_right[valid_idx_mask] = left_diffs / (left_diffs + right_diffs)
-    weight_left[valid_idx_mask] = 1.0 - weight_right[valid_idx_mask]
+    weight_left = torch.where(below, 1.0, weight_left)
+    indices = torch.where(below, 0.0, indices)
 
-    below = indices < 0
-    weight_right[below] = 0.0
-    weight_left[below] = 1.0
-    indices[below] = 0.0
-
-    above = indices >= reg_max
-    weight_right[above] = 1.0
-    weight_left[above] = 0.0
-    indices[above] = reg_max - 0.1
+    weight_right = torch.where(above, 1.0, weight_right)
+    indices = torch.where(above, reg_max - 0.1, indices)
 
     return indices, weight_right, weight_left
 
