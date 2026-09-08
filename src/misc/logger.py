@@ -122,7 +122,10 @@ class MetricLogger:
         report_memory = torch.cuda.is_available()
         fields = [header, "[{0" + space_fmt + "}/{1}]", "eta: {eta}", "{meters}", "time: {time}", "data: {data}"]
         if report_memory:
-            fields.append("max mem: {memory:.0f}")
+            # the peak allocated so far, and what the caching allocator holds right now: on
+            # Windows the driver pages into system memory once the latter passes the card, and
+            # everything crawls
+            fields.append("max mem: {memory:.0f} (reserved {reserved:.0f})")
         log_msg = self.delimiter.join(fields)
         mb = 1024.0 * 1024.0
         for i, obj in enumerate(iterable):
@@ -140,6 +143,7 @@ class MetricLogger:
                         time=str(iter_time),
                         data=str(data_time),
                         memory=torch.cuda.max_memory_allocated() / mb if report_memory else 0.0,
+                        reserved=torch.cuda.memory_reserved() / mb if report_memory else 0.0,
                     )
                 )
             end = time.time()
