@@ -5,7 +5,6 @@ faster-coco-eval-aitod
 PyYAML
 tensorboard
 scipy
-calflops
 transformers
 scikit-image
 matplotlib
