@@ -4,7 +4,9 @@
 # shares, the Gaussian similarity as every quality and as the matching cost, the refinement floor,
 # and logit 0 as the rule. Two things the decoder no longer offers: one distinct forced token per
 # ground truth with fallbacks (assign_k: 1 forces each ground truth's best token, shared ones
-# once) and the min_negatives floor of 100 unforced queries (moot under min_queries 300).
+# once) and the min_negatives floor of 100 unforced queries (moot under min_queries 300). One
+# change on top: the objectness targets are the pairs' GIoU rather than 1, and the positive half
+# of the loss weighs a quarter of the negative half.
 
 __include__: ['./MaxIoU-S-VisDrone.yml']
 
@@ -13,14 +15,18 @@ output_dir: ./outputs/maxiou_s_visdrone_balanced
 MaxIoUTransformer:
   obj_threshold: 0.5   # sigmoid 0.5 is logit 0, the rule then
   assign_k: 1          # then: assign_candidates 8, one distinct token per ground truth
-  min_refine_cells: 2
 
 DomeCriterion:
-  enc_topk: 3
+  enc_topk: 2
   obj_loss: balanced
-  obj_target: one
+  # the positive half weighs 0.25 of the negative half (0.2 : 0.8): a token passes logit 0 when it
+  # looks four times more like an object than like background, against once with the halves even
+  obj_pos_weight: 0.25
+  # the morning's targets were 1; GIoU (clamped at 0, so at most the IoU) is a lower target for a
+  # loose box, to bring the objectness rule's pass count down from the 2000 cap
+  obj_target: quality
+  enc_quality: giou
   obj_quality_weight: True
   quality: gaussian
-  enc_quality: gaussian
   matcher:
     weight_dict: {cost_class: 2, cost_bbox: 5, cost_giou: 0, cost_gaussian: 2}
