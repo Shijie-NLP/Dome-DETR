@@ -211,40 +211,41 @@ class DomeCriterion(nn.Module):
             The encoder sets' box losses then use their own matches.
         alpha, gamma: the focal parameters of the classification losses.
         reg_max: the FDR bin count of the decoder.
-        quality: the localization quality of a matched pair, the VFL / MAL target score and the
-            FGL weight: ``iou`` (D-FINE), ``giou`` (clamped at 0), ``nwd`` (the normalized Gaussian
+        dec_quality: the localization quality of a matched pair of the decoder's (and denoising)
+            sets, the VFL / MAL target score and the FGL weight: ``iou`` (D-FINE), ``giou``
+            (clamped at 0), ``nwd`` (the normalized Gaussian
             Wasserstein distance, ``exp(-W2 / nwd_c)``) or ``gaussian`` (one minus the Hellinger
             distance between the boxes as Gaussians: parameter-free, scale-invariant, smooth,
             and defined for boxes that do not overlap; about three times less sensitive to a
             small offset than IoU, which is what tiny objects need).
         nwd_c: the ``nwd`` constant, in normalized units (0.016 is 12.8 px of an 800 px image).
-        enc_quality: the quality metric of the encoder sets' pairs instead (``None``: ``quality``).
+        enc_quality: the quality metric of the encoder sets' pairs (``None``: ``dec_quality``).
             The decoder's score must rank tight boxes first (IoU), while the encoder's only picks
             the tokens worth refining, where a near miss on a tiny box should still count for
             something: ``gaussian`` keeps a box one width off at 0.4 where IoU is already 0.
         boxes_weight_format: ``None``, ``iou`` or ``giou``: weight the GIoU loss and the VFL / MAL
-            targets by the matched pairs' (G)IoU instead of ``quality``.
+            targets by the matched pairs' (G)IoU instead of the quality.
         defe_density_map_weight, density_recall_penalty: the density-map loss weight, and how
             much harder under-estimation of populated cells is penalised.
         mal_alpha: the negative weight of the MAL loss (``None``: 1).
         use_uni_set: match the box and localization losses against the union of the matches of
             every prediction set (D-FINE's 'go' indices) rather than each set's own.
-        obj_target: the positives' target of ``loss_obj``: ``one`` (0/1 classification) or
+        enc_obj_target: the positives' target of ``loss_obj``: ``one`` (0/1 classification) or
             ``quality`` (the matched pair's ``quality``, IoU by default: a positive whose box is
             off its ground truth is trained towards a low score, so that the objectness reflects
             how well the token's box fits, not only that a token was matched).
-        obj_loss: the form of the classification loss ``loss_obj`` (the matched queries'
+        enc_obj_loss: the form of the classification loss ``loss_obj`` (the matched queries'
             ground-truth class positive, every other (query, class) entry negative): ``plain``,
             the BCE of every entry summed and normalized by the ground truth count like the other
             classification losses, whose decision boundary (logit 0) is the posterior's under the
             queries' own share of objects; or ``balanced``, the two halves normalized to weight
             1/2 each, whose boundary is the likelihood ratio's, blind to how rare objects are
             (permissive: it passes every token that looks more like an object than not).
-        obj_quality_weight: ``balanced`` only: share the positive half among the positives in
+        enc_obj_quality_weight: ``balanced`` only: share the positive half among the positives in
             proportion to their ``quality`` (the pair's Gaussian similarity with ``gaussian``)
             instead of equally: the targets stay 1, so every positive is still pushed past the
             boundary (recall), but a positive whose box is well off its ground truth pushes less.
-        obj_pos_weight: ``balanced`` only: how much more the positive half weighs than the
+        enc_obj_pos_weight: ``balanced`` only: how much more the positive half weighs than the
             negative half; the boundary moves to a likelihood ratio of its inverse.
     """
 
@@ -260,7 +261,7 @@ class DomeCriterion(nn.Module):
         gamma=2.0,
         num_classes=80,
         reg_max=32,
-        quality="iou",
+        dec_quality="iou",
         nwd_c=0.016,
         enc_quality=None,
         boxes_weight_format=None,
@@ -272,10 +273,10 @@ class DomeCriterion(nn.Module):
         enc_matching="hungarian",
         enc_topk=1,
         enc_in_uni_set=True,
-        obj_target="one",
-        obj_loss="plain",
-        obj_quality_weight=False,
-        obj_pos_weight=1.0,
+        enc_obj_target="one",
+        enc_obj_loss="plain",
+        enc_obj_quality_weight=False,
+        enc_obj_pos_weight=1.0,
     ):
         super().__init__()
         self.num_classes = num_classes
@@ -288,9 +289,9 @@ class DomeCriterion(nn.Module):
         self.enc_matching = enc_matching
         self.enc_topk = enc_topk
         self.enc_in_uni_set = enc_in_uni_set
-        assert quality in ("iou", "giou", "nwd", "gaussian"), quality
+        assert dec_quality in ("iou", "giou", "nwd", "gaussian"), dec_quality
         assert enc_quality in (None, "iou", "giou", "nwd", "gaussian"), enc_quality
-        self.quality = quality
+        self.dec_quality = dec_quality
         self.enc_quality = enc_quality
         self.nwd_c = nwd_c
         self.boxes_weight_format = boxes_weight_format
@@ -301,12 +302,12 @@ class DomeCriterion(nn.Module):
         self.density_recall_penalty = density_recall_penalty
         self.mal_alpha = mal_alpha
         self.use_uni_set = use_uni_set
-        assert obj_target in ("one", "quality"), obj_target
-        assert obj_loss in ("plain", "balanced"), obj_loss
-        self.obj_target = obj_target
-        self.obj_loss = obj_loss
-        self.obj_quality_weight = obj_quality_weight
-        self.obj_pos_weight = obj_pos_weight
+        assert enc_obj_target in ("one", "quality"), enc_obj_target
+        assert enc_obj_loss in ("plain", "balanced"), enc_obj_loss
+        self.enc_obj_target = enc_obj_target
+        self.enc_obj_loss = enc_obj_loss
+        self.enc_obj_quality_weight = enc_obj_quality_weight
+        self.enc_obj_pos_weight = enc_obj_pos_weight
         self._clear_cache()
 
     def _clear_cache(self):
@@ -330,8 +331,8 @@ class DomeCriterion(nn.Module):
         return self.matched[key]
 
     def _matched_quality(self, src_boxes, target_boxes, metric=None):
-        """The localization quality of matched pairs of cxcywh boxes, ``[K]`` in [0, 1], by ``metric`` (default ``quality``)."""
-        metric = metric or self.quality
+        """The localization quality of matched pairs of cxcywh boxes, ``[K]`` in [0, 1], by ``metric`` (default ``dec_quality``)."""
+        metric = metric or self.dec_quality
         if metric == "iou":
             return elementwise_box_iou(box_cxcywh_to_xyxy(src_boxes), box_cxcywh_to_xyxy(target_boxes))[0]
         if metric == "giou":
@@ -394,11 +395,11 @@ class DomeCriterion(nn.Module):
         """
         Objectness classification over every (query, class) entry of each set's ``pred_logits
         [B, Q, C]``: the matched queries are positive on their ground-truth class (class 0 when
-        ``C`` is 1), with target 1 or, with ``obj_target='quality'``, their pair's quality; every
+        ``C`` is 1), with target 1 or, with ``enc_obj_target='quality'``, their pair's quality; every
         other entry negative, padded queries left out. ``plain`` is the BCE of the entries, summed
         and normalized by ``num_boxes``; ``balanced`` normalizes each half to weight 1/2 (the
-        positives' shares equal, or with ``obj_quality_weight`` in proportion to their
-        ``quality``) and scales the positive half by ``obj_pos_weight``.
+        positives' shares equal, or with ``enc_obj_quality_weight`` in proportion to their
+        ``quality``) and scales the positive half by ``enc_obj_pos_weight``.
         """
         logits = stack.logits.float()  # the weights are built in fp32 under autocast too
         s, b, q = pairs.set_idx, pairs.batch_idx, pairs.query_idx
@@ -406,24 +407,24 @@ class DomeCriterion(nn.Module):
         pos = torch.zeros_like(logits, dtype=torch.bool)
         pos[s, b, q, cls] = True
         target = torch.zeros_like(logits)
-        if self.obj_target == "quality":
+        if self.enc_obj_target == "quality":
             target[s, b, q, cls] = self._matched(stack, pairs, targets)[2].to(target.dtype)
         else:
             target[s, b, q, cls] = 1.0
-        if self.obj_loss == "plain":
+        if self.enc_obj_loss == "plain":
             loss = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
             return {"loss_obj": self._reduce_query_loss(loss, stack, num_boxes)}
 
         share = torch.zeros(logits.shape[:3], device=logits.device)  # each positive query's share of the positive half
         share[s, b, q] = 1.0
-        if self.obj_quality_weight:
+        if self.enc_obj_quality_weight:
             share[s, b, q] = self._matched(stack, pairs, targets)[2].to(share.dtype)
         keep = torch.ones_like(logits, dtype=torch.bool)
         if stack.q_valid is not None:
             keep &= stack.q_valid[None, :, :, None]
         pos, neg = pos & keep, ~pos & keep
         share = share[..., None] * pos  # [S, B, Q, C], the positives' shares
-        pos_weight = 0.5 * self.obj_pos_weight * share / share.sum((1, 2, 3)).clamp(min=1e-6)[:, None, None, None]
+        pos_weight = 0.5 * self.enc_obj_pos_weight * share / share.sum((1, 2, 3)).clamp(min=1e-6)[:, None, None, None]
         neg_weight = 0.5 / neg.sum((1, 2, 3)).clamp(min=1)[:, None, None, None]
         weight = pos_weight * pos + neg_weight * neg
         loss = F.binary_cross_entropy_with_logits(logits, target, weight=weight, reduction="none")

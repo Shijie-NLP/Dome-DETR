@@ -7,7 +7,7 @@ whose query selection replaces the top-k by objectness, with no denoising querie
 past the selection is D-FINE's: the encoder's predictions on the queries and the decoder's
 outputs are Hungarian-matched by the criterion. The one difference in the losses is on the
 encoder side, where the class logits are trained as objectness (``loss_obj`` of
-``DomeCriterion``'s ``enc_losses``: a plain BCE towards 1 or, with ``obj_target='quality'``,
+``DomeCriterion``'s ``enc_losses``: a plain BCE towards 1 or, with ``enc_obj_target='quality'``,
 towards the matched pair's IoU), so that a probability threshold on them can serve as the
 selection rule.
 

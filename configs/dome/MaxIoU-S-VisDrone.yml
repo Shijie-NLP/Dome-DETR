@@ -47,7 +47,7 @@ MaxIoUTransformer:
 
   # the query selection: a token passes when the sigmoid of its highest class logit exceeds
   # obj_threshold; 0.5 is the head's decision boundary, logit 0, and with the balanced loss below
-  # the score is not a calibrated probability, so the count is steered by obj_pos_weight, not
+  # the score is not a calibrated probability, so the count is steered by enc_obj_pos_weight, not
   # here. VisDrone crops hold 40 to 100 boxes on most images and up to ~500 on the crowded ones
   obj_threshold: 0.5
   min_queries: 300     # the least queries per image, training and inference alike
@@ -60,7 +60,7 @@ MaxIoUTransformer:
   # A token several ground truths want is forced once; the criterion decides who predicts what.
   # One per ground truth: every extra forced token is a near-duplicate the loss labels negative
   assign_metric: gaussian
-  assign_k: 2
+  assign_k: 3
   assign_radius: 1
 
   # query self-attention restricted to each query's local_attn_k nearest queries by initial box
@@ -83,30 +83,28 @@ DomeCriterion:
   # box losses one-to-many too
   enc_losses: ['obj', 'boxes']
   enc_matching: topk
-  enc_topk: 2
+  enc_topk: 3
   enc_in_uni_set: False
   # the objectness loss: a class-balanced BCE, the positive and negative halves normalized to
   # weight 1/2 each, the positives' shares in proportion to their quality, and the positive half
-  # then scaled by obj_pos_weight. At 1 the boundary sits at a likelihood ratio of 1 and passed
+  # then scaled by enc_obj_pos_weight. At 1 the boundary sits at a likelihood ratio of 1 and passed
   # some 2000 tokens per image; at 0.25 (0.2 : 0.8) a token passes when it looks four times more
-  # like an object than like background. A plain BCE (obj_loss: plain) let nothing through: the
+  # like an object than like background. A plain BCE (enc_obj_loss: plain) let nothing through: the
   # near-duplicate tokens around each positive are labelled 0 and pull it under the line
-  obj_loss: balanced
-  obj_pos_weight: 0.25
-  obj_quality_weight: True
+  enc_obj_loss: balanced
+  enc_obj_pos_weight: 0.20
+  enc_obj_quality_weight: False
   # each positive is targeted at its pair's quality rather than 1, so a token whose box is off
   # its ground truth learns a lower score. The encoder's quality is the Gaussian similarity: a
   # tiny box one width off, IoU 0 like the background, still scores 0.4 there, so the score keeps
   # a gradient towards the object where IoU or GIoU (clamped at 0) would have none
-  obj_target: quality
+  enc_obj_target: quality
   enc_quality: gaussian
   # the decoder's pair quality (VFL target, FGL weight) is IoU as in D-FINE: its score has to
   # rank tight boxes first (the Gaussian similarity there cost 2 points of AP75). The matching
   # cost keeps the Gaussian term instead of GIoU, which saturates once a candidate misses a tiny
   # ground truth (and the normalized L1 is negligible there), so the class cost alone would decide
-  quality: iou
-  matcher:
-    weight_dict: {cost_class: 2, cost_bbox: 5, cost_giou: 0, cost_gaussian: 2}
+  dec_quality: iou
 
 
 optimizer:
