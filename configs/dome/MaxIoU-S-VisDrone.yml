@@ -60,7 +60,7 @@ MaxIoUTransformer:
   # A token several ground truths want is forced once; the criterion decides who predicts what.
   # One per ground truth: every extra forced token is a near-duplicate the loss labels negative
   assign_metric: gaussian
-  assign_k: 3
+  assign_k: 1
   assign_radius: 1
 
   # query self-attention restricted to each query's local_attn_k nearest queries by initial box
@@ -83,7 +83,7 @@ DomeCriterion:
   # box losses one-to-many too
   enc_losses: ['obj', 'boxes']
   enc_matching: topk
-  enc_topk: 3
+  enc_topk: 1
   enc_in_uni_set: False
   # the objectness loss: a class-balanced BCE, the positive and negative halves normalized to
   # weight 1/2 each, the positives' shares in proportion to their quality, and the positive half
@@ -92,7 +92,7 @@ DomeCriterion:
   # like an object than like background. A plain BCE (enc_obj_loss: plain) let nothing through: the
   # near-duplicate tokens around each positive are labelled 0 and pull it under the line
   enc_obj_loss: balanced
-  enc_obj_pos_weight: 0.20
+  enc_obj_pos_weight: 0.5
   enc_obj_quality_weight: False
   # each positive is targeted at its pair's quality rather than 1, so a token whose box is off
   # its ground truth learns a lower score. The encoder's quality is the Gaussian similarity: a
@@ -105,6 +105,8 @@ DomeCriterion:
   # cost keeps the Gaussian term instead of GIoU, which saturates once a candidate misses a tiny
   # ground truth (and the normalized L1 is negligible there), so the class cost alone would decide
   dec_quality: iou
+  matcher:
+    weight_dict: { cost_class: 2, cost_bbox: 5, cost_giou: 0, cost_gaussian: 2 }
 
 
 optimizer:
