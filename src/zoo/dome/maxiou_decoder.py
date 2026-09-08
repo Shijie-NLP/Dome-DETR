@@ -179,17 +179,17 @@ class MaxIoUTransformer(DFINETransformer):
 
     # ------------------------------------------------------------------ forced tokens
 
-    def _candidates(self, gt_cxcywh, gt_valid, pred_cxcywh, valid, spatial_shapes):
+    def _candidates(self, gt_cxcywh, gt_valid, boxes_of, n, valid, spatial_shapes):
         """
         Each ground truth's ``assign_candidates`` best tokens, ``[B, M, K]`` indices and match
         values (best first), over ``gt_cxcywh [B, M, 4]`` (``gt_valid [B, M]`` marks padding) and
-        ``pred_cxcywh [B, N, 4]``. The candidates are the tokens of the window of
-        ``2 * assign_radius + 1`` cells around the ground truth's centre cell (clamped to the grid)
-        on every level, found by index arithmetic; invalid tokens never qualify. A token index of
-        ``N`` in the result is a dummy (its value is ``-inf``).
+        the ``n`` tokens, whose predicted boxes ``boxes_of(index)`` gives for ``[B, X]`` token
+        indices (only the candidates' are ever computed). The candidates are the tokens of the
+        window of ``2 * assign_radius + 1`` cells around the ground truth's centre cell (clamped
+        to the grid) on every level, found by index arithmetic; invalid tokens never qualify. A
+        token index of ``n`` in the result is a dummy (its value is ``-inf``).
         """
         b, m = gt_cxcywh.shape[:2]
-        n = pred_cxcywh.shape[1]
         device = gt_cxcywh.device
         r = self.assign_radius
         i32 = torch.int32  # the index arithmetic (N < 2^31); int64 only where gather needs it
@@ -209,8 +209,9 @@ class MaxIoUTransformer(DFINETransformer):
         idx = rr.mul_(w[:, None]).add_(cc).add_(start[:, None])
         cand = torch.where(inside, idx, n).flatten(2).long()  # [B, M, C]; n is the dummy token
 
-        # the metric's features of every token and ground truth, the candidates' gathered through
-        # a zero row for the dummy token, [B, M, C, 4]
+        # the metric's features of the candidates (the dummy's box is whatever the clamped index
+        # gives; it is masked below) and of the ground truths, [B, M, C, 4]
+        pred_cxcywh = boxes_of(cand.flatten(1).clamp(max=n - 1)).view(b, m, -1, 4)
         if self.assign_metric == "gaussian":
             feat, gt_feat = pred_cxcywh, gt_cxcywh
         elif self.assign_metric == "nwd":
@@ -220,8 +221,6 @@ class MaxIoUTransformer(DFINETransformer):
             gt_feat = torch.cat([gt_cxcywh[..., :2], gt_cxcywh[..., 2:] / 2], dim=-1)
         else:
             feat, gt_feat = box_cxcywh_to_xyxy(pred_cxcywh), box_cxcywh_to_xyxy(gt_cxcywh)
-        feat = torch.cat([feat, feat.new_zeros((b, 1, 4))], dim=1)
-        feat = feat.gather(1, cand.flatten(1).unsqueeze(-1).expand(-1, -1, 4)).view(b, m, -1, 4)
         if self.assign_metric == "gaussian":
             match = gaussian_box_similarity(gt_feat[:, :, None, :], feat)
         elif self.assign_metric == "nwd":
@@ -235,22 +234,23 @@ class MaxIoUTransformer(DFINETransformer):
         return torch.where(best.values.isfinite(), cand.gather(-1, best.indices), n), best.values
 
     @torch.no_grad()
-    def _forced(self, targets, pred_cxcywh, valid, spatial_shapes):
+    def _forced(self, targets, boxes_of, n, valid, spatial_shapes):
         """
         The tokens the ground truths force into the queries, a ``[B, N]`` mask with one distinct
-        token per real ground truth, and the number of real ground truths per image. Round ``r``
+        token per real ground truth, and the number of real ground truths per image, over the
+        ``n`` tokens whose predicted boxes ``boxes_of`` gives (see ``_candidates``). Round ``r``
         gives every ground truth still without a token its ``r``-th candidate unless another has
         it (the lowest-index ground truth wins a tie); the rare ground truth whose candidates all
         went to others takes the nearest free token, settled on the host.
         """
-        b, n = pred_cxcywh.shape[:2]
-        device = pred_cxcywh.device
+        b = len(targets)
+        device = valid.device
         num_gts = [t["boxes"].shape[0] for t in targets]
         gt_boxes = pad_sequence([t["boxes"] for t in targets], batch_first=True)  # [B, M, 4]
         m = gt_boxes.shape[1]
         counts = torch.tensor(num_gts).to(device, non_blocking=True)
         gt_valid = torch.arange(m, device=device)[None, :] < counts[:, None]
-        cand, _ = self._candidates(gt_boxes, gt_valid, pred_cxcywh, valid, spatial_shapes)  # [B, M, K]
+        cand, _ = self._candidates(gt_boxes, gt_valid, boxes_of, n, valid, spatial_shapes)  # [B, M, K]
 
         forced = torch.zeros((b, n + 1), dtype=torch.bool, device=device)  # column n: the dummy's bin
         owner = torch.empty((b, n + 1), dtype=torch.long, device=device)
@@ -269,7 +269,8 @@ class MaxIoUTransformer(DFINETransformer):
                 break
         forced = forced[:, :n]
 
-        if pending:  # a ground truth's candidates all went to others
+        if pending:  # a ground truth's candidates all went to others: every token's box, this once
+            pred_cxcywh = boxes_of(torch.arange(n, device=device)[None, :].expand(b, -1))
             cost = torch.where(valid[None, :] & ~forced, 0.0, float("inf")).to(pred_cxcywh.dtype)
             for i, j in left.nonzero().tolist():
                 dist = torch.cdist(gt_boxes[i, j : j + 1, :2], pred_cxcywh[i, :, :2]).squeeze(0) + cost[i]
@@ -345,12 +346,17 @@ class MaxIoUTransformer(DFINETransformer):
                     batch_queries_num,
                 )
 
-            # every token's box: the pick needs them. In fp32 with autocast off: under autocast this
-            # no-grad call would cache the head's half-precision weights without a graph, and the
+            # the box head on the tokens the pick and the queries need, not on every token (a
+            # 960x960 input has 76k). In fp32 with autocast off: under autocast this no-grad call
+            # would cache the head's half-precision weights without a graph, and the
             # graph-bearing call on the queries below would reuse them and reach no parameter
-            with torch.autocast(device.type, enabled=False):
-                boxes_unact = self.enc_bbox_head(output_memory.float()) + anchors
-            forced, num_gts = self._forced(targets, F.sigmoid(boxes_unact), valid, spatial_shapes)  # [B, N]
+            def boxes_unact_of(index):
+                with torch.autocast(device.type, enabled=False):
+                    return self.enc_bbox_head(take(output_memory, index).float()) + take(anchors, index)
+
+            forced, num_gts = self._forced(
+                targets, lambda index: F.sigmoid(boxes_unact_of(index)), n, valid, spatial_shapes
+            )  # [B, N]
             num_gt = forced.sum(1)
             num_selected = (forced & passed).sum(1)  # forced tokens the head lets through
             per_level = torch.stack([f.sum(1) for f in forced.split([h * w for h, w in spatial_shapes], 1)], 1)
@@ -364,7 +370,7 @@ class MaxIoUTransformer(DFINETransformer):
                 scores.masked_fill(forced, float("inf")), count, num_selected, *per_level.unbind(1)
             )
             contents = take(output_memory, index).masked_fill(pad[..., None], 0)
-            boxes_init = take(boxes_unact, index).masked_fill(pad[..., None], 0)
+            boxes_init = boxes_unact_of(index).masked_fill(pad[..., None], 0)
             self.last_assign_stats = [
                 {"num_gt": g, "selected": s, "rule": q - g, "levels": lv}
                 for g, s, q, *lv in zip(num_gts, selected, batch_queries_num, *levels)
