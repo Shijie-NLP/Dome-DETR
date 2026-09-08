@@ -18,10 +18,12 @@ import torch.nn as nn
 import torch.nn.functional as F  # noqa: N812
 import torch.nn.init as init
 
-from ...misc.box_ops import box_xyxy_to_cxcywh
 from ...nn.transformer import MLP
 
 __all__ = ["LQE", "Integral", "bbox2distance", "distance2bbox", "translate_gt", "weighting_function"]
+
+
+_WEIGHTS: dict = {}  # W(n) per (reg_max, up, reg_scale, device): the parameters are frozen in practice
 
 
 def weighting_function(reg_max, up, reg_scale, deploy=False):
@@ -36,15 +38,32 @@ def weighting_function(reg_max, up, reg_scale, deploy=False):
         reg_scale (Tensor): controls the curvature; larger values give flatter weights near the
             centre and steeper ones at both ends.
         deploy (bool): return a constant tensor detached from ``up`` and ``reg_scale``.
+
+    Built once per value of ``up`` and ``reg_scale`` (in-place changes, a checkpoint load say, are
+    seen through their version counters) unless one of them takes gradients, in which case it is
+    rebuilt with its graph every call: the build is some 80 tiny kernels, a millisecond a call.
     """
+    cacheable = not (up.requires_grad or reg_scale.requires_grad)
+    key = (reg_max, up.data_ptr(), up._version, reg_scale.data_ptr(), reg_scale._version, str(up.device))
+    if cacheable and key in _WEIGHTS:
+        values = _WEIGHTS[key]
+        return values.clone() if deploy else values
+    values = _build_weights(reg_max, up, reg_scale)
+    if cacheable:
+        if len(_WEIGHTS) >= 16:
+            _WEIGHTS.clear()
+        _WEIGHTS[key] = values
+    return values.detach().clone() if deploy else values
+
+
+def _build_weights(reg_max, up, reg_scale):
     upper_bound1 = abs(up[0]) * abs(reg_scale)
     upper_bound2 = upper_bound1 * 2
     step = (upper_bound1 + 1) ** (2 / (reg_max - 2))
     left_values = [-(step**i) + 1 for i in range(reg_max // 2 - 1, 0, -1)]
     right_values = [step**i - 1 for i in range(1, reg_max // 2)]
     values = [-upper_bound2] + left_values + [torch.zeros_like(up[0][None])] + right_values + [upper_bound2]
-    values = torch.cat(values, 0)
-    return values.detach().clone() if deploy else values
+    return torch.cat(values, 0)
 
 
 def translate_gt(gt, reg_max, reg_scale, up):
@@ -119,11 +138,11 @@ def distance2bbox(points, distance, reg_scale, min_unit=None):
         Tensor: ``(..., 4)`` boxes as [cx, cy, w, h].
     """
     unit = _edge_unit(points, abs(reg_scale), min_unit)
-    x1 = points[..., 0] - 0.5 * points[..., 2] - distance[..., 0] * unit[..., 0]
-    y1 = points[..., 1] - 0.5 * points[..., 3] - distance[..., 1] * unit[..., 1]
-    x2 = points[..., 0] + 0.5 * points[..., 2] + distance[..., 2] * unit[..., 0]
-    y2 = points[..., 1] + 0.5 * points[..., 3] + distance[..., 3] * unit[..., 1]
-    return box_xyxy_to_cxcywh(torch.stack([x1, y1, x2, y2], -1))
+    # the x and y edges together: the same arithmetic as coordinate by coordinate, in a third of the kernels
+    half = 0.5 * points[..., 2:]
+    lt = points[..., :2] - half - distance[..., :2] * unit
+    rb = points[..., :2] + half + distance[..., 2:] * unit
+    return torch.cat([(lt + rb) / 2, rb - lt], -1)  # xyxy -> cxcywh
 
 
 def bbox2distance(points, bbox, reg_max, reg_scale, up, eps=0.1, min_unit=None):
