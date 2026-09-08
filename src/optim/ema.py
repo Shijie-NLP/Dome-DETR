@@ -45,18 +45,31 @@ class ModelEMA:
             return self.decay
         return self.decay * (1 - math.exp(-self.updates / self.warmups))
 
+    def _pairs(self, model: nn.Module) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+        """
+        The floating point entries of the average's and the model's state dicts, paired by name
+        and kept: the entries are views of the parameters and buffers, which loading a state dict
+        or an optimizer step update in place, so the lists stay valid until the module is moved.
+        """
+        model = dist_utils.de_parallel(model)
+        if getattr(self, "_paired_model", None) is not model:
+            msd = model.state_dict()
+            names = [k for k, v in self.module.state_dict().items() if v.dtype.is_floating_point]
+            ema_sd = self.module.state_dict()
+            self._pairs_cache = ([ema_sd[k] for k in names], [msd[k] for k in names])
+            self._paired_model = model
+        return self._pairs_cache
+
     @torch.no_grad()
     def update(self, model: nn.Module) -> None:
         self.updates += 1
         d = self.effective_decay()
-        msd = dist_utils.de_parallel(model).state_dict()
-        for k, v in self.module.state_dict().items():
-            if v.dtype.is_floating_point:
-                v *= d
-                v += (1 - d) * msd[k].detach()
+        ema, live = self._pairs(model)
+        torch._foreach_lerp_(ema, live, 1 - d)  # ema = ema + (1 - d) * (live - ema), one launch per dtype
 
     def to(self, *args, **kwargs):
         self.module = self.module.to(*args, **kwargs)
+        self._paired_model = None  # moving replaces the tensors
         return self
 
     def state_dict(self) -> dict:
