@@ -16,7 +16,7 @@ train_dataloader:
 
   shuffle: True
   total_batch_size: 8
-  num_workers: 4
+  num_workers: 8   # a worker makes ~25 img/s; training at batch 12 consumes ~50
   pin_memory: True   # batches land in pinned memory, so their copy to the GPU is asynchronous
 
 
