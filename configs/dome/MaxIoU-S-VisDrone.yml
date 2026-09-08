@@ -85,11 +85,16 @@ DomeCriterion:
   enc_matching: topk
   enc_topk: 1
   enc_in_uni_set: False
-  # the objectness loss: a plain BCE, the positives' target 1, everything else 0, no reweighting,
-  # so logit 0 is the posterior's boundary under the queries' own share of objects. balanced (the
-  # halves weighted 1/2 each, obj_pos_weight and obj_quality_weight on top) puts the boundary at
-  # the likelihood ratio instead, which passes thousands of tokens per image
+  # the objectness loss: a plain BCE, everything but the positives targeted at 0, no reweighting.
+  # balanced (the halves weighted 1/2 each, obj_pos_weight and obj_quality_weight on top) puts the
+  # boundary at the likelihood ratio instead, which passes thousands of tokens per image
   obj_loss: plain
+  # the positives' target: their pair's IoU (quality below) rather than 1, so a forced token whose
+  # box is off its ground truth learns a low score and the objectness tracks how well a token's
+  # box fits; the tokens the threshold passes are then the ones worth refining. The cost is that
+  # a tiny object whose best encoder box has a low IoU scores low too, and can fall under
+  # obj_threshold at inference (obj_target: one restores the 0/1 target)
+  obj_target: quality
   # the VFL target of the decoder's queries and the matching cost's localization term: D-FINE's IoU
   # and GIoU. The Gaussian similarity (quality: gaussian; matcher weight_dict cost_giou: 0,
   # cost_gaussian: 2), three times less sensitive to a pixel of offset on a tiny box, gave a score
