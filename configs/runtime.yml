@@ -1,6 +1,8 @@
 # Runtime defaults shared by every experiment. Model configs and the command line override them.
 
 print_freq: 100
+# every run writes into its own <output_dir>/<date>_<time> (a resumed run into its checkpoint's
+# directory); `--output-dir` on the command line names the directory itself
 output_dir: './logs'
 checkpoint_freq: 12
 

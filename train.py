@@ -9,6 +9,10 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
 import argparse
+from datetime import datetime
+from pathlib import Path
+
+import torch
 
 from src.core import YAMLConfig, yaml_utils
 from src.misc import dist_utils
@@ -26,6 +30,20 @@ if debug:
     torch.Tensor.__repr__ = custom_repr
 
 
+def run_dir(output_dir: str, resume: str | None) -> str:
+    """
+    The directory of this run: a resumed run's checkpoint directory, otherwise a new
+    ``<output_dir>/<date>_<time>`` (rank 0's, shared with the other ranks), so that no two runs
+    write into the same directory.
+    """
+    if resume:
+        return str(Path(resume).parent)
+    stamp = [datetime.now().strftime("%Y-%m-%d_%H-%M-%S")]
+    if dist_utils.is_dist_available_and_initialized():
+        torch.distributed.broadcast_object_list(stamp, src=0)
+    return str(Path(output_dir) / stamp[0])
+
+
 def main(args) -> None:
     """main"""
     dist_utils.setup_distributed(args.print_rank, args.print_method, seed=args.seed)
@@ -36,6 +54,9 @@ def main(args) -> None:
     update_dict.update({k: v for k, v in args.__dict__.items() if k not in ["update"] and v is not None})
 
     cfg = YAMLConfig(args.config, **update_dict)
+    if "output_dir" not in update_dict:  # not given on the command line: a directory of this run's own
+        cfg.output_dir = run_dir(cfg.output_dir, args.resume)
+    print("output_dir:", cfg.output_dir)
 
     if (args.resume or args.tuning) and "HGNetv2" in cfg.yaml_cfg:
         cfg.yaml_cfg["HGNetv2"]["pretrained"] = False
