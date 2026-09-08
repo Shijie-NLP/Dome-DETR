@@ -5,10 +5,11 @@
 # Training: every ground truth forces the assign_k encoder tokens whose predicted boxes match it
 # best into the queries; the other queries are the tokens whose objectness passes obj_threshold,
 # filled up to min_queries with the best unpassed tokens. Inference: the objectness alone selects.
-# Everything past the selection is D-FINE's (Hungarian matching, VFL, FDR). The encoder's class
-# logits are trained as objectness: each ground truth's enc_topk most similar queries are its
-# positives, targeted at their IoU, everything else at 0, so a probability threshold on the
-# sigmoid is the selection rule.
+# Everything past the selection is D-FINE's (Hungarian matching, VFL, FDR) with the Gaussian
+# similarity as the pair quality and matching cost. The encoder's class logits are trained as
+# objectness with a class-balanced BCE: each ground truth's enc_topk most similar queries are its
+# positives, targeted at their GIoU, everything else at 0, the positive half weighing a quarter
+# of the negative half, and logit 0 (obj_threshold 0.5) is the selection rule.
 
 __include__: [
   '../dataset/visdrone_detection.yml',
@@ -44,9 +45,10 @@ MaxIoUTransformer:
   num_denoising: 0     # the forced tokens take the denoising queries' role
 
   # the query selection: a token passes when the sigmoid of its highest class logit exceeds
-  # obj_threshold (0.5 is the head's decision boundary, logit 0). VisDrone crops hold 40 to 100
-  # boxes on most images and up to ~500 on the crowded ones
-  obj_threshold: 0.3
+  # obj_threshold; 0.5 is the head's decision boundary, logit 0, and with the balanced loss below
+  # the score is not a calibrated probability, so the count is steered by obj_pos_weight, not
+  # here. VisDrone crops hold 40 to 100 boxes on most images and up to ~500 on the crowded ones
+  obj_threshold: 0.5
   min_queries: 300     # the least queries per image, training and inference alike
   num_queries: 2000    # the most (memory guard); forced tokens are kept beyond it
 
@@ -54,9 +56,10 @@ MaxIoUTransformer:
   # similarity of their predicted boxes (scale-invariant: a small box that just misses a tiny
   # ground truth still beats a coarse-level box that merely contains it, which under iou or giou
   # always wins), among the 3x3 cells around its centre cell on every level (assign_radius 1).
-  # A token several ground truths want is forced once; the criterion decides who predicts what
+  # A token several ground truths want is forced once; the criterion decides who predicts what.
+  # One per ground truth: every extra forced token is a near-duplicate the loss labels negative
   assign_metric: gaussian
-  assign_k: 4
+  assign_k: 1
   assign_radius: 1
 
   # query self-attention restricted to each query's local_attn_k nearest queries by initial box
@@ -79,20 +82,27 @@ DomeCriterion:
   # box losses one-to-many too
   enc_losses: ['obj', 'boxes']
   enc_matching: topk
-  enc_topk: 3
+  enc_topk: 2
   enc_in_uni_set: False
-  # the objectness loss: a plain BCE (no focal or balanced reweighting, so the sigmoid stays a
-  # calibrated probability for obj_threshold); each positive is targeted at its pair's IoU,
-  # so a token whose box is off its ground truth learns a low score, everything else at 0
-  obj_loss: plain
+  # the objectness loss: a class-balanced BCE, the positive and negative halves normalized to
+  # weight 1/2 each, the positives' shares in proportion to their quality, and the positive half
+  # then scaled by obj_pos_weight. At 1 the boundary sits at a likelihood ratio of 1 and passed
+  # some 2000 tokens per image; at 0.25 (0.2 : 0.8) a token passes when it looks four times more
+  # like an object than like background. A plain BCE (obj_loss: plain) let nothing through: the
+  # near-duplicate tokens around each positive are labelled 0 and pull it under the line
+  obj_loss: balanced
+  obj_pos_weight: 0.25
+  obj_quality_weight: True
+  # each positive is targeted at its pair's GIoU (clamped at 0, at most the IoU): a token whose
+  # box is off its ground truth learns a low score, and a loose one a lower one than with 1
   obj_target: quality
-  # the pair quality (VFL target, FGL weight, obj_target): IoU as in D-FINE. The Gaussian
-  # similarity gave a score that no longer tracked how tight a box is (AP50 up, AP75 down)
-  quality: iou
-  # the encoder's objectness targets (obj_target: quality) use the Gaussian similarity instead:
-  # that score only picks the tokens worth refining, and a tiny box one width off, IoU 0 like the
-  # background, still scores 0.4 there (the decoder's IoU targets are what rank tight boxes first)
-  enc_quality: gaussian
+  enc_quality: giou
+  # the decoder's pair quality (VFL target, FGL weight) and the matching cost: the Gaussian
+  # similarity, as in the run this recipe restates (2026-09-08); iou with cost_giou 2 and
+  # cost_gaussian 0 is D-FINE's, which ranked tight boxes better (AP75) at the same AP
+  quality: gaussian
+  matcher:
+    weight_dict: {cost_class: 2, cost_bbox: 5, cost_giou: 0, cost_gaussian: 2}
 
 
 optimizer:
