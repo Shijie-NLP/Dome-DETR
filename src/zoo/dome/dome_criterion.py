@@ -197,7 +197,7 @@ class DomeCriterion(nn.Module):
             ``enc_topk`` most similar queries are its positives, a query serving one ground truth
             at most). The encoder's queries are candidates, not detections, so one-to-one is not
             needed there, and several passing tokens per object make its recall robust.
-        enc_topk: the queries per ground truth of ``topk``.
+        enc_topk: the queries per ground truth of ``topk`` (1: one-to-one, the most similar).
         enc_in_uni_set: whether the encoder sets' matches join the union matching (D-FINE: yes).
             With ``topk`` they should not, or the decoder's box losses would turn one-to-many.
             The encoder sets' box losses then use their own matches.
@@ -217,14 +217,19 @@ class DomeCriterion(nn.Module):
         mal_alpha: the negative weight of the MAL loss (``None``: 1).
         use_uni_set: match the box and localization losses against the union of the matches of
             every prediction set (D-FINE's 'go' indices) rather than each set's own.
-        obj_quality_weight: in ``loss_obj``, share the positive half among the positives in
+        obj_loss: the form of the 0/1 classification loss ``loss_obj`` (the matched queries'
+            ground-truth class positive, every other (query, class) entry negative): ``plain``,
+            the BCE of every entry summed and normalized by the ground truth count like the other
+            classification losses, whose decision boundary (logit 0) is the posterior's under the
+            queries' own share of objects; or ``balanced``, the two halves normalized to weight
+            1/2 each, whose boundary is the likelihood ratio's, blind to how rare objects are
+            (permissive: it passes every token that looks more like an object than not).
+        obj_quality_weight: ``balanced`` only: share the positive half among the positives in
             proportion to their ``quality`` (the pair's Gaussian similarity with ``gaussian``)
             instead of equally: the targets stay 1, so every positive is still pushed past the
             boundary (recall), but a positive whose box is well off its ground truth pushes less.
-        obj_pos_weight: in the 0/1 classification loss (``loss_obj``, a class-balanced BCE over
-            every (query, class) entry, the matched queries' ground-truth class positive),
-            how much more the positive half weighs than the negative half; 1 is the balanced
-            decision boundary at logit 0.
+        obj_pos_weight: ``balanced`` only: how much more the positive half weighs than the
+            negative half; the boundary moves to a likelihood ratio of its inverse.
     """
 
     __share__ = ["num_classes"]
@@ -248,8 +253,9 @@ class DomeCriterion(nn.Module):
         use_uni_set=True,
         enc_losses=None,
         enc_matching="hungarian",
-        enc_topk=3,
+        enc_topk=1,
         enc_in_uni_set=True,
+        obj_loss="plain",
         obj_quality_weight=False,
         obj_pos_weight=1.0,
     ):
@@ -275,6 +281,8 @@ class DomeCriterion(nn.Module):
         self.density_recall_penalty = density_recall_penalty
         self.mal_alpha = mal_alpha
         self.use_uni_set = use_uni_set
+        assert obj_loss in ("plain", "balanced"), obj_loss
+        self.obj_loss = obj_loss
         self.obj_quality_weight = obj_quality_weight
         self.obj_pos_weight = obj_pos_weight
         self._clear_cache()
@@ -360,18 +368,22 @@ class DomeCriterion(nn.Module):
 
     def loss_obj(self, stack, pairs, num_boxes, targets, **kwargs):
         """
-        Plain 0/1 classification, no IoU-aware target: a class-balanced BCE over every (query,
-        class) entry of each set's ``pred_logits [B, Q, C]``. The matched queries are positive on
-        their ground-truth class (class 0 when ``C`` is 1), every other entry negative; each half
-        is normalized to weight 1/2 (the positives' shares equal, or with ``obj_quality_weight``
-        in proportion to their ``quality``) and the positive half scaled by ``obj_pos_weight``, so
-        the decision boundary is logit 0. Padded queries are left out.
+        0/1 classification, no IoU-aware target, over every (query, class) entry of each set's
+        ``pred_logits [B, Q, C]``: the matched queries are positive on their ground-truth class
+        (class 0 when ``C`` is 1), every other entry negative, padded queries left out. ``plain``
+        is the BCE of the entries, summed and normalized by ``num_boxes``; ``balanced`` normalizes
+        each half to weight 1/2 (the positives' shares equal, or with ``obj_quality_weight`` in
+        proportion to their ``quality``) and scales the positive half by ``obj_pos_weight``.
         """
         logits = stack.logits.float()  # the weights are built in fp32 under autocast too
         s, b, q = pairs.set_idx, pairs.batch_idx, pairs.query_idx
         cls = targets.labels[b, pairs.target_idx] if logits.shape[-1] > 1 else torch.zeros_like(q)
         target = torch.zeros_like(logits)
         target[s, b, q, cls] = 1.0
+        if self.obj_loss == "plain":
+            loss = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
+            return {"loss_obj": self._reduce_query_loss(loss, stack, num_boxes)}
+
         share = torch.zeros(logits.shape[:3], device=logits.device)  # each positive query's share of the positive half
         share[s, b, q] = 1.0
         if self.obj_quality_weight:
