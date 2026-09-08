@@ -75,15 +75,16 @@ MaxIoUTransformer:
   assign_radius: 1   # candidates: the 3x3 cells around the ground truth's centre, per level
 
 DomeCriterion:
-  enc_losses: ['obj', 'boxes']   # the encoder's queries: plain 0/1 objectness (no IoU target) and boxes
-  # the encoder's queries: every ground truth's single most similar query (by Gaussian similarity,
-  # the metric the forced selection uses, so it is nearly always the forced token itself) is its
-  # positive; enc_topk: 3 makes it one-to-many, a few passing tokens per object instead of one
-  # peak, at the price of a head that passes the objects' whole neighbourhoods. The matches stay
-  # out of the union matching (with topk > 1 it would make the decoder's box losses one-to-many
-  # too). enc_matching: hungarian, enc_in_uni_set: True restores D-FINE's
+  enc_losses: ['obj', 'boxes']   # the encoder's queries: objectness (obj_target below) and boxes
+  # the encoder's queries: every ground truth's enc_topk most similar queries (by Gaussian
+  # similarity, the metric the forced selection uses, so they are nearly always its forced tokens)
+  # are its positives, each targeted at its own IoU (obj_target: quality), so the second and
+  # third fit worse and learn lower scores rather than the neighbourhood's whole. A query wanted
+  # by several ground truths goes to the most similar. The matches stay out of the union matching
+  # (with topk > 1 it would make the decoder's box losses one-to-many too). enc_matching:
+  # hungarian, enc_in_uni_set: True restores D-FINE's
   enc_matching: topk
-  enc_topk: 1
+  enc_topk: 3
   enc_in_uni_set: False
   # the objectness loss: a plain BCE, everything but the positives targeted at 0, no reweighting.
   # balanced (the halves weighted 1/2 each, obj_pos_weight and obj_quality_weight on top) puts the
