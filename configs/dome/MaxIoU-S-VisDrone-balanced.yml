@@ -1,0 +1,26 @@
+# MaxIoU-S on VisDrone as it ran on the morning of 2026-09-08 (the run whose objectness passed
+# nearly every token, 2000 queries per image, and stood at Dome-S's AP at epoch 6), restated on
+# the current code: the class-balanced objectness loss with 0/1 targets and quality-weighted
+# shares, the Gaussian similarity as every quality and as the matching cost, the refinement floor,
+# and logit 0 as the rule. Two things the decoder no longer offers: one distinct forced token per
+# ground truth with fallbacks (assign_k: 1 forces each ground truth's best token, shared ones
+# once) and the min_negatives floor of 100 unforced queries (moot under min_queries 300).
+
+__include__: ['./MaxIoU-S-VisDrone.yml']
+
+output_dir: ./outputs/maxiou_s_visdrone_balanced
+
+MaxIoUTransformer:
+  obj_threshold: 0.5   # sigmoid 0.5 is logit 0, the rule then
+  assign_k: 1          # then: assign_candidates 8, one distinct token per ground truth
+  min_refine_cells: 2
+
+DomeCriterion:
+  enc_topk: 3
+  obj_loss: balanced
+  obj_target: one
+  obj_quality_weight: True
+  quality: gaussian
+  enc_quality: gaussian
+  matcher:
+    weight_dict: {cost_class: 2, cost_bbox: 5, cost_giou: 0, cost_gaussian: 2}
