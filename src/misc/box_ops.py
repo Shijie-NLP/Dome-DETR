@@ -5,7 +5,8 @@ Copyright(c) 2024 The D-FINE Authors. All Rights Reserved.
 
 Box utilities. Boxes are ``[..., 4]`` tensors, ``cxcywh`` (centre and size) or ``xyxy``
 (corners); the pairwise functions take ``[N, 4]`` and ``[M, 4]`` and return ``[N, M]``, the
-elementwise ones take two ``[N, 4]`` and return ``[N]``.
+elementwise ones take two broadcastable ``[..., 4]`` and return ``[...]`` (so ``[N, 1, 4]`` against
+``[M, 4]`` is a pairwise ``[N, M]`` too).
 """
 
 import torch
@@ -63,14 +64,19 @@ def generalized_box_iou(boxes1: Tensor, boxes2: Tensor) -> Tensor:
     return iou - (area - union) / area
 
 
+def _area(boxes: Tensor) -> Tensor:
+    """Area of xyxy boxes ``[..., 4]``, as torchvision's ``box_area`` but over any leading dims."""
+    return (boxes[..., 2] - boxes[..., 0]) * (boxes[..., 3] - boxes[..., 1])
+
+
 def elementwise_box_iou(boxes1: Tensor, boxes2: Tensor) -> tuple[Tensor, Tensor]:
-    """IoU and union area of the i-th box of each set, ``[N]`` each (the diagonal of ``box_iou``)."""
-    area1 = box_area(boxes1)
-    area2 = box_area(boxes2)
-    lt = torch.max(boxes1[:, :2], boxes2[:, :2])
-    rb = torch.min(boxes1[:, 2:], boxes2[:, 2:])
+    """IoU and union area of the i-th box of each set, ``[...]`` each (the diagonal of ``box_iou``)."""
+    area1 = _area(boxes1)
+    area2 = _area(boxes2)
+    lt = torch.max(boxes1[..., :2], boxes2[..., :2])
+    rb = torch.min(boxes1[..., 2:], boxes2[..., 2:])
     wh = (rb - lt).clamp(min=0)
-    inter = wh[:, 0] * wh[:, 1]
+    inter = wh[..., 0] * wh[..., 1]
     union = area1 + area2 - inter
     return inter / union, union
 
@@ -97,12 +103,12 @@ def gaussian_box_similarity(boxes1: Tensor, boxes2: Tensor, eps: float = 1e-6) -
 
 def elementwise_generalized_box_iou(boxes1: Tensor, boxes2: Tensor) -> Tensor:
     """
-    Generalized IoU of the i-th box of each set, ``[N]`` (the diagonal of ``generalized_box_iou``;
+    Generalized IoU of the i-th box of each set, ``[...]`` (the diagonal of ``generalized_box_iou``;
     well-formed boxes, as there).
     """
     iou, union = elementwise_box_iou(boxes1, boxes2)
-    lt = torch.min(boxes1[:, :2], boxes2[:, :2])
-    rb = torch.max(boxes1[:, 2:], boxes2[:, 2:])
+    lt = torch.min(boxes1[..., :2], boxes2[..., :2])
+    rb = torch.max(boxes1[..., 2:], boxes2[..., 2:])
     wh = (rb - lt).clamp(min=0)
-    area = wh[:, 0] * wh[:, 1]
+    area = wh[..., 0] * wh[..., 1]
     return iou - (area - union) / area
