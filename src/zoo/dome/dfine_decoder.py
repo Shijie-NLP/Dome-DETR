@@ -68,15 +68,22 @@ class TransformerDecoder(nn.Module):
         )
         self.lqe_layers = nn.ModuleList([copy.deepcopy(LQE(4, 64, 2, reg_max)) for _ in range(num_layers)])
 
-    def value_op(self, memory, value_proj, value_scale, memory_mask, memory_spatial_shapes):
-        """The encoder memory as per-level, per-head values for the deformable cross-attention."""
-        value = value_proj(memory) if value_proj is not None else memory
-        value = F.interpolate(memory, size=value_scale) if value_scale is not None else value
-        if memory_mask is not None:
-            value = value * memory_mask.to(value.dtype).unsqueeze(-1)
-        value = value.reshape(value.shape[0], value.shape[1], self.num_head, -1)
-        split_shape = [h * w for h, w in memory_spatial_shapes]
-        return value.permute(0, 2, 3, 1).split(split_shape, dim=-1)
+    def value_op(self, feats, value_scale=None):
+        """
+        The projected levels ``[bs, C, h, w]`` as the deformable cross-attention's values, one
+        ``[bs, heads, c, h * w]`` tensor per level: a view of the level, cast to fp32 (the
+        precision ``grid_sample`` runs at under autocast) once for every layer, so no layer
+        copies or casts them again and the backward pass keeps one copy. ``value_scale`` (the
+        wider training-only layers) interpolates the channels to it.
+        """
+        values = []
+        for feat in feats:
+            bs, _, h, w = feat.shape
+            value = feat.flatten(2)  # [bs, C, h * w]
+            if value_scale is not None:
+                value = F.interpolate(value.transpose(1, 2), size=value_scale).transpose(1, 2)
+            values.append(value.float().reshape(bs, self.num_head, -1, h * w))
+        return values
 
     def convert_to_deploy(self):
         self.project = weighting_function(self.reg_max, self.up, self.reg_scale, deploy=True)
@@ -87,7 +94,7 @@ class TransformerDecoder(nn.Module):
         self,
         target,
         ref_points_unact,
-        memory,
+        feats,
         spatial_shapes,
         bbox_head,
         score_head,
@@ -97,14 +104,13 @@ class TransformerDecoder(nn.Module):
         up,
         reg_scale,
         attn_mask=None,
-        memory_mask=None,
         img_input=None,
         self_attn_q_scale=None,
         fdr_min_unit=None,
     ):
         output = target
         output_detach = pred_corners_undetach = 0
-        value = self.value_op(memory, None, None, memory_mask, spatial_shapes)
+        value = self.value_op(feats)
 
         dec_out_bboxes, dec_out_logits, dec_out_pred_corners, dec_out_refs = [], [], [], []
         project = self.project if hasattr(self, "project") else weighting_function(self.reg_max, up, reg_scale)
@@ -120,7 +126,7 @@ class TransformerDecoder(nn.Module):
             # the wider training-only layers work on interpolated queries and values
             if i >= self.eval_idx + 1 and self.layer_scale > 1:
                 query_pos_embed = F.interpolate(query_pos_embed, scale_factor=self.layer_scale)
-                value = self.value_op(memory, None, query_pos_embed.shape[-1], memory_mask, spatial_shapes)
+                value = self.value_op(feats, query_pos_embed.shape[-1])
                 output = F.interpolate(output, size=query_pos_embed.shape[-1])
                 output_detach = output.detach()
 
@@ -483,7 +489,7 @@ class DFINETransformer(nn.Module):
         feats = encoder_out["feats"]
         img_inputs = encoder_out["img_inputs"]
 
-        _, memory, spatial_shapes = self._get_encoder_input(feats)
+        proj_feats, memory, spatial_shapes = self._get_encoder_input(feats)
 
         dec_in = self._get_decoder_input(memory, spatial_shapes, encoder_out, targets)
         init_ref_contents, init_ref_points_unact = dec_in.contents, dec_in.boxes_unact
@@ -522,7 +528,7 @@ class DFINETransformer(nn.Module):
         out_bboxes, out_logits, out_corners, out_refs, pre_bboxes, pre_logits = self.decoder(
             init_ref_contents,
             init_ref_points_unact,
-            memory,
+            proj_feats,
             spatial_shapes,
             self.dec_bbox_head,
             self.dec_score_head,
