@@ -1,9 +1,10 @@
 # MaxIoU-S on VisDrone2019-DET: the D-FINE-S baseline recipe (plain HybridEncoder, no DeFE / MWAS)
 # with the ground-truth-forced query selection and no denoising. At training every ground truth
-# forces the encoder token whose box matches it best into the queries and the rest are the tokens
-# the objectness passes; at inference the objectness alone selects. Everything past the selection
-# is D-FINE's (Hungarian matching), except that the encoder's class logits are trained as plain
-# 0/1 objectness (enc_losses) so that logit 0 is the selection rule.
+# forces the assign_k encoder tokens whose boxes match it best into the queries and the best
+# unforced tokens by objectness fill up to min_queries; at inference the objectness alone
+# selects. Everything past the selection is D-FINE's (Hungarian matching), except that the
+# encoder's class logits are trained as plain 0/1 objectness (enc_losses) so that logit 0 is the
+# selection rule.
 
 __include__: [
   '../dataset/visdrone_detection.yml',
@@ -44,8 +45,8 @@ MaxIoUTransformer:
   # the encoder's class logits are trained on 0/1 targets (a plain BCE, each ground truth's most
   # similar query positive on its class); their maximum is the objectness that picks the queries
   # in training and inference alike at its decision boundary, logit 0
-  min_queries: 300     # the least queries per image, training (forced tokens included) and inference
-  min_negatives: 100   # training: the least unforced queries on top of the forced tokens (crowds)
+  min_queries: 300     # the least queries per image: training (the forced tokens, then the best
+                       # unforced by objectness) and inference alike
   infer_rule: objectness   # or topk, the plain D-FINE selection
   # query self-attention: each query sees its local_attn_k nearest queries (0: all); or keep full
   # attention and rescale the logits by log(n)/log(num_queries) so the entropy does not grow with n
@@ -67,8 +68,9 @@ MaxIoUTransformer:
   # beats a coarse-level box that merely contains it, which under giou or iou always wins because
   # any non-overlapping box scores at most 0), nwd (the AI-TOD line's metric), giou or iou
   assign_metric: gaussian
-  assign_candidates: 8   # candidates per ground truth: its fallbacks when another took its best token
-  assign_radius: 1       # candidates: the 3x3 cells around the ground truth's centre, per level
+  assign_k: 4        # forced tokens per ground truth, its most similar (a token several ground
+                     # truths want is forced once; the criterion's matching decides who predicts what)
+  assign_radius: 1   # candidates: the 3x3 cells around the ground truth's centre, per level
 
 DomeCriterion:
   enc_losses: ['obj', 'boxes']   # the encoder's queries: plain 0/1 objectness (no IoU target) and boxes

@@ -24,10 +24,11 @@ def query_stats(model, outputs) -> dict[str, float]:
     """
     A training batch's query selection, averaged over its images, for the meters: ``queries``
     (queries per image, every decoder) and, from a decoder that reports ``last_assign_stats``
-    (MaxIoUTransformer), ``gt`` (ground truths per image), ``forced_passed`` (the share of the
-    forced tokens the objectness already lets through: the rule's recall in training), ``rule``
-    (the unforced queries per image) and ``forced_s{stride}`` (the share of the forced tokens on
-    each level: a drift of tiny objects' tokens towards coarse levels shows here).
+    (MaxIoUTransformer), ``gt`` (ground truths per image), ``forced`` (forced tokens per image),
+    ``forced_passed`` (the share of the forced tokens the objectness already lets through: the
+    rule's recall in training), ``rule`` (the unforced queries per image) and
+    ``forced_s{stride}`` (the share of the forced tokens on each level: a drift of tiny objects'
+    tokens towards coarse levels shows here).
     """
     counts = outputs.get("batch_queries_num")
     stats = {"queries": sum(counts) / len(counts)} if counts else {}
@@ -35,12 +36,13 @@ def query_stats(model, outputs) -> dict[str, float]:
     assign = getattr(decoder, "last_assign_stats", None)
     if not assign:
         return stats
-    n, gts = len(assign), max(sum(a["num_gt"] for a in assign), 1)
-    stats["gt"] = gts / n
-    stats["forced_passed"] = sum(a["selected"] for a in assign) / gts
+    n, forced = len(assign), max(sum(a["forced"] for a in assign), 1)
+    stats["gt"] = sum(a["num_gt"] for a in assign) / n
+    stats["forced"] = forced / n
+    stats["forced_passed"] = sum(a["selected"] for a in assign) / forced
     stats["rule"] = sum(a["rule"] for a in assign) / n
     for level, stride in enumerate(decoder.feat_strides):
-        stats[f"forced_s{stride}"] = sum(a["levels"][level] for a in assign) / gts
+        stats[f"forced_s{stride}"] = sum(a["levels"][level] for a in assign) / forced
     return stats
 
 

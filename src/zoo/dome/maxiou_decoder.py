@@ -12,29 +12,23 @@ logit 0, can serve as the selection rule.
 
 - The objectness of a token is its highest class logit; logit 0 is the selection rule, no
   threshold to estimate or store.
-- Training (with ground truths in the batch): every ground truth forces one token of its own
-  into the queries, the token whose predicted box matches it best (``assign_metric``:
-  ``gaussian``, ``nwd``, ``giou`` or ``iou``) among the ``(2 * assign_radius + 1)``-cell windows around its centre cell
-  on every level (index arithmetic, no ``cdist``). Two ground truths wanting the same token are
-  not a matter of assignment (the criterion's Hungarian decides who predicts what) but of
-  coverage: every ground truth gets a distinct token, so the second one moves on to its next
-  candidate (``assign_candidates`` per ground truth; the rare one whose candidates all went to
-  others takes the nearest free token). The rest of the queries are the unforced tokens the
-  objectness passes, floored so that an image has at least ``min_queries`` queries and at least
-  ``min_negatives`` unforced ones (a crowd would otherwise train the decoder on forced tokens
-  alone until the head passes some), and capped at ``num_queries``. Images differ in query
-  count (padded to the largest, ``batch_queries_num`` tells the criterion).
+- Training (with ground truths in the batch): every ground truth forces the ``assign_k`` tokens
+  whose predicted boxes match it best (``assign_metric``: ``gaussian``, ``nwd``, ``giou`` or
+  ``iou``) among the ``(2 * assign_radius + 1)``-cell windows around its centre cell on every
+  level (index arithmetic, no ``cdist``) into the queries. No assignment: a token several ground
+  truths want is forced once, and the criterion's matching decides who predicts what. An image
+  short of ``min_queries`` queries fills up with the best unforced tokens by objectness. Images
+  differ in query count (padded to the largest, ``batch_queries_num`` tells the criterion); a
+  crowd whose forced tokens exceed ``num_queries`` keeps them all.
 - Inference: the tokens the objectness passes, clamped to ``[min_queries, num_queries]`` by its
-  logit, so the query count is per image; ``num_queries`` is only a memory guard. As the head
-  learns to pass the forced tokens, the training set converges to the inference set plus a
-  vanishing forced part. ``infer_rule='topk'`` restores the plain top-k by objectness.
-- ``last_assign_stats`` reports, per image, the ground truths, how many forced tokens the head
-  already lets through (``selected``, its recall in training), the rule-selected queries and the
-  forced tokens per level (``levels``: a drift of tiny objects' tokens towards coarse levels shows
-  here).
+  logit, so the query count is per image; ``num_queries`` is only a memory guard.
+  ``infer_rule='topk'`` restores the plain top-k by objectness.
+- ``last_assign_stats`` reports, per image, the ground truths, the forced tokens, how many of
+  them the head already lets through (``selected``, its recall in training), the rule-selected
+  queries and the forced tokens per level (``levels``: a drift of tiny objects' tokens towards
+  coarse levels shows here).
 
-Host syncs per batch: one boolean per round of the forced-token pass (one or two rounds nearly
-always) and the query counts.
+Host syncs per batch: the query counts.
 """
 
 import torch
@@ -76,15 +70,11 @@ class MaxIoUTransformer(DFINETransformer):
             distance, i.e. by plain distance in ``(cx, cy, w/2, h/2)`` space: an offset counts in
             pixels whatever the box size), ``giou`` or ``iou`` (under both, any box containing
             the ground truth beats any box not overlapping it).
-        assign_candidates: tokens each ground truth keeps as candidates, its fallbacks when
-            another ground truth took its best one.
+        assign_k: tokens each ground truth forces into the queries, its most similar ones.
         assign_radius: cells around the ground truth's centre cell, per level, that are candidates
             (1: a 3x3 window on each level).
-        min_queries: the least queries an image gets, in training (forced tokens included) and
-            at inference alike.
-        min_negatives: training: the least unforced queries an image gets on top of its forced
-            tokens, the best unpassed tokens by objectness (the negatives nearest the decision
-            boundary), for images with about ``min_queries`` ground truths or more.
+        min_queries: the least queries an image gets, in training (the forced tokens, then the
+            best unforced tokens by objectness) and at inference alike.
         infer_rule: ``objectness`` (the head's decision, per-image count) or ``topk``
             (``num_queries`` best by objectness).
         local_attn_k / attn_logn_scale / attn_logn_base / min_sample_cells / min_refine_cells /
@@ -118,10 +108,9 @@ class MaxIoUTransformer(DFINETransformer):
         layer_scale=1,
         num_queries=300,
         assign_metric="gaussian",
-        assign_candidates=8,
+        assign_k=4,
         assign_radius=1,
         min_queries=300,
-        min_negatives=100,
         infer_rule="objectness",
         local_attn_k=0,
         attn_logn_scale=False,
@@ -163,31 +152,31 @@ class MaxIoUTransformer(DFINETransformer):
             anchor_grid_size=anchor_grid_size,
         )
         assert assign_metric in ("gaussian", "nwd", "giou", "iou"), assign_metric
-        assert assign_candidates >= 1 and assign_radius >= 0
+        assert assign_k >= 1 and assign_radius >= 0
         assert infer_rule in ("objectness", "topk"), infer_rule
-        assert min_queries <= num_queries and min_negatives >= 0
+        assert min_queries <= num_queries
         self.assign_metric = assign_metric
-        self.assign_candidates = assign_candidates
+        self.assign_k = assign_k
         self.assign_radius = assign_radius
         self.min_queries = min_queries
-        self.min_negatives = min_negatives
         self.infer_rule = infer_rule
-        # diagnostics of the last training forward, per image: ground truths, how many of their
-        # forced tokens the objectness already lets through, the rule-selected queries and the
+        # diagnostics of the last training forward, per image: ground truths, forced tokens, how
+        # many of them the objectness already lets through, the rule-selected queries and the
         # forced tokens per level
         self.last_assign_stats = None
 
     # ------------------------------------------------------------------ forced tokens
 
-    def _candidates(self, gt_cxcywh, gt_valid, boxes_of, n, valid, spatial_shapes):
+    def _nearest(self, gt_cxcywh, gt_valid, boxes_of, n, valid, spatial_shapes):
         """
-        Each ground truth's ``assign_candidates`` best tokens, ``[B, M, K]`` indices and match
-        values (best first), over ``gt_cxcywh [B, M, 4]`` (``gt_valid [B, M]`` marks padding) and
-        the ``n`` tokens, whose predicted boxes ``boxes_of(index)`` gives for ``[B, X]`` token
-        indices (only the candidates' are ever computed). The candidates are the tokens of the
-        window of ``2 * assign_radius + 1`` cells around the ground truth's centre cell (clamped
-        to the grid) on every level, found by index arithmetic; invalid tokens never qualify. A
-        token index of ``n`` in the result is a dummy (its value is ``-inf``).
+        Each ground truth's ``assign_k`` best tokens, ``[B, M, K]`` indices (best first), over
+        ``gt_cxcywh [B, M, 4]`` (``gt_valid [B, M]`` marks padding) and the ``n`` tokens, whose
+        predicted boxes ``boxes_of(index)`` gives for ``[B, X]`` token indices (only the
+        candidates' are ever computed). The candidates are the tokens of the window of
+        ``2 * assign_radius + 1`` cells around the ground truth's centre cell (clamped to the
+        grid) on every level, found by index arithmetic; invalid tokens never qualify. A token
+        index of ``n`` in the result is a dummy (a padded ground truth's, or a window short of
+        ``assign_k`` valid tokens).
         """
         b, m = gt_cxcywh.shape[:2]
         device = gt_cxcywh.device
@@ -230,53 +219,27 @@ class MaxIoUTransformer(DFINETransformer):
             match = iou if self.assign_metric == "iou" else giou
         ok = torch.cat([valid, valid.new_zeros(1)])[cand] & gt_valid[..., None]  # dummy, invalid, padding out
         match = match.masked_fill_(~ok, float("-inf"))
-        best = match.topk(min(self.assign_candidates, match.shape[-1]), dim=-1)
-        return torch.where(best.values.isfinite(), cand.gather(-1, best.indices), n), best.values
+        best = match.topk(min(self.assign_k, match.shape[-1]), dim=-1)
+        return torch.where(best.values.isfinite(), cand.gather(-1, best.indices), n)
 
     @torch.no_grad()
     def _forced(self, targets, boxes_of, n, valid, spatial_shapes):
         """
-        The tokens the ground truths force into the queries, a ``[B, N]`` mask with one distinct
-        token per real ground truth, and the number of real ground truths per image, over the
-        ``n`` tokens whose predicted boxes ``boxes_of`` gives (see ``_candidates``). Round ``r``
-        gives every ground truth still without a token its ``r``-th candidate unless another has
-        it (the lowest-index ground truth wins a tie); the rare ground truth whose candidates all
-        went to others takes the nearest free token, settled on the host.
+        The forced tokens ``[B, N]`` of a batch, every real ground truth's ``assign_k`` nearest
+        (see ``_nearest``), and the number of real ground truths per image, over the ``n`` tokens
+        whose predicted boxes ``boxes_of`` gives. No assignment: a token several ground truths
+        want is forced once, and the criterion's matching decides who predicts what.
         """
         b = len(targets)
         device = valid.device
         num_gts = [t["boxes"].shape[0] for t in targets]
         gt_boxes = pad_sequence([t["boxes"] for t in targets], batch_first=True)  # [B, M, 4]
-        m = gt_boxes.shape[1]
         counts = torch.tensor(num_gts).to(device, non_blocking=True)
-        gt_valid = torch.arange(m, device=device)[None, :] < counts[:, None]
-        cand, _ = self._candidates(gt_boxes, gt_valid, boxes_of, n, valid, spatial_shapes)  # [B, M, K]
-
-        forced = torch.zeros((b, n + 1), dtype=torch.bool, device=device)  # column n: the dummy's bin
-        owner = torch.empty((b, n + 1), dtype=torch.long, device=device)
-        gt = torch.arange(m, device=device)[None, :].expand(b, -1)
-        left = gt_valid.clone()
-        pending = True
-        for r in range(cand.shape[-1]):
-            tok = cand[..., r]  # [B, M]
-            want = left & (tok < n) & ~forced.gather(1, tok)
-            owner.fill_(m).scatter_reduce_(1, torch.where(want, tok, n), gt, "amin")
-            win = want & (owner.gather(1, tok) == gt)
-            forced.scatter_(1, torch.where(win, tok, n), True)
-            left &= ~win
-            pending = bool(left.any())  # one boolean per round; the first round covers nearly everything
-            if not pending:
-                break
-        forced = forced[:, :n]
-
-        if pending:  # a ground truth's candidates all went to others: every token's box, this once
-            pred_cxcywh = boxes_of(torch.arange(n, device=device)[None, :].expand(b, -1))
-            cost = torch.where(valid[None, :] & ~forced, 0.0, float("inf")).to(pred_cxcywh.dtype)
-            for i, j in left.nonzero().tolist():
-                dist = torch.cdist(gt_boxes[i, j : j + 1, :2], pred_cxcywh[i, :, :2]).squeeze(0) + cost[i]
-                t = dist.argmin()
-                forced[i, t], cost[i, t] = True, float("inf")
-        return forced, num_gts
+        gt_valid = torch.arange(gt_boxes.shape[1], device=device)[None, :] < counts[:, None]
+        nearest = self._nearest(gt_boxes, gt_valid, boxes_of, n, valid, spatial_shapes)  # [B, M, K]
+        forced = torch.zeros((b, n + 1), dtype=torch.bool, device=device)  # column n: the dummies'
+        forced.scatter_(1, nearest.flatten(1), True)
+        return forced[:, :n], num_gts
 
     # ------------------------------------------------------------------ query selection
 
@@ -297,9 +260,9 @@ class MaxIoUTransformer(DFINETransformer):
 
     def _get_decoder_input(self, memory, spatial_shapes, encoder_out, targets=None):
         """
-        Training (with ground truths in the batch): every ground truth's forced token plus the
-        unforced tokens the objectness passes, by its logit, padded to the largest count in the
-        batch, plus the encoder's predictions on the queries for the criterion. Inference: the
+        Training (with ground truths in the batch): every ground truth's forced tokens, then the
+        best unforced tokens by objectness up to ``min_queries``, padded to the largest count in
+        the batch, plus the encoder's predictions on the queries for the criterion. Inference: the
         tokens the objectness passes, clamped to ``[min_queries, num_queries]`` by its logit, or
         the plain top-k by objectness with ``infer_rule='topk'``.
         """
@@ -357,23 +320,21 @@ class MaxIoUTransformer(DFINETransformer):
             forced, num_gts = self._forced(
                 targets, lambda index: F.sigmoid(boxes_unact_of(index)), n, valid, spatial_shapes
             )  # [B, N]
-            num_gt = forced.sum(1)
+            num_forced = forced.sum(1)
             num_selected = (forced & passed).sum(1)  # forced tokens the head lets through
             per_level = torch.stack([f.sum(1) for f in forced.split([h * w for h, w in spatial_shapes], 1)], 1)
-            # the forced tokens plus the unforced ones the head passes, floored at min_queries and
-            # at min_negatives unforced ones, capped at num_queries (a crowd beyond it keeps its
-            # forced tokens and its min_negatives; they are valid by construction)
-            least = (num_gt + self.min_negatives).clamp(min=floor)
-            count = (num_gt + (passed & ~forced).sum(1)).maximum(least).minimum(least.clamp(min=cap))
-            count = count.minimum(num_valid)
-            index, pad, batch_queries_num, selected, *levels = select(
-                scores.masked_fill(forced, float("inf")), count, num_selected, *per_level.unbind(1)
+            # the forced tokens, then the best unforced ones by objectness up to min_queries (a
+            # crowd whose forced tokens exceed num_queries keeps them all; they are valid by
+            # construction)
+            count = num_forced.clamp(min=floor).minimum(num_valid)
+            index, pad, batch_queries_num, num_forced, selected, *levels = select(
+                scores.masked_fill(forced, float("inf")), count, num_forced, num_selected, *per_level.unbind(1)
             )
             contents = take(output_memory, index).masked_fill(pad[..., None], 0)
             boxes_init = boxes_unact_of(index).masked_fill(pad[..., None], 0)
             self.last_assign_stats = [
-                {"num_gt": g, "selected": s, "rule": q - g, "levels": lv}
-                for g, s, q, *lv in zip(num_gts, selected, batch_queries_num, *levels)
+                {"num_gt": g, "forced": f, "selected": s, "rule": q - f, "levels": lv}
+                for g, f, s, q, *lv in zip(num_gts, num_forced, selected, batch_queries_num, *levels)
             ]
 
         # the encoder's predictions on the queries, with a graph: D-FINE's enc_aux_outputs, which
