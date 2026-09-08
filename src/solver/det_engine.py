@@ -21,8 +21,8 @@ from ..optim import ModelEMA, Warmup
 
 
 def to_device(targets: list[dict], device) -> list[dict]:
-    """The per-image target dicts with every tensor moved to ``device``."""
-    return [{k: v.to(device) for k, v in t.items()} for t in targets]
+    """The per-image target dicts with every tensor moved to ``device`` (asynchronously from pinned memory)."""
+    return [{k: v.to(device, non_blocking=True) for k, v in t.items()} for t in targets]
 
 
 def optimizer_step(loss: torch.Tensor, model, optimizer, scaler: GradScaler | None, max_norm: float) -> None:
@@ -68,7 +68,7 @@ def train_one_epoch(
     device_type = torch.device(device).type
 
     for i, (samples, targets) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
-        samples = samples.to(device)
+        samples = samples.to(device, non_blocking=True)
         targets = to_device(targets, device)
         global_step = epoch * len(data_loader) + i
         metas = dict(epoch=epoch, step=i, global_step=global_step, epoch_step=len(data_loader))
@@ -154,7 +154,7 @@ def evaluate(
 
     with PredictionDumper(SAVE_TEST_VISUALIZE_RESULT) as dumper:
         for samples, targets in metric_logger.log_every(data_loader, 10, header):
-            samples = samples.to(device)
+            samples = samples.to(device, non_blocking=True)
             targets = to_device(targets, device)
 
             outputs = model(samples, targets=targets)

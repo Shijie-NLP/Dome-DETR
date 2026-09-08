@@ -17,6 +17,7 @@ train_dataloader:
   shuffle: True
   total_batch_size: 8
   num_workers: 4
+  pin_memory: True   # batches land in pinned memory, so their copy to the GPU is asynchronous
 
 
 val_dataloader:
@@ -26,3 +27,4 @@ val_dataloader:
   shuffle: False
   total_batch_size: 16
   num_workers: 4
+  pin_memory: True
