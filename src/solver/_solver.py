@@ -11,6 +11,7 @@ import torch
 
 from ..core import BaseConfig
 from ..misc import dist_utils
+from ..misc.console import tee_console
 
 
 def load_checkpoint(path: str):
@@ -67,6 +68,8 @@ class BaseSolver:
 
         self.output_dir = Path(cfg.output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        if dist_utils.is_main_process():
+            tee_console(self.output_dir / "console.log")  # the console, kept next to log.txt
         self.writer = cfg.writer
 
         if self.writer:

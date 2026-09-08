@@ -141,7 +141,7 @@ class DetSolver(BaseSolver):
                     self.writer.add_scalar(f"Test/{k}_{i}", v, epoch)
 
     def _append_log(self, log_stats: dict):
-        """One json line per epoch in ``log.txt``, written by the main process."""
+        """One json line per epoch in ``log.txt``, written by the main process (the console goes to ``console.log``)."""
         if self.output_dir and dist_utils.is_main_process():
             with (self.output_dir / "log.txt").open("a") as f:
                 f.write(json.dumps(log_stats) + "\n")
