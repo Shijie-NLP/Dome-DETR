@@ -24,18 +24,12 @@ from ...misc.box_ops import (
     gaussian_box_similarity,
 )
 from .fdr import bbox2distance
-from .matcher import padded_targets, topk_matching
+from .matcher import FlatMatches, PaddedTargets, padded_targets, topk_matching_flat
 
 __all__ = ["DomeCriterion"]
 
 
-class Targets(NamedTuple):
-    """A batch's ground truths padded to ``[B, M]``: see ``matcher.padded_targets``."""
-
-    labels: Tensor  # [B, M]
-    boxes: Tensor  # [B, M, 4]
-    gt_valid: Tensor  # [B, M]
-    q_valid: Tensor  # [B, Q], the real (unpadded) queries of every image
+Targets = PaddedTargets  # a batch's ground truths padded to [B, M], see matcher.padded_targets
 
 
 class Pairs(NamedTuple):
@@ -72,16 +66,28 @@ class Pairs(NamedTuple):
         )
 
     @classmethod
+    def from_flat(cls, flat: FlatMatches):
+        """From the matcher's flat matches of one or more sets (sorted by set and image already)."""
+        device = flat.query_idx.device
+        set_idx = torch.arange(len(flat.counts)).repeat_interleave(torch.tensor(flat.counts, dtype=torch.long))
+        return cls(
+            set_idx.to(device, non_blocking=True), flat.batch_idx, flat.query_idx, flat.target_idx, list(flat.counts)
+        )
+
+    @classmethod
     def shared(cls, indices, num_sets, device):
         """The same per-image matching for every one of ``num_sets`` sets."""
-        one = cls.from_lists([indices], device)
-        k = one.counts[0]
-        set_idx = torch.arange(num_sets, device=device).repeat_interleave(k)
-        return cls(
+        return cls.from_lists([indices], device).tiled(num_sets)
+
+    def tiled(self, num_sets):
+        """These pairs of one set, as the same matching for every one of ``num_sets`` sets."""
+        k = self.counts[0]
+        set_idx = torch.arange(num_sets, device=self.query_idx.device).repeat_interleave(k)
+        return Pairs(
             set_idx,
-            one.batch_idx.repeat(num_sets),
-            one.query_idx.repeat(num_sets),
-            one.target_idx.repeat(num_sets),
+            self.batch_idx.repeat(num_sets),
+            self.query_idx.repeat(num_sets),
+            self.target_idx.repeat(num_sets),
             [k] * num_sets,
         )
 
@@ -306,8 +312,9 @@ class DomeCriterion(nn.Module):
         """The matched predictions' boxes ``[K, 4]``, the target boxes they are matched to, and their quality (detached)."""
         key = (id(stack), id(pairs))
         if key not in self.matched:
-            src_boxes = stack.boxes[pairs.set_idx, pairs.batch_idx, pairs.query_idx]
-            target_boxes = targets.boxes[pairs.batch_idx, pairs.target_idx]
+            _, b, q, _ = stack.boxes.shape
+            src_boxes = stack.boxes.reshape(-1, 4)[(pairs.set_idx * b + pairs.batch_idx) * q + pairs.query_idx]
+            target_boxes = targets.boxes.reshape(-1, 4)[pairs.batch_idx * targets.boxes.shape[1] + pairs.target_idx]
             with torch.no_grad():
                 quality = self._matched_quality(src_boxes, target_boxes)
             self.matched[key] = (src_boxes, target_boxes, quality)
@@ -592,19 +599,19 @@ class DomeCriterion(nn.Module):
         return torch.clamp(count / dist_utils.get_world_size(), min=1).item()
 
     @staticmethod
-    def _union_indices(indices_list, num_queries, num_targets):
+    def _union_matches(matches: list[FlatMatches], num_queries, num_targets) -> FlatMatches:
         """
-        D-FINE's 'go' matching: the union of the matches of several prediction sets
-        (``indices_list``, one per-image list each), keeping for every query the target it was
-        matched to most often (the lowest index on a tie). Three host syncs.
+        D-FINE's 'go' matching: the union of the matches of several prediction sets, keeping for
+        every query the target it was matched to most often (the lowest index on a tie), as flat
+        matches of one set sorted by image. Two host syncs.
         """
         b, m = len(num_targets), max(num_targets)
-        device = indices_list[0][0][0].device
+        device = matches[0].query_idx.device
+        empty = torch.zeros(0, dtype=torch.long, device=device)
         if m == 0:
-            empty = torch.zeros(0, dtype=torch.long, device=device)
-            return [(empty, empty) for _ in range(b)]
+            return FlatMatches(empty, empty, empty, [0])
         # every match as one key (image, query, target); the number of sets a key appears in
-        key = torch.cat([(i * num_queries + src) * m + tgt for ind in indices_list for i, (src, tgt) in enumerate(ind)])
+        key = torch.cat([(f.batch_idx * num_queries + f.query_idx) * m + f.target_idx for f in matches])
         key, count = torch.unique(key, return_counts=True)  # sorted: image, query, then target
         query, target = key // m, key % m  # query numbered across the batch
         best = torch.zeros((b * num_queries,), dtype=count.dtype, device=device)
@@ -614,8 +621,7 @@ class DomeCriterion(nn.Module):
         first.scatter_reduce_(0, query[top], target[top], "amin")  # the lowest target among the ties
         keep = top & (target == first[query])
         query, target = query[keep], target[keep]
-        per_image = torch.bincount(query // num_queries, minlength=b).tolist()
-        return list(zip((query % num_queries).split(per_image), target.split(per_image)))
+        return FlatMatches(query // num_queries, query % num_queries, target, [query.shape[0]])
 
     @staticmethod
     def get_cdn_matched_indices(dn_meta, targets):
@@ -650,43 +656,47 @@ class DomeCriterion(nn.Module):
         batch_queries_num = outputs.get("batch_queries_num")
         num_queries = outputs["pred_logits"].shape[1]
         self._clear_cache()
-        padded = Targets(*padded_targets(targets, num_queries, batch_queries_num))
+        padded = padded_targets(targets, num_queries, batch_queries_num)
         fdr = {"up": outputs.get("up"), "reg_scale": outputs.get("reg_scale"), "min_unit": outputs.get("fdr_min_unit")}
 
-        # match every prediction set in one go, and build the union matching for the box losses
+        # match every prediction set in one go, and build the union matching for the box losses;
+        # the matches stay flat (one index tensor each) from the matcher to the losses
         hungarian_enc = self.enc_matching == "hungarian"
         sets = [outputs, *outputs["aux_outputs"], outputs["pre_outputs"]]
         suffixes = ["", *(f"_aux_{i}" for i in range(len(outputs["aux_outputs"]))), "_pre"]
         enc_sets = outputs["enc_aux_outputs"]
-        matched = self.matcher.match_sets(
-            sets + (enc_sets if hungarian_enc else []), targets, batch_queries_num=batch_queries_num
-        )
-        indices = matched[: len(sets)]
-        if hungarian_enc:
-            indices_enc = matched[len(sets) :]
+        matched, _ = self.matcher.match_sets_flat(sets + (enc_sets if hungarian_enc else []), padded)
+        if hungarian_enc:  # the decoder sets' matches first, then the encoder sets'
+            split = sum(matched.counts[: len(sets)])
+            dec_matches = FlatMatches(*(t[:split] for t in matched[:3]), matched.counts[: len(sets)])
+            enc_matches = [FlatMatches(*(t[split:] for t in matched[:3]), matched.counts[len(sets) :])]
         else:
-            indices_enc = [topk_matching(o, targets, self.enc_topk, batch_queries_num) for o in enc_sets]
-        num_targets = [len(t["labels"]) for t in targets]
-        indices_go = self._union_indices(
-            indices + (indices_enc if self.enc_in_uni_set else []), num_queries, num_targets
+            dec_matches = matched
+            enc_matches = [topk_matching_flat(o, padded, self.enc_topk) for o in enc_sets]
+        own = Pairs.from_flat(dec_matches)
+        enc_own = Pairs.from_flat(
+            FlatMatches(
+                *(torch.cat(t) for t in zip(*(f[:3] for f in enc_matches))), [n for f in enc_matches for n in f.counts]
+            )
         )
-        num_go = self._average_over_ranks(sum(len(x[0]) for x in indices_go), device)
-        num_boxes = self._average_over_ranks(sum(num_targets), device)
+        union = self._union_matches(
+            [dec_matches] + (enc_matches if self.enc_in_uni_set else []), num_queries, padded.num_gt
+        )
+        num_go = self._average_over_ranks(union.counts[0], device)
+        num_boxes = self._average_over_ranks(sum(padded.num_gt), device)
 
         # the decoder's sets: their own matches for the classification losses, the union for the boxes
         stack = SetStack.build(sets, suffixes, padded.q_valid)
-        own = Pairs.from_lists(indices, device)
-        shared = Pairs.shared(indices_go, stack.num_sets, device)
+        shared = Pairs.from_flat(union).tiled(stack.num_sets)
         losses = self._stack_losses(stack, padded, self.losses, own, shared, num_boxes, num_go, ("boxes", "local"), fdr)
 
         # the encoder sets: their own losses, and outside the union their own matches and pair counts
         enc_stack = SetStack.build(enc_sets, [f"_enc_{i}" for i in range(len(enc_sets))], padded.q_valid)
-        enc_own = Pairs.from_lists(indices_enc, device)
         enc_losses = self.losses if self.enc_losses is None else self.enc_losses
         if self.enc_in_uni_set:
-            enc_args = (enc_own, Pairs.shared(indices_go, enc_stack.num_sets, device), num_boxes, num_go, ("boxes",))
+            enc_args = (enc_own, Pairs.from_flat(union).tiled(enc_stack.num_sets), num_boxes, num_go, ("boxes",))
         else:
-            pairs = [self._average_over_ranks(sum(len(x[0]) for x in ind), device) for ind in indices_enc]
+            pairs = [self._average_over_ranks(n, device) for n in enc_own.counts]
             enc_args = (enc_own, enc_own, torch.tensor(pairs, device=device), None, ())
         if outputs["enc_meta"]["class_agnostic"]:
             with self._class_agnostic(padded) as enc_targets:
