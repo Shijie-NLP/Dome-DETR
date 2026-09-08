@@ -1,10 +1,14 @@
-# MaxIoU-S on VisDrone2019-DET: the D-FINE-S baseline recipe (plain HybridEncoder, no DeFE / MWAS)
-# with the ground-truth-forced query selection and no denoising. At training every ground truth
-# forces the assign_k encoder tokens whose boxes match it best into the queries, the rest are the
-# tokens that pass the objectness threshold, and the best unpassed tokens fill up to min_queries;
-# at inference the objectness alone selects. Everything past the selection is D-FINE's (Hungarian matching), except that the
-# encoder's class logits are trained as plain 0/1 objectness (enc_losses) so that a probability
-# threshold on them is the selection rule.
+# MaxIoU-S on VisDrone2019-DET: the D-FINE-S baseline recipe (plain HybridEncoder, no DeFE / MWAS,
+# the 800 px pipeline and schedule of DFine-S-VisDrone) with the ground-truth-forced query
+# selection and no denoising.
+#
+# Training: every ground truth forces the assign_k encoder tokens whose predicted boxes match it
+# best into the queries; the other queries are the tokens whose objectness passes obj_threshold,
+# filled up to min_queries with the best unpassed tokens. Inference: the objectness alone selects.
+# Everything past the selection is D-FINE's (Hungarian matching, VFL, FDR). The encoder's class
+# logits are trained as objectness: each ground truth's enc_topk most similar queries are its
+# positives, targeted at their IoU, everything else at 0, so a probability threshold on the
+# sigmoid is the selection rule.
 
 __include__: [
   '../dataset/visdrone_detection.yml',
@@ -31,76 +35,59 @@ HybridEncoder:
   in_channels: [64, 256, 512, 1024]
   depth_mult: .34
   expansion: 0.5
-  # short of memory, `checkpoint_fusion: True` recomputes the stride-4 fusion blocks' activations
-  # in the backward pass: at 960x960 a batch of 8 drops from 15.2 to 9.6 GiB for ~25% more time
-  # per step (one RTX 5090 then takes a batch of 16 instead of 12)
 
 MaxIoUTransformer:
   num_layers: 3
   # deformable cross-attention sampling points per level (strides 4, 8, 16, 32), 16 in all as with
   # [4, 4, 4, 4]: the tiny objects live on the fine levels, so those get the points
   num_points: [6, 4, 3, 3]
-  num_queries: 2000    # the most queries an image gets (memory guard, training and inference)
-  num_denoising: 0   # the ground truths' claimed tokens replace the denoising queries
-  # the encoder's class logits are trained on 0/1 targets (a plain BCE, each ground truth's most
-  # similar query positive on its class); their maximum is the objectness that picks the queries
-  # in training and inference alike: a token passes when its sigmoid exceeds obj_threshold (0.5
-  # is the head's decision boundary, logit 0)
-  min_queries: 300     # the least queries per image: training (the forced and passed tokens, then
-                       # the best unpassed by objectness) and inference alike
+  num_denoising: 0     # the forced tokens take the denoising queries' role
+
+  # the query selection: a token passes when the sigmoid of its highest class logit exceeds
+  # obj_threshold (0.5 is the head's decision boundary, logit 0). VisDrone crops hold 40 to 100
+  # boxes on most images and up to ~500 on the crowded ones
   obj_threshold: 0.3
-  infer_rule: objectness   # or topk, the plain D-FINE selection
-  # query self-attention: each query sees its local_attn_k nearest queries (0: all); or keep full
-  # attention and rescale the logits by log(n)/log(num_queries) so the entropy does not grow with n
-  local_attn_k: 64
-  attn_logn_scale: False
-  # the deformable cross-attention samples within a radius proportional to the query's box; floor
-  # it at so many cells on every level (1: the neighbouring cells) so tiny boxes still read their
-  # surroundings (0: off)
-  min_sample_cells: 1
-  # the FDR layers move the box edges within a range proportional to the first layer's box; with
-  # min_refine_cells: 2 every edge could move at least 2 cells of the finest level whatever the box
-  # size, but that floors the finest bin at 2 px, which costs the tiniest boxes their AP75 (0: off)
-  min_refine_cells: 0
-  # the first level's anchor box as a fraction of the image, doubling per level: 0.025 is 5 cells of
-  # the stride-4 level (20 px at 800), D-FINE's ratio; its 0.05 default was meant for a stride-8 level
-  anchor_grid_size: 0.025
-  # how a ground truth ranks the tokens' boxes: gaussian (the same Gaussian similarity as the
-  # criterion's quality: scale-invariant, and a small box that just misses a tiny ground truth still
-  # beats a coarse-level box that merely contains it, which under giou or iou always wins because
-  # any non-overlapping box scores at most 0), nwd (the AI-TOD line's metric), giou or iou
+  min_queries: 300     # the least queries per image, training and inference alike
+  num_queries: 2000    # the most (memory guard); forced tokens are kept beyond it
+
+  # the forced tokens: every ground truth's assign_k most similar tokens, by the Gaussian
+  # similarity of their predicted boxes (scale-invariant: a small box that just misses a tiny
+  # ground truth still beats a coarse-level box that merely contains it, which under iou or giou
+  # always wins), among the 3x3 cells around its centre cell on every level (assign_radius 1).
+  # A token several ground truths want is forced once; the criterion decides who predicts what
   assign_metric: gaussian
-  assign_k: 4        # forced tokens per ground truth, its most similar (a token several ground
-                     # truths want is forced once; the criterion's matching decides who predicts what)
-  assign_radius: 1   # candidates: the 3x3 cells around the ground truth's centre, per level
+  assign_k: 4
+  assign_radius: 1
+
+  # query self-attention restricted to each query's local_attn_k nearest queries by initial box
+  # centre (0: all); the compute is the same, only the neighbourhood changes
+  local_attn_k: 64
+  # the deformable cross-attention samples within a radius proportional to the query's box,
+  # floored at one cell on every level so a tiny box still reads its surroundings
+  min_sample_cells: 1
+  # the first level's anchor box as a fraction of the image, doubling per level: 5 cells of the
+  # stride-4 level, D-FINE's ratio (its 0.05 default was meant for a stride-8 first level)
+  anchor_grid_size: 0.025
+  # min_refine_cells (FDR's edge range floored at so many finest-level cells) stays 0: at 2 it
+  # floors the finest bin at 2 px, which cost the tiniest boxes their AP75
 
 DomeCriterion:
-  enc_losses: ['obj', 'boxes']   # the encoder's queries: objectness (obj_target below) and boxes
-  # the encoder's queries: every ground truth's enc_topk most similar queries (by Gaussian
-  # similarity, the metric the forced selection uses, so they are nearly always its forced tokens)
-  # are its positives, each targeted at its own IoU (obj_target: quality), so the second and
-  # third fit worse and learn lower scores rather than the neighbourhood's whole. A query wanted
-  # by several ground truths goes to the most similar. The matches stay out of the union matching
-  # (with topk > 1 it would make the decoder's box losses one-to-many too). enc_matching:
-  # hungarian, enc_in_uni_set: True restores D-FINE's
+  # the encoder set (the selected queries' encoder predictions): objectness and boxes on the
+  # topk matching, every ground truth's enc_topk most similar queries by Gaussian similarity
+  # (nearly always its forced tokens), a query wanted by several going to the most similar.
+  # These matches stay out of the union matching, which with topk > 1 would make the decoder's
+  # box losses one-to-many too
+  enc_losses: ['obj', 'boxes']
   enc_matching: topk
   enc_topk: 3
   enc_in_uni_set: False
-  # the objectness loss: a plain BCE, everything but the positives targeted at 0, no reweighting.
-  # balanced (the halves weighted 1/2 each, obj_pos_weight and obj_quality_weight on top) puts the
-  # boundary at the likelihood ratio instead, which passes thousands of tokens per image
+  # the objectness loss: a plain BCE (no focal or balanced reweighting, so the sigmoid stays a
+  # calibrated probability for obj_threshold); each positive is targeted at its pair's IoU,
+  # so a token whose box is off its ground truth learns a low score, everything else at 0
   obj_loss: plain
-  # the positives' target: their pair's IoU (quality below) rather than 1, so a forced token whose
-  # box is off its ground truth learns a low score and the objectness tracks how well a token's
-  # box fits; the tokens the threshold passes are then the ones worth refining. The cost is that
-  # a tiny object whose best encoder box has a low IoU scores low too, and can fall under
-  # obj_threshold at inference (obj_target: one restores the 0/1 target)
   obj_target: quality
-  # the VFL target of the decoder's queries and the matching cost's localization term: D-FINE's IoU
-  # and GIoU. The Gaussian similarity (quality: gaussian; matcher weight_dict cost_giou: 0,
-  # cost_gaussian: 2), three times less sensitive to a pixel of offset on a tiny box, gave a score
-  # that no longer tracked how tight a box is: at epoch 6 AP50 was 5 points above Dome-S and AP75
-  # 2 points below, on the same AP
+  # the pair quality (VFL target, FGL weight, obj_target): IoU as in D-FINE. The Gaussian
+  # similarity gave a score that no longer tracked how tight a box is (AP50 up, AP75 down)
   quality: iou
 
 
