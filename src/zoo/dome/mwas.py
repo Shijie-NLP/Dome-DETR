@@ -25,9 +25,10 @@ class AxisPermutedEncoder(nn.Module):
     """
     A stack of ``TransformerEncoderLayer`` applied to ``[N, L, C]`` tokens (N windows of L
     positions) twice per layer: once over the L positions of each window, then, with the first
-    two axes swapped, over the N windows at each position. The positional embedding is the sum
-    of a per-window absolute one (``glob_pos_embeds``, ``[N, C, h, w]``) and a shared relative one
-    (``pos_embed``, ``[C, h, w]``).
+    two axes swapped, over the N windows at each position (``cross_mask``, ``[N, N]`` with True
+    blocking, keeps the windows of different images apart when a batch's windows are stacked).
+    The positional embedding is the sum of a per-window absolute one (``glob_pos_embeds``,
+    ``[N, C, h, w]``) and a shared relative one (``pos_embed``, ``[C, h, w]``).
     """
 
     def __init__(self, encoder_layer, num_layers, norm=None):
@@ -36,18 +37,18 @@ class AxisPermutedEncoder(nn.Module):
         self.num_layers = num_layers
         self.norm = norm
 
-    def forward(self, src, src_mask=None, pos_embed=None, glob_pos_embeds=None) -> torch.Tensor:
+    def forward(self, src, pos_embed, glob_pos_embeds, cross_mask=None) -> torch.Tensor:
         output = src
         n, c = glob_pos_embeds.shape[:2]
         pos = glob_pos_embeds.reshape(n, c, -1).permute(0, 2, 1) + pos_embed.reshape(c, -1).permute(1, 0).unsqueeze(0)
         pos_t = pos.permute(1, 0, 2).contiguous()
         for layer in self.layers:
             q = k = output + pos
-            output = layer.attend(q, k, output, src_mask)
+            output = layer.attend(q, k, output)
             # across windows: swap the window and position axes
             output = output.permute(1, 0, 2).contiguous()
             q = k = output + pos_t
-            output = layer.attend(q, k, output, src_mask).permute(1, 0, 2).contiguous()
+            output = layer.attend(q, k, output, cross_mask).permute(1, 0, 2).contiguous()
 
         if self.norm is not None:
             output = self.norm(output)
@@ -62,6 +63,10 @@ class MaskedWindowAttention(nn.Module):
     a ``[B, 1, H, W]`` binary density mask, the window side in cells, and a ``[C, H, W]`` absolute
     position embedding. A window is selected when any mask cell inside it is set. Returns the
     features with the encoded windows added back, and the ``[B, H/ws, W/ws]`` window mask.
+
+    The selected windows of the whole batch go through the encoder in one call (one host sync,
+    for their number); its across-window attention is masked so that windows of different images
+    do not see each other. An image the mask selects no window in keeps its features as they are.
     """
 
     def __init__(self, embed_dim=256, num_heads=8, dim_feedforward=1024, num_layers=1, dropout=0.0, activation="relu"):
@@ -88,18 +93,14 @@ class MaskedWindowAttention(nn.Module):
         window_mask = self._window_mask(mask, features.shape[-2:], ws)  # [B, nh, nw]
         dump_feature_map("defe_window_mask", window_mask.float().unsqueeze(1))
 
-        out = features.clone()
-        for i in range(b):
-            rows, cols = torch.nonzero(window_mask[i], as_tuple=True)
-            if rows.numel() == 0:
-                raise RuntimeError(f"image {i}: the density mask selects no window")
-            encoded = self._encode(windows[i][rows, cols], rel_pos_embed, pos_windows[rows, cols])
-            # add the encoded windows back at their places
-            # under autocast the features are half while the encoder (LayerNorm) returns float
-            delta = torch.zeros_like(windows[i])
-            delta[rows, cols] = encoded.to(delta.dtype)
-            out[i] += delta.permute(2, 0, 3, 1, 4).reshape(c, h, w)
-        return out, window_mask
+        img, rows, cols = torch.nonzero(window_mask, as_tuple=True)  # sorted by image
+        same_image = img[:, None] == img[None, :]
+        encoded = self._encode(windows[img, rows, cols], rel_pos_embed, pos_windows[rows, cols], ~same_image)
+        # add the encoded windows back at their places
+        # under autocast the features are half while the encoder (LayerNorm) returns float
+        delta = torch.zeros_like(windows)
+        delta[img, rows, cols] = encoded.to(delta.dtype)
+        return features + delta.permute(0, 3, 1, 4, 2, 5).reshape(b, c, h, w), window_mask
 
     @staticmethod
     def _as_windows(x, ws):
@@ -114,16 +115,17 @@ class MaskedWindowAttention(nn.Module):
         kernel = (mask.shape[-2] // h * ws, mask.shape[-1] // w * ws)
         return F.max_pool2d(mask.float(), kernel_size=kernel, stride=kernel).squeeze(1) > 0
 
-    def _encode(self, windows, rel_pos_embed, glob_pos_embeds):
+    def _encode(self, windows, rel_pos_embed, glob_pos_embeds, cross_mask=None):
         """Run the window encoder on ``[N, C, ws, ws]`` windows; same shape out."""
         n, c, h, w = windows.shape
         tokens = windows.reshape(n, c, -1).permute(0, 2, 1)
-        tokens = self.window_encoder(tokens, pos_embed=rel_pos_embed, glob_pos_embeds=glob_pos_embeds)
+        tokens = self.window_encoder(tokens, rel_pos_embed, glob_pos_embeds, cross_mask)
         return tokens.permute(0, 2, 1).reshape(n, c, h, w)
 
     def _relative_embedding(self, ws):
         """``[C, ws, ws]`` embedding of each cell's normalized (x, y) inside the window."""
         device = self.rel_pos_encoder[0].weight.device
-        grid_y, grid_x = torch.meshgrid(torch.arange(ws), torch.arange(ws), indexing="ij")
-        coords = torch.stack([grid_x / (ws - 1), grid_y / (ws - 1)], dim=-1).to(device)
+        cells = torch.arange(ws, device=device)
+        grid_y, grid_x = torch.meshgrid(cells, cells, indexing="ij")
+        coords = torch.stack([grid_x / (ws - 1), grid_y / (ws - 1)], dim=-1)
         return self.rel_pos_encoder(coords).permute(2, 0, 1)
