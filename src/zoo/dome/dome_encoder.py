@@ -16,8 +16,7 @@ import torch.nn.functional as F  # noqa: N812
 
 from ...core import register
 from ...misc.visualizer import SAVE_INTERMEDIATE_VISUALIZE_RESULT, dump_feature_map
-from ...nn.position_encoding import build_2d_sincos_position_embedding
-from .defe import LiteDeFE, adaptive_defe_filter, render_density_map
+from .defe import LiteDeFE, adaptive_defe_filter, render_density_maps
 from .hybrid_encoder import HybridEncoder
 from .mwas import MaskedWindowAttention
 
@@ -110,12 +109,9 @@ class DomeHybridEncoder(HybridEncoder):
             defe_feature_filtered = adaptive_defe_filter(
                 F.interpolate(defe_feature_pooled, size=(H, W), mode="bilinear", align_corners=True)
             ).float()
-            glob_pos_embed = (
-                build_2d_sincos_position_embedding(W, H, embed_dim=self.hidden_dim)
-                .permute(0, 2, 1)
-                .view(-1, H, W)
-                .to(proj_feats[1].device)
-            )
+            # the absolute position embedding of the window grid, built once per size (as upstream: the
+            # column-major embedding viewed row-major, which the released checkpoints were trained on)
+            glob_pos_embed = self._pos_embed(W, H, proj_feats[1].device).permute(0, 2, 1).view(-1, H, W)
             proj_feats[1], defe["defe_window_mask"] = self.mwas_processor(
                 proj_feats[1], defe_feature_filtered, ws, glob_pos_embed
             )
@@ -128,15 +124,13 @@ class DomeHybridEncoder(HybridEncoder):
         # it, so it is built for training (and for the visualization dump)
         defe["gt_density_map"] = []
         if targets is not None and (self.training or SAVE_INTERMEDIATE_VISUALIZE_RESULT):
-            B, _, img_h, img_w = img_inputs.shape
-            heatmaps = []
-            for b in range(B):
-                boxes = targets[b]["boxes"]
-                if not self.training:
-                    # validation targets are xyxy pixels; the generator wants normalized cxcywh
-                    boxes = boxes / boxes.new_tensor([img_w, img_h, img_w, img_h])
-                    boxes = torch.cat([(boxes[:, :2] + boxes[:, 2:]) / 2, boxes[:, 2:] - boxes[:, :2]], dim=1)
-                heatmaps.append(render_density_map(boxes, (img_h, img_w)))
-            defe["gt_density_map"] = torch.stack(heatmaps).to(img_inputs.device)
+            img_h, img_w = img_inputs.shape[2:]
+            boxes = [t["boxes"] for t in targets]
+            if not self.training:
+                # validation targets are xyxy pixels; the renderer wants normalized cxcywh
+                scale = img_inputs.new_tensor([img_w, img_h, img_w, img_h])
+                boxes = [b / scale for b in boxes]
+                boxes = [torch.cat([(b[:, :2] + b[:, 2:]) / 2, b[:, 2:] - b[:, :2]], dim=1) for b in boxes]
+            defe["gt_density_map"] = render_density_maps(boxes, (img_h, img_w))
             dump_feature_map("heatmap_gt", defe["gt_density_map"])
         return {"defe": defe}

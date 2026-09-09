@@ -5,10 +5,8 @@ Copyright (c) 2025 The Dome-DETR Authors. All Rights Reserved.
 DeFE, the Density-Focal Extractor: a light head on the stride-4 features that predicts a
 per-pixel object density map and a per-image count value. The encoder uses the map to pick the
 windows MWAS attends to and the decoder to size its query budget; the criterion supervises it
-with ``render_density_map``, a Gaussian heatmap drawn from the ground-truth boxes.
+with ``render_density_maps``, a Gaussian heatmap drawn from the ground-truth boxes.
 """
-
-import random
 
 import torch
 import torch.nn as nn
@@ -16,7 +14,7 @@ import torch.nn.functional as F  # noqa: N812
 
 from ...nn.blocks import ChannelAttention, DepthwiseSeparableConv
 
-__all__ = ["DeFEStack", "LiteDeFE", "adaptive_defe_filter", "render_density_map"]
+__all__ = ["DeFEStack", "LiteDeFE", "adaptive_defe_filter", "render_density_maps"]
 
 
 class DeFEStack(nn.Module):
@@ -69,84 +67,101 @@ class LiteDeFE(nn.Module):
     def forward(self, features):
         x = self.defe(self.conv1(features))
         density = F.interpolate(self.density_head(x), scale_factor=2, mode="bilinear", align_corners=False)
-        if density.max() > 0:
-            density = density / density.max()
+        peak = density.max()
+        density = torch.where(peak > 0, density / peak, density)  # no host sync on the peak
         reg_value = self.regression_head(x)
         return density, reg_value
 
 
-def _gaussian_kernel(sigma_x, sigma_y):
-    """A normalized 2D Gaussian on an odd grid of about 6 sigma per side."""
-    sigma_x, sigma_y = max(sigma_x, 0.1), max(sigma_y, 0.1)
-    kernel_w = int(6 * sigma_x) + 1
-    kernel_h = int(6 * sigma_y) + 1
-    kernel_w += kernel_w % 2 == 0
-    kernel_h += kernel_h % 2 == 0
-
-    x = torch.arange(kernel_w, dtype=torch.float32) - (kernel_w // 2)
-    y = torch.arange(kernel_h, dtype=torch.float32) - (kernel_h // 2)
-    yy, xx = torch.meshgrid(y, x, indexing="ij")
-    kernel = torch.exp(-(xx**2 / (2 * sigma_x**2) + yy**2 / (2 * sigma_y**2)))
-    kernel_sum = kernel.sum()
-    return kernel / kernel_sum if kernel_sum > 0 else kernel
-
-
-def render_density_map(boxes, size, sigma_ratio=1.2):
+def _kernel_sizes(px, sigma_ratio):
     """
-    The ground-truth density map for ``boxes`` (normalized cxcywh) on an image of ``size`` =
-    (h, w): one normalized Gaussian per box, centred on the box and as wide as
-    ``sigma_ratio`` times its side lengths, summed and scaled to a maximum of 1. Returns
-    ``[1, h, w]`` on the CPU.
+    The Gaussian of a box side of ``px`` pixels (``[..]``, whole numbers): its sigma
+    (``sigma_ratio`` times the side, at least 1), the kernel's half width (the kernel spans about
+    6 sigma, rounded up to an odd width), and the divisor ``2 sigma^2``. Sigma and the width are
+    computed in float64, as the Python arithmetic of the original per-box loop was.
     """
-    H, W = size  # noqa: N806
-    heatmap = torch.zeros((H, W), dtype=torch.float32)
-
-    for x_center, y_center, width, height in boxes:
-        cx, cy = int(x_center * W), int(y_center * H)
-        w_px, h_px = max(int(width * W), 1), max(int(height * H), 1)
-        kernel = _gaussian_kernel(max(w_px * sigma_ratio, 1.0), max(h_px * sigma_ratio, 1.0))
-        if kernel.numel() == 0:
-            continue
-        k_h, k_w = kernel.shape
-        radius_x, radius_y = k_w // 2, k_h // 2
-
-        # the part of the kernel that lands inside the image
-        x_start, y_start = max(cx - radius_x, 0), max(cy - radius_y, 0)
-        x_end, y_end = min(cx + radius_x + 1, W), min(cy + radius_y + 1, H)
-        k_start_x = max(radius_x - (cx - x_start), 0)
-        k_start_y = max(radius_y - (cy - y_start), 0)
-        k_end_x = k_w - max((cx + radius_x + 1) - x_end, 0)
-        k_end_y = k_h - max((cy + radius_y + 1) - y_end, 0)
-        patch = kernel[k_start_y:k_end_y, k_start_x:k_end_x]
-        if patch.numel() == 0:
-            continue
-        patch = patch[: y_end - y_start, : x_end - x_start]
-        heatmap[y_start:y_end, x_start:x_end] += patch
-
-    if heatmap.max() > 0:
-        heatmap = heatmap / heatmap.max()
-    return heatmap.unsqueeze(0)
+    sigma = (px.double() * sigma_ratio).clamp(min=1.0)
+    width = (6 * sigma).trunc() + 1
+    width = width + (width % 2 == 0)
+    return width // 2, (2 * sigma**2).float()
 
 
-def adaptive_defe_filter(defe_feature, init_thresh=0.05, step=0.01):
+def _axis_profiles(centre, radius, denom, length, sigma_ratio, chunk=1024):
     """
-    Binarize a density map [B, 1, H, W] per image, lowering the threshold from ``init_thresh``
-    in steps of ``step`` until something passes. An all-zero map gets one random cell so that
-    the window attention always has a window to work on.
+    Each box's Gaussian along one axis, sampled at the ``length`` pixel positions of the image:
+    ``exp(-d^2 / denom)`` at distance ``d`` from ``centre`` within ``radius``, 0 beyond, as
+    ``[..., length]``; and the sum of the same Gaussian over the full kernel ``[-radius, radius]``
+    (the kernel is normalized before it is clipped to the image), as ``[...]``. The sum runs over
+    offsets up to the largest kernel a box within the image can have (normalized sides at most 1),
+    in chunks, so that no box count has to be read back from the device.
     """
-    final_mask = torch.zeros_like(defe_feature, dtype=torch.bool)
-    for b in range(defe_feature.shape[0]):
-        single_feat = defe_feature[b : b + 1]
-        current_thresh = init_thresh
-        while current_thresh >= 0:
-            mask = single_feat > current_thresh
-            if mask.any():
-                final_mask[b : b + 1] = mask
-                break
-            current_thresh = round(current_thresh - step, 2)
-        else:
-            final_mask[
-                b, :, random.randint(0, single_feat.shape[2] - 1), random.randint(0, single_feat.shape[3] - 1)
-            ] = True
-            print(f"Batch {b}: No valid region found, use random point enhancement")
-    return final_mask
+    coords = torch.arange(length, device=centre.device, dtype=torch.float32)
+    d = coords - centre[..., None]
+    profile = torch.exp(-(d**2) / denom[..., None]) * (d.abs() <= radius[..., None])
+    reach = int(3 * sigma_ratio * length) + 2  # half of the widest kernel: 6 sigma + 2, sigma <= sigma_ratio * length
+    total = torch.zeros_like(denom)
+    for start in range(-reach, reach + 1, chunk):
+        offsets = torch.arange(start, min(start + chunk, reach + 1), device=centre.device, dtype=torch.float32)
+        total += (torch.exp(-(offsets**2) / denom[..., None]) * (offsets.abs() <= radius[..., None])).sum(-1)
+    return profile, total
+
+
+def render_density_maps(boxes, size, sigma_ratio=1.2):
+    """
+    The ground-truth density maps of a batch: one ``[B, 1, h, w]`` map (``size`` = (h, w)) for
+    ``boxes``, a list of ``[N_b, 4]`` normalized cxcywh boxes, on their device. Each map is the
+    sum of one normalized Gaussian per box, centred on the box (its centre and side lengths
+    truncated to whole pixels, sides at least 1) with sigma ``sigma_ratio`` times the side lengths
+    and a kernel of about 6 sigma clipped to the image, scaled to a maximum of 1 (left at 0 when
+    the image has no boxes).
+
+    Rendered for the whole batch at once: the Gaussians are separable, so a map is a matrix
+    product of the boxes' profiles along y and along x. The profiles multiply where the original
+    per-box loop exponentiated the sum, so the values agree to float32 rounding, not bit for bit.
+    """
+    h, w = size
+    b = len(boxes)
+    device = boxes[0].device
+    lengths = torch.tensor([len(x) for x in boxes])
+    if int(lengths.max()) == 0:
+        return torch.zeros((b, 1, h, w), device=device)
+    padded = torch.nn.utils.rnn.pad_sequence(boxes, batch_first=True)  # [B, M, 4]
+    valid = (torch.arange(padded.shape[1])[None, :] < lengths[:, None]).to(device, non_blocking=True)
+
+    # the truncations of the original loop: int(centre * W), max(int(side * W), 1)
+    cx, cy = (padded[..., 0] * w).trunc(), (padded[..., 1] * h).trunc()
+    w_px, h_px = (padded[..., 2] * w).trunc().clamp(min=1), (padded[..., 3] * h).trunc().clamp(min=1)
+    rx, denom_x = _kernel_sizes(w_px, sigma_ratio)
+    ry, denom_y = _kernel_sizes(h_px, sigma_ratio)
+    gx, sum_x = _axis_profiles(cx, rx, denom_x, w, sigma_ratio)  # [B, M, w], [B, M]
+    gy, sum_y = _axis_profiles(cy, ry, denom_y, h, sigma_ratio)  # [B, M, h], [B, M]
+    gx = gx * (valid / (sum_x * sum_y))[..., None]  # the kernel's normalization, padding zeroed
+    heatmaps = torch.bmm(gy.transpose(1, 2), gx)  # [B, h, w]
+    peak = heatmaps.amax((1, 2), keepdim=True)
+    heatmaps = torch.where(peak > 0, heatmaps / peak, heatmaps)
+    return heatmaps[:, None]
+
+
+_FILTER_THRESHOLDS = (0.05, 0.04, 0.03, 0.02, 0.01, 0.0)
+
+
+def adaptive_defe_filter(defe_feature, thresholds=_FILTER_THRESHOLDS):
+    """
+    Binarize a density map ``[B, 1, H, W]`` per image at the first of ``thresholds`` (descending)
+    that some cell of the image exceeds. An image with no cell above 0 gets one random cell so
+    that the window attention always has a window to work on. No host sync: the thresholds are
+    picked on the device.
+    """
+    b, _, h, w = defe_feature.shape
+    levels = torch.tensor(thresholds, dtype=defe_feature.dtype, device=defe_feature.device)
+    peak = defe_feature.amax((1, 2, 3))  # [B]
+    above = peak[:, None] > levels[None, :]  # [B, T], monotone along T
+    chosen = levels[above.int().argmax(1)]  # the first threshold the peak exceeds (any, if none)
+    mask = defe_feature > chosen[:, None, None, None]
+    # the fallback: images whose map is all 0 get one random cell
+    fallback = ~above.any(1)
+    rows = torch.randint(h, (b,), device=defe_feature.device)
+    cols = torch.randint(w, (b,), device=defe_feature.device)
+    point = torch.zeros_like(mask)
+    point[torch.arange(b, device=mask.device), 0, rows, cols] = True
+    return torch.where(fallback[:, None, None, None], point, mask)
