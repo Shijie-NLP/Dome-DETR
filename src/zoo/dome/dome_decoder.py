@@ -16,7 +16,7 @@ import torch.nn.functional as F  # noqa: N812
 from ...core import register
 from ...misc.box_ops import box_cxcywh_to_xyxy
 from .dfine_decoder import DecoderInput, DFINETransformer
-from .dynamic_nms import dynamic_nms
+from .dynamic_nms import dynamic_nms_batch
 
 __all__ = ["DomeTransformer"]
 
@@ -110,26 +110,32 @@ class DomeTransformer(DFINETransformer):
         row = (cy * n_rows).long().clamp(0, n_rows - 1)
         return window_mask[torch.arange(b, device=anchors_unact.device).view(-1, 1), row, col]
 
-    def _density_nms(self, boxes_cxcywh, logits, density_map):
+    def _density_nms(self, boxes_cxcywh, logits, density_map, valid):
         """
-        Class-wise NMS over one image's candidate boxes (normalized cxcywh) with an IoU threshold
-        that rises from ``nms_iou_low`` to ``nms_iou_high`` with the density under each box's
-        centre (``density_map`` is ``[1, h, w]``). Returns the indices to keep.
+        Class-wise NMS over the batch's candidate boxes ``[B, N, 4]`` (normalized cxcywh; only
+        the ``valid`` ones take part) with an IoU threshold that rises from ``nms_iou_low`` to
+        ``nms_iou_high`` with the density under each box's centre (``density_map`` is
+        ``[B, 1, h, w]``). Returns the ``[B, N]`` mask of the boxes to keep.
         """
-        cx, cy = boxes_cxcywh[:, 0], boxes_cxcywh[:, 1]
-        h, w = density_map.shape[1:]
+        b = boxes_cxcywh.shape[0]
+        cx, cy = boxes_cxcywh[..., 0], boxes_cxcywh[..., 1]
+        h, w = density_map.shape[2:]
         row = (cy * (h - 1)).long().clamp(0, h - 1)
         col = (cx * (w - 1)).long().clamp(0, w - 1)
-        density = density_map[:, row, col].squeeze(0).detach()
+        density = density_map[torch.arange(b, device=row.device)[:, None], 0, row, col].detach()
         iou_thresholds = self.nms_iou_low + (self.nms_iou_high - self.nms_iou_low) * density
-        scores, class_ids = logits.max(dim=1)
-        return dynamic_nms(box_cxcywh_to_xyxy(boxes_cxcywh), scores, class_ids, iou_thresholds)
+        scores, class_ids = logits.max(dim=-1)
+        return dynamic_nms_batch(box_cxcywh_to_xyxy(boxes_cxcywh), scores, class_ids, iou_thresholds, valid)
 
     def _get_decoder_input(self, memory, spatial_shapes, encoder_out, targets=None):
         """
         PAQI. Returns the initial query contents and boxes (as logits, both detached and padded
         to the largest query count in the batch), the encoder-side predictions for the auxiliary
         loss, and the real query count of every image.
+
+        The whole batch goes through the window filter, the NMS and the padding together: the
+        one host round trip is the NMS's (its sequential pass runs on the host), and the query
+        counts come back with it.
         """
         defe = encoder_out.get("defe")
         if defe is None or "defe_window_mask" not in defe:
@@ -151,36 +157,31 @@ class DomeTransformer(DFINETransformer):
         topk_memory, topk_logits, topk_anchors = self._select_topk(
             output_memory, enc_outputs_logits, anchors, self.max_num_select
         )
-        b = topk_anchors.size(0)
+        b, n = topk_anchors.shape[:2]
         min_num = self.min_num_select
+        device = memory.device
 
-        # the core queries are kept as they are; the rest must sit in a populated window
-        selected_mask = self._in_marked_windows(topk_anchors[:, min_num:], defe_window_mask)
+        # the core queries are kept as they are; the rest must sit in a populated window, and
+        # among those the NMS decides (the core queries take part as suppressors, never suppressed)
+        core = torch.arange(n, device=device)[None, :] < min_num  # [1, N]
+        candidate = torch.cat(
+            [core.expand(b, -1)[:, :min_num], self._in_marked_windows(topk_anchors[:, min_num:], defe_window_mask)], 1
+        )
+        bbox_unact = self.enc_bbox_head(topk_memory) + topk_anchors
+        kept = self._density_nms(F.sigmoid(bbox_unact), topk_logits, defe_feature, candidate)
+        selected = core | (candidate & kept)  # [B, N]
 
-        per_image = []  # (memory, logits, bbox_unact) per image, after window filtering and NMS
-        for i in range(b):
-            keep = torch.cat([torch.ones(min_num, dtype=torch.bool, device=memory.device), selected_mask[i]])
-            mem = topk_memory[i][keep]
-            logits = topk_logits[i][keep]
-            bbox_unact = self.enc_bbox_head(mem) + topk_anchors[i][keep]
-
-            if logits.size(0) > 0:
-                keep_idx = self._density_nms(F.sigmoid(bbox_unact), logits, defe_feature[i])
-                # the core queries are never suppressed
-                keep_idx = torch.cat([torch.arange(min_num, device=keep_idx.device), keep_idx[keep_idx >= min_num]])
-                mem, logits, bbox_unact = mem[keep_idx], logits[keep_idx], bbox_unact[keep_idx]
-            per_image.append((mem, logits, bbox_unact))
-
-        batch_queries_num = [mem.size(0) for mem, _, _ in per_image]
+        # every image's selected queries first, in their top-k order, padded to the largest count
+        batch_queries_num = selected.sum(1).tolist()
         max_total = max(batch_queries_num)
-        padded_memory = torch.zeros((b, max_total, topk_memory.size(-1)), device=memory.device)
-        padded_logits = torch.zeros((b, max_total, topk_logits.size(-1)), device=memory.device)
-        padded_bbox_unact = torch.zeros((b, max_total, 4), device=memory.device)
-        for i, (mem, logits, bbox_unact) in enumerate(per_image):
-            n = batch_queries_num[i]
-            padded_memory[i, :n] = mem
-            padded_logits[i, :n] = logits
-            padded_bbox_unact[i, :n] = bbox_unact
+        order = torch.sort((~selected).to(torch.int8), dim=1, stable=True).indices[:, :max_total]
+        real = torch.arange(max_total, device=device)[None, :] < torch.tensor(batch_queries_num, device=device)[:, None]
+
+        def take(x):
+            x = x.gather(1, order[..., None].expand(-1, -1, x.shape[-1])).float()
+            return x.masked_fill(~real[..., None], 0.0)
+
+        padded_memory, padded_logits, padded_bbox_unact = take(topk_memory), take(topk_logits), take(bbox_unact)
 
         # the criterion masks the padded entries with batch_queries_num
         enc_topk_bboxes_list = [F.sigmoid(padded_bbox_unact)]
