@@ -56,14 +56,11 @@ def get_contrastive_denoising_training_group(
 
     num_group = max(num_denoising // max_gt_num, 1)
 
-    input_query_class = torch.full([bs, max_gt_num], num_classes, dtype=torch.int32, device=device)
-    input_query_bbox = torch.zeros([bs, max_gt_num, 4], device=device)
-    pad_gt_mask = torch.zeros([bs, max_gt_num], dtype=torch.bool, device=device)
-    for i, num_gt in enumerate(num_gts):
-        if num_gt > 0:
-            input_query_class[i, :num_gt] = targets[i]["labels"]
-            input_query_bbox[i, :num_gt] = targets[i]["boxes"]
-            pad_gt_mask[i, :num_gt] = 1
+    # the ground truths padded to the largest count (no syncs: the counts are host values)
+    pad = torch.nn.utils.rnn.pad_sequence
+    input_query_class = pad([t["labels"] for t in targets], batch_first=True, padding_value=num_classes).to(torch.int32)
+    input_query_bbox = pad([t["boxes"] for t in targets], batch_first=True)
+    pad_gt_mask = (torch.arange(max_gt_num)[None, :] < torch.tensor(num_gts)[:, None]).to(device, non_blocking=True)
 
     # each group has positive and negative queries
     input_query_class = input_query_class.tile([1, 2 * num_group])
@@ -72,9 +69,12 @@ def get_contrastive_denoising_training_group(
     negative_gt_mask = torch.zeros([bs, max_gt_num * 2, 1], device=device)
     negative_gt_mask[:, max_gt_num:] = 1
     negative_gt_mask = negative_gt_mask.tile([1, num_group, 1])
-    positive_gt_mask = (1 - negative_gt_mask).squeeze(-1) * pad_gt_mask
-    dn_positive_idx = torch.nonzero(positive_gt_mask)[:, 1]
-    dn_positive_idx = torch.split(dn_positive_idx, [n * num_group for n in num_gts])
+    # the positive query of every ground truth in every group, per image: group after group,
+    # ground truths in order (what nonzero over the positive mask listed)
+    positions = torch.arange(num_group, device=device)[:, None] * (2 * max_gt_num) + torch.arange(
+        max_gt_num, device=device
+    )
+    dn_positive_idx = tuple(positions[:, :n].reshape(-1) for n in num_gts)
     num_denoising = int(max_gt_num * 2 * num_group)  # total denoising queries
 
     if label_noise_ratio > 0:
@@ -98,24 +98,18 @@ def get_contrastive_denoising_training_group(
     input_query_logits = class_embed(input_query_class)
 
     tgt_size = num_denoising + num_queries
-    base_attn_mask = torch.full((tgt_size, tgt_size), False, device=device)
-    base_attn_mask[num_denoising:, :num_denoising] = True  # matching queries cannot see the denoising ones
-    for i in range(num_group):  # groups cannot see each other
-        group_start = max_gt_num * 2 * i
-        group_end = max_gt_num * 2 * (i + 1)
-        if i < num_group - 1:
-            base_attn_mask[group_start:group_end, group_end:num_denoising] = True
-        if i > 0:
-            base_attn_mask[group_start:group_end, :group_start] = True
-
-    attn_mask = base_attn_mask[None, None].repeat(bs, 1, 1, 1)  # [bs, 1, T, T]
+    # a denoising query is seen only by the queries of its own group: not by the matching
+    # queries, not by the other groups
+    position = torch.arange(tgt_size, device=device)
+    group = torch.where(position < num_denoising, position // (2 * max_gt_num), -1)
+    attn_mask = (position[None, :] < num_denoising) & (group[:, None] != group[None, :])
+    attn_mask = attn_mask[None, None].expand(bs, 1, -1, -1)  # [bs, 1, T, T]
 
     if batch_queries_num is not None:
-        for b, valid_queries in enumerate(batch_queries_num):
-            padding_start = num_denoising + valid_queries
-            if padding_start < tgt_size:
-                attn_mask[b, 0, :padding_start, padding_start:] = True  # real queries do not see padding
-                attn_mask[b, 0, padding_start:, :padding_start] = True  # padding does not see real queries
+        # real queries and padding do not see one another (padding still sees itself)
+        counts = torch.tensor(batch_queries_num).to(device, non_blocking=True)
+        real = position[None, :] < num_denoising + counts[:, None]  # [bs, T]
+        attn_mask = attn_mask | (real[:, None, :, None] != real[:, None, None, :])
 
     dn_meta = {
         "dn_positive_idx": dn_positive_idx,
