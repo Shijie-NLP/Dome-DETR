@@ -1,8 +1,8 @@
 """
 How the decoder refines its boxes layer by layer (D-FINE's Fine-grained Distribution
 Refinement, FDR). A trained model is run on validation images with every decoder layer's
-output captured, and each ground-truth object is followed through the stages of its best
-query: the encoder proposal, the first layer's plain box (the anchor of every distribution),
+output captured, and each ground-truth object is followed through the stages of its detection,
+the highest-scoring query whose final box reaches the IoU threshold with it: the encoder proposal, the first layer's plain box (the anchor of every distribution),
 then the FDR box of each layer, whose four edges are expectations of a distribution over the
 ``reg_max + 1`` bins of W(n).
 
@@ -171,12 +171,18 @@ class Sample:
         self.probs = self.out["corners"][0].softmax(-1)  # [L, Q, 4, bins]
 
     def match(self, iou_threshold):
-        """Per ground-truth box the query whose final box overlaps it most: (gt index, query, IoU) above the threshold."""
+        """
+        Per ground-truth box its detection: of the queries whose final box reaches ``iou_threshold``
+        with it, the one with the highest score, as (gt index, query, IoU). The best-overlapping
+        query is often a suppressed duplicate (one-to-one matching trains it as background), so
+        the score picks the query the postprocessor would keep. Boxes without such a query are left out.
+        """
         if len(self.gt) == 0:
             return []
         iou, _ = box_iou(self.gt, self.boxes[-1])  # [G, Q]
-        best, query = iou.max(1)
-        return [(g, int(query[g]), float(best[g])) for g in range(len(self.gt)) if best[g] >= iou_threshold]
+        scores = self.scores[-1][None].expand_as(iou)
+        best, query = torch.where(iou >= iou_threshold, scores, -1.0).max(1)
+        return [(g, int(query[g]), float(iou[g, query[g]])) for g in range(len(self.gt)) if best[g] >= 0]
 
     def gt_size(self, g):
         """Square-root area of ground-truth box ``g`` in original-image pixels."""
@@ -468,7 +474,10 @@ def main():
         "--num-images", type=int, default=50, help="images sampled for the trend statistics (default 50, 0 to skip)"
     )
     parser.add_argument(
-        "--match-iou", type=float, default=0.5, help="final IoU a query needs to count as an object's (default 0.5)"
+        "--match-iou",
+        type=float,
+        default=0.5,
+        help="final IoU a query needs to be a candidate for an object; the highest-scoring one is taken (default 0.5)",
     )
     parser.add_argument(
         "--score", type=float, default=0.3, help="score threshold of the detections drawn on image.png (default 0.3)"
@@ -528,7 +537,7 @@ def main():
             text = (
                 f"# FDR refinement of `{os.path.relpath(checkpoint).replace(os.sep, '/')}`\n\n"
                 f"{len(records)} ground-truth objects of {len(indices)} validation images, each followed through the query whose "
-                f"final box overlaps it most (IoU >= {args.match_iou}). Stages: the encoder proposal, the first layer's plain box "
+                f"final box reaches IoU {args.match_iou} with it and scores highest. Stages: the encoder proposal, the first layer's plain box "
                 f"(the anchor of the distributions), then the FDR box of every layer. Sizes are square-root areas in original pixels.\n\n"
                 f"![trend](trend.png)\n\n" + trend_table(records, stages)
             )

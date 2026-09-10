@@ -87,7 +87,8 @@ python tools/analysis/run_report.py outputs/*/*      # every run, one report eac
 
 How a trained decoder refines its boxes layer by layer (D-FINE's Fine-grained Distribution
 Refinement). The checkpoint of a run is run on validation images with every decoder layer
-captured, and each ground-truth object is followed through its best query's stages: the
+captured, and each ground-truth object is followed through the stages of its detection (the
+highest-scoring query whose final box reaches `--match-iou` with it): the
 encoder proposal, the first layer's plain box (the anchor of the distributions), then the FDR
 box of every layer, whose four edges are expectations over the `reg_max + 1` bins of W(n).
 Written to `<run>/fdr/`: `object_<k>.png` (one object: the stages' boxes on a crop and the edge
@@ -103,4 +104,4 @@ python tools/analysis/fdr_refinement.py <run> --checkpoint best_stg1.pth --num-i
 
 `--checkpoint` defaults to `best_stg2.pth`, then `best_stg1.pth`, then `last.pth`; `--image` is a
 row index or a unique part of the image id; `--match-iou` (default 0.5) is the final IoU a query
-needs to count as an object's.
+needs to be a candidate for an object; the highest-scoring candidate is taken.
