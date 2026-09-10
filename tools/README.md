@@ -64,3 +64,21 @@ positive, about half the VisDrone rate. The dense tail behaves like VisDrone and
 201-500 boxes the two datasets match (8.8% vs 10.3%), and the 29 images above 500 boxes reach
 16.6%, with six negatives in ten closer to another GT than to their own source. The effect is a
 function of crowding, not of object size.
+
+## analysis/run_report.py
+
+One report per training run, written into the run's own output directory: `RESULTS.md` and
+`curves.png`. It reads what `train.py` leaves there (`config.yml`, the per-epoch `log.txt`,
+`console.log`, the checkpoints and the COCOeval dumps under `eval/`) and answers the questions
+one asks of a finished or half-finished run: how it was set up, whether it finished, the best
+and last AP with every evaluator entry, which epoch each `.pth` holds, the stage-2 reloads,
+AP/loss/learning-rate/epoch-time curves, per-class AP over the periodic `eval/` snapshots, and
+the warnings the console caught.
+
+```
+python tools/analysis/run_report.py outputs/dfine_s_visdrone/2026-09-09_17-13-58
+python tools/analysis/run_report.py outputs/*/*      # every run, one report each
+```
+
+`--every N` sets the epoch spacing of the progress table (default 10); `--no-figure` and
+`--no-per-class` skip the plot and the `eval/` reading (the only part that needs torch).
