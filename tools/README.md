@@ -82,3 +82,25 @@ python tools/analysis/run_report.py outputs/*/*      # every run, one report eac
 
 `--every N` sets the epoch spacing of the progress table (default 10); `--no-figure` and
 `--no-per-class` skip the plot and the `eval/` reading (the only part that needs torch).
+
+## analysis/fdr_refinement.py
+
+How a trained decoder refines its boxes layer by layer (D-FINE's Fine-grained Distribution
+Refinement). The checkpoint of a run is run on validation images with every decoder layer
+captured, and each ground-truth object is followed through its best query's stages: the
+encoder proposal, the first layer's plain box (the anchor of the distributions), then the FDR
+box of every layer, whose four edges are expectations over the `reg_max + 1` bins of W(n).
+Written to `<run>/fdr/`: `object_<k>.png` (one object: the stages' boxes on a crop and the edge
+distributions of every layer), `image.png` (where those objects are), and `trend.png` /
+`trend.md` (over a sample of images, per object size: IoU, edge movement, distribution
+sharpness and score per stage).
+
+```
+python tools/analysis/fdr_refinement.py outputs/dfine_s_visdrone/2026-09-09_17-13-58
+python tools/analysis/fdr_refinement.py <run> --image 0000001_02999_d_0000005 --objects 8 --num-images 100
+python tools/analysis/fdr_refinement.py <run> --checkpoint best_stg1.pth --num-images 0
+```
+
+`--checkpoint` defaults to `best_stg2.pth`, then `best_stg1.pth`, then `last.pth`; `--image` is a
+row index or a unique part of the image id; `--match-iou` (default 0.5) is the final IoU a query
+needs to count as an object's.
