@@ -271,10 +271,13 @@ class DFINETransformer(nn.Module):
         query_budget: how many encoder tokens become queries. ``fixed``: ``num_queries`` for
             every image (D-FINE). ``bucket``: a small counting head (``CountHead``, on encoder
             level ``count_level``) predicts a distribution over buckets of the image's object
-            count, ``count_bucket`` wide (0 .. 100, 100 .. 200, ..., the last open); bucket ``b``
-            is worth ``count_base + b * count_bucket`` queries, and the image gets the budget of
-            the bucket where the predicted distribution first reaches ``count_quantile`` (an
-            unsure head rounds up), within ``min_queries`` .. ``max_queries``. In training the
+            count, the buckets cut at ``count_edges`` (``[100, 200, 300, 600]``: 0 .. 100, 100 ..
+            200, 200 .. 300, 300 .. 600 and 600 and above, the last open) and worth
+            ``count_budgets`` queries each (one more entry than the edges); the image gets the
+            budget of the bucket where the predicted distribution first reaches
+            ``count_quantile`` (an unsure head rounds up). Wide buckets where images are rare
+            (a few dozen AI-TOD tiles hold over 600 objects) keep every bucket learnable. In
+            training the
             budget comes from the ground-truth count's bucket (``count_train_budget`` ``gt``: the
             head trains alongside on ``loss_count`` and only decides at inference; ``max``: the
             larger of the head's and the ground truth's, so the decoder also sees the budgets the
@@ -323,11 +326,9 @@ class DFINETransformer(nn.Module):
         fine_channels=0,
         null_point=False,
         query_budget="fixed",
-        min_queries=300,
-        max_queries=1500,
         count_level=2,
-        count_bucket=100,
-        count_base=300,
+        count_edges=(100, 200, 300, 600),
+        count_budgets=(300, 400, 500, 800, 1500),
         count_quantile=0.9,
         count_train_budget="gt",
     ):
@@ -359,16 +360,17 @@ class DFINETransformer(nn.Module):
         self.reg_max = reg_max
         self.num_queries = num_queries
         self.query_budget = query_budget
-        self.min_queries = min_queries
-        self.max_queries = max_queries
         self.count_level = count_level
-        self.count_bucket = count_bucket
-        self.count_base = count_base
+        self.count_edges = list(count_edges)
+        self.count_budgets = list(count_budgets)
         self.count_quantile = count_quantile
         self.count_train_budget = count_train_budget
         if query_budget == "bucket":
-            assert count_base <= max_queries and count_bucket > 0
-            self.num_count_buckets = (max_queries - count_base) // count_bucket + 1
+            assert len(self.count_budgets) == len(self.count_edges) + 1, "one budget per bucket: the edges cut one more"
+            assert self.count_edges == sorted(self.count_edges) and all(e > 0 for e in self.count_edges), count_edges
+            self.num_count_buckets = len(self.count_budgets)
+            self.register_buffer("count_edges_t", torch.tensor(self.count_edges), persistent=False)
+            self.register_buffer("count_budgets_t", torch.tensor(self.count_budgets), persistent=False)
             self.count_head = CountHead(feat_channels[count_level], self.num_count_buckets)
         self.cross_attn_method = cross_attn_method
         self.query_select_method = query_select_method
@@ -569,16 +571,15 @@ class DFINETransformer(nn.Module):
         Per image, the number of queries under ``query_budget='bucket'``: the budget of the bucket
         where the predicted count distribution reaches ``count_quantile``; in training the
         ground-truth count's bucket's (``count_train_budget`` ``gt``) or the larger of the two
-        (``max``); within ``min_queries`` .. ``max_queries``. On the host.
+        (``max``). On the host.
         """
         cdf = count_logits.float().softmax(-1).cumsum(-1)
         bucket = (cdf >= self.count_quantile - 1e-6).int().argmax(-1)  # the first bucket reaching the quantile
         if self.training and targets is not None:
             gt = torch.tensor([len(t["labels"]) for t in targets], device=bucket.device)
-            gt_bucket = (gt // self.count_bucket).clamp(max=self.num_count_buckets - 1)
+            gt_bucket = torch.bucketize(gt, self.count_edges_t, right=True)  # edges [100, ...]: 100 falls in bucket 1
             bucket = gt_bucket if self.count_train_budget == "gt" else torch.maximum(bucket, gt_bucket)
-        budget = self.count_base + bucket * self.count_bucket
-        return budget.clamp(self.min_queries, self.max_queries).tolist()
+        return self.count_budgets_t[bucket].tolist()
 
     def _get_decoder_input(self, memory, spatial_shapes, encoder_out, targets=None):
         """
@@ -612,7 +613,7 @@ class DFINETransformer(nn.Module):
             batch_queries_num = self._bucket_budgets(count_logits, targets)
             if self.training:
                 extra["count_logits"] = count_logits
-                extra["count_meta"] = {"bucket": self.count_bucket, "num_buckets": self.num_count_buckets}
+                extra["count_meta"] = {"edges": self.count_edges_t, "num_buckets": self.num_count_buckets}
         batch_queries_num = [
             min(n, enc_outputs_logits.shape[1]) for n in batch_queries_num
         ]  # never more than the tokens

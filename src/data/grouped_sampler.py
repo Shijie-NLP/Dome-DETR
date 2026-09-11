@@ -8,6 +8,7 @@ by the bucket of their count the padding is gone, and the budget of a batch is t
 of its images.
 """
 
+import bisect
 import math
 
 import torch
@@ -28,10 +29,9 @@ def object_counts(dataset) -> list[int]:
 @register()
 class GroupedBatchSampler(Sampler):
     """
-    Yields batches of indices whose images fall in the same count bucket: bucket ``count //
-    width``, counts of ``last`` and above in one bucket (the decoder's open last bucket; keep
-    ``width`` and ``last`` equal to its ``count_bucket`` and ``count_bucket * (buckets - 1)``).
-    Every epoch (``set_epoch``) the images of each bucket are shuffled and cut into batches, the
+    Yields batches of indices whose images fall in the same count bucket, the buckets cut at
+    ``edges`` (``[100, 200, 300, 600]``: 0 .. 100, ..., 600 and above; keep them equal to the
+    decoder's ``count_edges`` so a batch shares one budget). Every epoch (``set_epoch``) the images of each bucket are shuffled and cut into batches, the
     batches of every bucket then shuffled together; the images a bucket has left over are
     pooled, sorted by bucket and batched among themselves (the only batches that mix
     neighbouring buckets), the last of those dropped when ``drop_last`` or incomplete under
@@ -39,9 +39,9 @@ class GroupedBatchSampler(Sampler):
     rank, every rank the same number of batches.
     """
 
-    def __init__(self, dataset, batch_size, width=100, last=1200, shuffle=True, drop_last=False, seed=0):
-        counts = object_counts(dataset)
-        self.groups = [min(c // width, last // width) for c in counts]
+    def __init__(self, dataset, batch_size, edges=(100, 200, 300, 600), shuffle=True, drop_last=False, seed=0):
+        edges = sorted(edges)
+        self.groups = [bisect.bisect_right(edges, c) for c in object_counts(dataset)]
         self.batch_size = batch_size
         self.shuffle = shuffle
         self.drop_last = drop_last

@@ -184,7 +184,7 @@ class YAMLConfig(BaseConfig):
     def build_dataloader(self, name: str):
         """
         The loader of ``name``. ``group_by_count`` in its yaml (``True``, or the arguments of
-        ``GroupedBatchSampler``: ``width``, ``last``, ``drop_last``) batches images of similar
+        ``GroupedBatchSampler``: ``edges``, ``drop_last``) batches images of similar
         object counts, so a per-image query budget pads nothing; the sampler handles the ranks.
         """
         bs = self.get_rank_batch_size(self.yaml_cfg[name])

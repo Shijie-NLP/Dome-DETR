@@ -462,7 +462,7 @@ class DomeCriterion(nn.Module):
     def loss_count(self, logits, meta, num_gt):
         """Cross-entropy of the counting head against each image's ground-truth count bucket, smoothed to its neighbours."""
         n = meta["num_buckets"]
-        bucket = (torch.tensor(num_gt, device=logits.device) // meta["bucket"]).clamp(max=n - 1)
+        bucket = torch.bucketize(torch.tensor(num_gt, device=logits.device), meta["edges"], right=True)
         logits = logits.float()
         if self.count_logit_adjust > 0:
             if self.count_hist is None or self.count_hist.numel() != n:
