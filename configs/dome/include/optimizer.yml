@@ -10,6 +10,9 @@ clip_max_norm: 0.1
 
 optimizer:
   type: AdamW
+  # one kernel per parameter group instead of a dozen foreach passes: 13 ms a step at the S
+  # scale on a 5090, with the same update (fused AdamW needs the parameters on the GPU)
+  fused: True
   # parameter groups by regex over the parameter names; what no group matches gets the
   # top-level settings. The backbone trains at a lower rate; norm layers get no weight decay.
   params:
