@@ -177,6 +177,29 @@ class TransformerDecoder(nn.Module):
         )
 
 
+class CountHead(nn.Module):
+    """
+    A distribution over buckets of an image's object count from one encoder level: a 1x1
+    reduction, two dilated 3x3 convolutions (a wide receptive field on a small map), global
+    average pooling and a linear layer. Under a hundred thousand parameters.
+    """
+
+    def __init__(self, in_channels, num_buckets, hidden=64):
+        super().__init__()
+        self.convs = nn.Sequential(
+            nn.Conv2d(in_channels, hidden, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden, hidden, 3, padding=2, dilation=2),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden, hidden, 3, padding=4, dilation=4),
+            nn.ReLU(inplace=True),
+        )
+        self.fc = nn.Linear(hidden, num_buckets)
+
+    def forward(self, feat):
+        return self.fc(self.convs(feat).mean((2, 3)))
+
+
 class DecoderInput(NamedTuple):
     """What ``_get_decoder_input`` hands the decoder (and, in training, the criterion)."""
 
@@ -240,6 +263,20 @@ class DFINETransformer(nn.Module):
         null_point: every cross-attention head gets a softmax entry that samples nothing and
             carries a learned vector instead (``MSDeformableAttention``), so a head with nothing
             useful at its points can abstain rather than return a full-magnitude mixture of them.
+        query_budget: how many encoder tokens become queries. ``fixed``: ``num_queries`` for
+            every image (D-FINE). ``bucket``: a small counting head (``CountHead``, on encoder
+            level ``count_level``) predicts a distribution over buckets of the image's object
+            count, ``count_bucket`` wide (0 .. 100, 100 .. 200, ..., the last open); bucket ``b``
+            is worth ``count_base + b * count_bucket`` queries, and the image gets the budget of
+            the bucket where the predicted distribution first reaches ``count_quantile`` (an
+            unsure head rounds up), within ``min_queries`` .. ``max_queries``. In training at
+            least the budget of the ground-truth count's bucket, so no ground truth is left
+            without a query for want of a budget while the decoder still sees the budgets the
+            head hands out. Classifying the count is stable where regressing it is not (DQ-DETR),
+            and the head's target is the count itself, so the budget does not drift with the
+            scores' calibration. The criterion trains the head (``loss_count``). The images of a
+            batch are padded to the largest budget; the padded queries are masked out of the
+            attention, the losses and the detections.
     """
 
     __share__ = ["num_classes", "eval_spatial_size"]
@@ -279,8 +316,16 @@ class DFINETransformer(nn.Module):
         anchor_cells=0,
         fine_channels=0,
         null_point=False,
+        query_budget="fixed",
+        min_queries=300,
+        max_queries=1500,
+        count_level=2,
+        count_bucket=100,
+        count_base=300,
+        count_quantile=0.9,
     ):
         super().__init__()
+        assert query_budget in ("fixed", "bucket"), query_budget
         assert len(feat_channels) <= num_levels
         assert anchor_grid_size > eps, f"anchor_grid_size {anchor_grid_size} must exceed eps {eps}"
         assert len(feat_strides) == len(feat_channels)
@@ -305,6 +350,17 @@ class DFINETransformer(nn.Module):
         self.aux_loss = aux_loss
         self.reg_max = reg_max
         self.num_queries = num_queries
+        self.query_budget = query_budget
+        self.min_queries = min_queries
+        self.max_queries = max_queries
+        self.count_level = count_level
+        self.count_bucket = count_bucket
+        self.count_base = count_base
+        self.count_quantile = count_quantile
+        if query_budget == "bucket":
+            assert count_base <= max_queries and count_bucket > 0
+            self.num_count_buckets = (max_queries - count_base) // count_bucket + 1
+            self.count_head = CountHead(feat_channels[count_level], self.num_count_buckets)
         self.cross_attn_method = cross_attn_method
         self.query_select_method = query_select_method
         self.local_attn_k = local_attn_k
@@ -499,37 +555,70 @@ class DFINETransformer(nn.Module):
 
         return gather(memory), gather(outputs_logits), gather(outputs_anchors_unact)
 
+    def _bucket_budgets(self, count_logits, targets):
+        """
+        Per image, the number of queries under ``query_budget='bucket'``: the budget of the bucket
+        where the predicted count distribution reaches ``count_quantile``, in training at least
+        the ground-truth count's bucket's, within ``min_queries`` .. ``max_queries``. On the host.
+        """
+        cdf = count_logits.float().softmax(-1).cumsum(-1)
+        bucket = (cdf >= self.count_quantile - 1e-6).int().argmax(-1)  # the first bucket reaching the quantile
+        if self.training and targets is not None:
+            gt = torch.tensor([len(t["labels"]) for t in targets], device=bucket.device)
+            bucket = torch.maximum(bucket, (gt // self.count_bucket).clamp(max=self.num_count_buckets - 1))
+        budget = self.count_base + bucket * self.count_bucket
+        return budget.clamp(self.min_queries, self.max_queries).tolist()
+
     def _get_decoder_input(self, memory, spatial_shapes, encoder_out, targets=None):
         """
-        The initial queries: the ``num_queries`` best encoder tokens. Returns their contents and
-        boxes (as logits, both detached), the encoder-side predictions for the auxiliary loss,
-        and the query count of every image (the same for all here), as a ``DecoderInput``. A
-        subclass with a per-image query count pads its queries to the largest and reports the real
-        counts; ``targets`` (training only) lets it choose queries by ground truth, and ``extra``
-        carries any further training outputs to the criterion.
+        The initial queries: the best encoder tokens, ``num_queries`` of them or the image's
+        budget (``query_budget``). Returns their contents and boxes (as logits, both detached,
+        padded to the largest count in the batch), the encoder-side predictions for the
+        auxiliary loss and the real query count of every image, as a ``DecoderInput``. A subclass may choose its
+        queries otherwise; ``targets`` (training only) may take part in the choice.
         """
         anchors, valid_mask = self._generate_anchors(spatial_shapes, device=memory.device)
-        if memory.shape[0] > 1:
-            anchors = anchors.repeat(memory.shape[0], 1, 1)
+        b = memory.shape[0]
+        if b > 1:
+            anchors = anchors.repeat(b, 1, 1)
         memory = valid_mask.to(memory.dtype) * memory
 
         output_memory: torch.Tensor = self.enc_output(memory)
         enc_outputs_logits: torch.Tensor = self.enc_score_head(output_memory)
 
-        topk_memory, topk_logits, topk_anchors = self._select_topk(
-            output_memory, enc_outputs_logits, anchors, self.num_queries
-        )
+        extra = {}
+        if self.query_budget == "fixed":
+            batch_queries_num = [self.num_queries] * b
+        else:
+            count_logits = self.count_head(encoder_out["feats"][self.count_level])  # [B, buckets]
+            batch_queries_num = self._bucket_budgets(count_logits, targets)
+            if self.training:
+                extra["count_logits"] = count_logits
+                extra["count_meta"] = {"bucket": self.count_bucket, "num_buckets": self.num_count_buckets}
+        batch_queries_num = [
+            min(n, enc_outputs_logits.shape[1]) for n in batch_queries_num
+        ]  # never more than the tokens
+        k = max(batch_queries_num)
+        topk_memory, topk_logits, topk_anchors = self._select_topk(output_memory, enc_outputs_logits, anchors, k)
         topk_bbox_unact = self.enc_bbox_head(topk_memory) + topk_anchors
+        if min(batch_queries_num) < k:
+            # the images with a smaller budget are padded: their surplus tokens are zeroed here and
+            # masked everywhere else by batch_queries_num
+            counts = torch.tensor(batch_queries_num, device=memory.device)
+            pad = (torch.arange(k, device=memory.device)[None, :] >= counts[:, None])[..., None]
+            topk_memory = topk_memory.masked_fill(pad, 0.0)
+            topk_logits = topk_logits.masked_fill(pad, 0.0)
+            topk_bbox_unact = topk_bbox_unact.masked_fill(pad, 0.0)
 
         enc_topk_bboxes_list = [F.sigmoid(topk_bbox_unact)]
         enc_topk_logits_list = [topk_logits]
-        batch_queries_num = [self.num_queries] * memory.shape[0]
         return DecoderInput(
             topk_memory.detach(),
             topk_bbox_unact.detach(),
             enc_topk_bboxes_list,
             enc_topk_logits_list,
             batch_queries_num,
+            extra,
         )
 
     # ------------------------------------------------------------------ forward

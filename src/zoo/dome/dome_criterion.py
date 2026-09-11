@@ -264,6 +264,10 @@ class DomeCriterion(nn.Module):
         enc_obj_pos_weight: ``balanced`` only: how much more the positive half weighs than the
             negative half; the boundary moves to a likelihood ratio of its inverse.
         rank_delta: the half-width of the Rank & Sort loss's smoothed step (0.5 in the paper).
+        count_smooth: the counting head's target (``count_logits`` from a decoder with
+            ``query_budget='bucket'``) is the ground-truth count's bucket, with this much of the
+            probability moved to each neighbouring bucket (ordinal smoothing: a bucket off is a
+            smaller error than ten off); cross-entropy, weighted by ``loss_count``.
     """
 
     __share__ = ["num_classes"]
@@ -297,8 +301,10 @@ class DomeCriterion(nn.Module):
         enc_obj_quality_weight=False,
         enc_obj_pos_weight=1.0,
         rank_delta=0.5,
+        count_smooth=0.1,
     ):
         super().__init__()
+        self.count_smooth = count_smooth
         self.rank_delta = rank_delta
         self.num_classes = num_classes
         self.matcher = matcher
@@ -444,6 +450,16 @@ class DomeCriterion(nn.Module):
             keep = stack.q_valid[:, :, None].expand_as(logits)
             logits, target = logits[keep], target[keep]
         return {"loss_rank": rank_sort_loss(logits.flatten(), target.flatten(), self.rank_delta)[None]}
+
+    def loss_count(self, logits, meta, num_gt):
+        """Cross-entropy of the counting head against each image's ground-truth count bucket, smoothed to its neighbours."""
+        n = meta["num_buckets"]
+        bucket = (torch.tensor(num_gt, device=logits.device) // meta["bucket"]).clamp(max=n - 1)
+        target = F.one_hot(bucket, n).float() * (1 - 2 * self.count_smooth)
+        target[:, 1:] += self.count_smooth * F.one_hot(bucket, n).float()[:, :-1]  # the bucket above
+        target[:, :-1] += self.count_smooth * F.one_hot(bucket, n).float()[:, 1:]  # the bucket below
+        target = target / target.sum(-1, keepdim=True)  # the edges keep their mass
+        return -(target * F.log_softmax(logits.float(), -1)).sum(-1).mean()
 
     def loss_obj(self, stack, pairs, num_boxes, targets, **kwargs):
         """
@@ -776,6 +792,11 @@ class DomeCriterion(nn.Module):
                 losses.update(self._stack_losses(enc_stack, enc_targets, enc_losses, *enc_args, fdr))
         else:
             losses.update(self._stack_losses(enc_stack, padded, enc_losses, *enc_args, fdr))
+
+        if "count_logits" in outputs and "loss_count" in self.weight_dict:
+            losses["loss_count"] = self.weight_dict["loss_count"] * self.loss_count(
+                outputs["count_logits"], outputs["count_meta"], padded.num_gt
+            )
 
         if "dn_outputs" in outputs:
             indices_dn = self.get_cdn_matched_indices(outputs["dn_meta"], targets)

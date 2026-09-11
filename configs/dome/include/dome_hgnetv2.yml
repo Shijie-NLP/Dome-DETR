@@ -79,7 +79,7 @@ DFINETransformer: &dfine_transformer
   query_select_method: default  # default, agnostic
 
 DomeCriterion:
-  weight_dict: {loss_vfl: 1, loss_bbox: 5, loss_giou: 2, loss_fgl: 0.15, loss_ddf: 1.5, loss_obj: 1, loss_rank: 1}
+  weight_dict: {loss_vfl: 1, loss_bbox: 5, loss_giou: 2, loss_fgl: 0.15, loss_ddf: 1.5, loss_obj: 1, loss_rank: 1, loss_count: 1}
   # 'rank' (the Rank & Sort loss on the last layer's scores) is implemented and off: add it here to train the ranking
   losses: ['vfl', 'boxes', 'local']
   alpha: 0.75
