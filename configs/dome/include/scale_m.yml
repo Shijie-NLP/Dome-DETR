@@ -1,0 +1,25 @@
+# The M scale: HGNetv2-B2, the encoder at two thirds of the depth and full expansion, four
+# decoder layers (D-FINE-M).
+
+HGNetv2:
+  name: 'B2'
+  return_idx: [0, 1, 2, 3]
+  freeze_at: -1
+  freeze_norm: False
+  use_lab: True
+
+HybridEncoder:
+  in_channels: [96, 384, 768, 1536]
+  depth_mult: .67
+  expansion: 1
+
+DomeHybridEncoder:
+  in_channels: [96, 384, 768, 1536]
+  depth_mult: .67
+  expansion: 1
+
+DFINETransformer:
+  num_layers: 4
+
+DomeTransformer:
+  num_layers: 4

@@ -1,63 +1,10 @@
 # D-FINE-S on VisDrone2019-DET with our method switched on: DFine-S-VisDrone as it is, plus the
-# five changes the 2026-09-11 probes led to. Each is one switch here, so the ablations
-# are this file with one of them reset to the baseline's value.
-#
-# 1. A stride-2 fine level for the decoder's cross-attention (values only): HGNetv2's stem
-#    returns its stride-2 map, the encoder adds the stride-4 level's semantics and two depthwise
-#    blocks at 64 channels, and every decoder layer samples it as its finest level. The query
-#    selection, anchors and losses stay on the four pyramid levels. On the baseline tiny objects'
-#    last-layer edges are still 1.2 px off while the FDR bins are 0.3 px wide: the queries lack
-#    the resolution, not the range. Cost on the 5090 in bf16: training at 4 x 800x800 from 87
-#    to about 105 ms a step and 4.65 to 6.0 GB peak (5.1 with checkpoint_fusion); inference at
-#    1344x800 from 22 to about 24 ms an image.
-# 2. min_sample_cells 1: the sampling radius is floored at one cell on every level. On the
-#    baseline a tiny box's four points per head fall within one cell on strides 8 to 32, the
-#    network stretches its raw offsets three-fold on stride 32 to compensate, and stride 32 is
-#    still worth 2 AP on tiny objects.
-# 3. enc_quality_source final: the encoder's VFL target is the IoU of the decoder's last layer's
-#    box of the matched query rather than of its own proposal. The encoder's score only picks
-#    the tokens worth refining, so it should say how well a token ends up localized (tiny
-#    proposals: IoU 0.49, after the decoder 0.70). The matching is unchanged.
-# 4. anchor_cells 10: the anchors are 10 cells of their level (40 px at stride 4), square in
-#    pixels whatever the input, instead of 0.05 of the image (67x40 px at 1333x800). On the
-#    square training crops this is the baseline exactly; at validation it is the difference
-#    between AP collapsing above the training extent and not: the baseline checkpoint scores
-#    35.3 / 31.9 / 22.5 at short sides 800 / 960 / 1120 with fraction anchors and 36.4 / 36.0 /
-#    33.3 with cell anchors, with no retraining.
-# 5. null_point: every cross-attention head gets a softmax entry that samples nothing and adds a
-#    learned vector instead, so a head whose points read nothing useful can abstain. On the
-#    baseline the weights are nearly flat over a head's points (2.7 to 3.7 effective of 4) while
-#    those points collapse into one cell for tiny objects: a full-magnitude mixture of the same
-#    background value that the output projection then has to cancel.
+# switches of include/ours.yml (the fine level, the sampling floor, the outcome-scored encoder,
+# cell anchors, the null entry). An ablation is this file with one of them reset.
 
 __include__: [
   './DFine-S-VisDrone.yml',
+  './include/ours.yml',
 ]
 
 output_dir: ./outputs/dfine_s_visdrone_ours
-
-# 1. the fine level
-HGNetv2:
-  return_stem: True
-
-HybridEncoder:
-  fine_in_channels: 32   # B0's stem: twice its middle width of 16
-  fine_dim: 64
-  fine_blocks: 2
-
-DFINETransformer:
-  fine_channels: 64
-  # sampling points per cross-attention level: the fine level (stride 2) first, then strides
-  # 4, 8, 16, 32
-  num_points: [4, 6, 4, 3, 3]
-  # 2. the sampling radius floor (0: the baseline)
-  min_sample_cells: 1
-  # 4. anchors in cells of their level (0: the baseline's fraction of the image)
-  anchor_cells: 10
-  # 5. the null entry of every cross-attention head (False: the baseline)
-  null_point: True
-
-DomeCriterion:
-  # 3. the encoder's quality target (own: the baseline)
-  enc_quality_source: final
-  dec_quality_source: own

@@ -1,0 +1,24 @@
+# The L scale: HGNetv2-B4, the encoder at full depth and expansion, six decoder layers (D-FINE-L).
+
+HGNetv2:
+  name: 'B4'
+  return_idx: [0, 1, 2, 3]
+  freeze_at: -1
+  freeze_norm: False
+  use_lab: True
+
+HybridEncoder:
+  in_channels: [128, 512, 1024, 2048]
+  depth_mult: 1
+  expansion: 1
+
+DomeHybridEncoder:
+  in_channels: [128, 512, 1024, 2048]
+  depth_mult: 1
+  expansion: 1
+
+DFINETransformer:
+  num_layers: 6
+
+DomeTransformer:
+  num_layers: 6

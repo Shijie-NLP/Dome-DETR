@@ -1,6 +1,6 @@
-# D-FINE-S baseline on VisDrone2019-DET: the Dome-S recipe on the plain HybridEncoder (no DeFE, no
-# MWAS) and the D-FINE decoder (a fixed num_queries per image instead of PAQI), everything else
-# unchanged (four-level pyramid, 800 px pipeline, schedule).
+# D-FINE-S baseline on VisDrone2019-DET: the plain HybridEncoder (no DeFE, no MWAS) and the D-FINE
+# decoder (a fixed num_queries per image instead of PAQI) at the S scale, on the shared 160-epoch
+# recipe. 500 queries: the evaluator keeps 500 detections per image.
 
 __include__: [
   '../dataset/visdrone_detection.yml',
@@ -8,6 +8,8 @@ __include__: [
   './include/dataloader.yml',
   './include/optimizer.yml',
   './include/dome_hgnetv2.yml',
+  './include/scale_s.yml',
+  './include/recipe_160.yml',
 ]
 
 output_dir: ./outputs/dfine_s_visdrone
@@ -16,54 +18,5 @@ DOME:
   encoder: HybridEncoder
   decoder: DFINETransformer
 
-HGNetv2:
-  name: 'B0'
-  return_idx: [0, 1, 2, 3]
-  freeze_at: -1
-  freeze_norm: False
-  use_lab: True
-
-HybridEncoder:
-  in_channels: [64, 256, 512, 1024]
-  depth_mult: .34
-  expansion: 0.5
-
 DFINETransformer:
-  num_layers: 3
   num_queries: 500
-
-
-optimizer:
-  type: AdamW
-  params:
-    -
-      params: '^(?=.*backbone)(?!.*(?:norm|bn)).*$'
-      lr: 0.00002
-    -
-      params: '^(?=.*backbone)(?=.*(?:norm|bn)).*$'
-      lr: 0.00002
-      weight_decay: 0.
-    -
-      params: '^(?=.*(?:encoder|decoder))(?=.*(?:norm|bn|bias)).*$'
-      weight_decay: 0.
-
-  lr: 0.0002
-  betas: [0.9, 0.999]
-  weight_decay: 0.000065
-
-lr_scheduler:
-  type: MultiStepLR
-  milestones: [80, 120]
-  gamma: 0.8
-
-
-# 160 epochs; augmentation and multi-scale training stop at 150 and the last 10 epochs
-# train on clean images
-epoches: 160
-train_dataloader:
-  dataset:
-    transforms:
-      policy:
-        epoch: 150
-  collate_fn:
-    stop_epoch: 150

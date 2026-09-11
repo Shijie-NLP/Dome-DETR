@@ -1,0 +1,26 @@
+# The S scale: HGNetv2-B0, the encoder at a third of the depth and half the expansion, three
+# decoder layers (D-FINE-S). A model config includes one scale file and sets what depends on the
+# dataset (queries, schedule).
+
+HGNetv2:
+  name: 'B0'
+  return_idx: [0, 1, 2, 3]
+  freeze_at: -1
+  freeze_norm: False
+  use_lab: True
+
+HybridEncoder:
+  in_channels: [64, 256, 512, 1024]
+  depth_mult: .34
+  expansion: 0.5
+
+DomeHybridEncoder:
+  in_channels: [64, 256, 512, 1024]
+  depth_mult: .34
+  expansion: 0.5
+
+DFINETransformer:
+  num_layers: 3
+
+DomeTransformer:
+  num_layers: 3
