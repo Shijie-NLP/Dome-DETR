@@ -205,26 +205,30 @@ class HungarianMatcher(nn.Module):
         """
         The matching of several prediction sets (each as in ``forward``, all with the same number
         of queries) against the same padded targets in one go: the costs are computed on the
-        device a set at a time over the whole batch, the real sub-matrices reach the host in one
-        copy, the assignments run in parallel threads and the indices go back in one copy.
-        Returns the matches, flat and sorted by set and image, and the pairs per set and image.
-        One host sync (the index of the real entries) besides the copy.
+        device in one call over every set and image (the sets stacked along the batch), the real
+        sub-matrices reach the host in one copy, the assignments run in parallel threads and the
+        indices go back in one copy. Returns the matches, flat and sorted by set and image, and
+        the pairs per set and image. One host sync (the index of the real entries) besides the copy.
         """
         device = outputs_list[0]["pred_logits"].device
-        q = outputs_list[0]["pred_logits"].shape[1]
+        b, q = outputs_list[0]["pred_logits"].shape[:2]
+        m = padded.boxes.shape[1]
+        s = len(outputs_list)
+        assert all(o["pred_logits"].shape[1] == q for o in outputs_list), "every set has the queries of the first"
         real = (padded.q_valid[:, :, None] & padded.gt_valid[:, None, :]).flatten().nonzero().squeeze(1)  # [K]
-        costs = []
-        for outputs in outputs_list:
-            assert outputs["pred_logits"].shape[1] == q, "every set has the queries of the first"
-            cost = self._cost(outputs["pred_logits"], outputs["pred_boxes"], padded.labels, padded.boxes)
-            costs.append(cost.flatten()[real])  # image by image, each row-major: the sub-matrices back to back
+        logits = torch.cat([o["pred_logits"] for o in outputs_list])  # [S * B, Q, C]
+        boxes = torch.cat([o["pred_boxes"] for o in outputs_list])
+        cost = self._cost(logits, boxes, padded.labels.repeat(s, 1), padded.boxes.repeat(s, 1, 1))  # [S * B, Q, M]
+        # set by set, image by image, each sub-matrix row-major: the same entries in every set
+        real = (real[None, :] + torch.arange(s, device=device)[:, None] * (b * q * m)).flatten()
         shapes = [(nq, ng) for _ in outputs_list for nq, ng in zip(padded.num_q, padded.num_gt)]
-        flat = torch.nan_to_num(torch.cat(costs), nan=1.0).cpu()  # the one device-to-host copy
-        mats = [m.view(shape).numpy() for m, shape in zip(flat.split([nq * ng for nq, ng in shapes]), shapes)]
+        flat = torch.nan_to_num(cost.flatten()[real], nan=1.0).cpu()  # the one device-to-host copy
+        mats = [x.view(shape).numpy() for x, shape in zip(flat.split([nq * ng for nq, ng in shapes]), shapes)]
         pairs = list(_ASSIGN_POOL.map(linear_sum_assignment, mats))
 
-        b = len(padded.num_gt)
-        lengths = [[len(i) for i, _ in pairs[k * b : (k + 1) * b]] for k in range(len(outputs_list))]
-        packed = torch.from_numpy(np.concatenate([np.stack([i, j]) for i, j in pairs], axis=1)).to(device)
+        lengths = [[len(i) for i, _ in pairs[k * b : (k + 1) * b]] for k in range(s)]
+        packed = torch.from_numpy(np.concatenate([np.stack([i, j]) for i, j in pairs], axis=1)).to(
+            device, non_blocking=True
+        )
         batch_idx = torch.cat([_batch_idx(lens, device) for lens in lengths])
         return FlatMatches(batch_idx, packed[0], packed[1], [sum(lens) for lens in lengths]), lengths

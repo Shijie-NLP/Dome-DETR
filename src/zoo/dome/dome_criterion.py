@@ -694,10 +694,11 @@ class DomeCriterion(nn.Module):
             for k, v in per_set.items():
                 if k not in self.weight_dict:
                     continue
+                v = v * self.weight_dict[k]  # the sets at once; the entries below are views of it
                 for s, suffix in enumerate(stack.suffixes[: v.shape[0]]):
                     if k == "loss_ddf" and not stack.has_teacher[s]:
                         continue
-                    result[k + suffix] = v[s] * self.weight_dict[k]
+                    result[k + suffix] = v[s]
         return result
 
     @staticmethod
@@ -841,5 +842,8 @@ class DomeCriterion(nn.Module):
         if "defe" in outputs:
             losses.update(self.loss_defe(outputs["defe"], targets))
 
-        # a NaN term must not take the whole step down with it
-        return {k: torch.nan_to_num(v, nan=0.0) for k, v in losses.items()}
+        # a NaN term must not take the whole step down with it: every term cleaned in one kernel,
+        # the dict's entries views of the result (``det_engine`` sums them with one more)
+        keys = list(losses)
+        values = torch.nan_to_num(torch.stack([losses[k] for k in keys]), nan=0.0)
+        return {k: values[i] for i, k in enumerate(keys)}

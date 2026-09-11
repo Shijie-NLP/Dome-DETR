@@ -152,13 +152,14 @@ def bbox2distance(points, bbox, reg_max, reg_scale, up, eps=0.1, min_unit=None):
     Returns:
         distances (4n,), weight_right (4n,), weight_left (4n,), all detached.
     """
-    reg_scale = abs(reg_scale)
-    unit = _edge_unit(points, reg_scale, min_unit) + 1e-16
+    unit = _edge_unit(points, abs(reg_scale), min_unit) + 1e-16
     left = (points[:, 0] - 0.5 * points[:, 2] - bbox[:, 0]) / unit[:, 0]
     top = (points[:, 1] - 0.5 * points[:, 3] - bbox[:, 1]) / unit[:, 1]
     right = (bbox[:, 2] - points[:, 0] - 0.5 * points[:, 2]) / unit[:, 0]
     bottom = (bbox[:, 3] - points[:, 1] - 0.5 * points[:, 3]) / unit[:, 1]
     four_lens = torch.stack([left, top, right, bottom], -1)
+    # reg_scale itself, not abs(reg_scale): W(n) takes the absolute value anyway, and its cache
+    # keys on the tensor, so a fresh abs() would rebuild it (80 kernels) on every call
     four_lens, weight_right, weight_left = translate_gt(four_lens, reg_max, reg_scale, up)
     if reg_max is not None:
         four_lens = four_lens.clamp(min=0, max=reg_max - eps)
