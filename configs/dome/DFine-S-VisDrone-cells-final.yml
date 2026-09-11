@@ -1,0 +1,23 @@
+# D-FINE-S on VisDrone2019-DET with both findings of the 2026-09-11 decoder probes switched on:
+# DFine-S-VisDrone as it is, plus
+#   min_sample_cells 1: the deformable cross-attention's sampling radius is floored at one cell
+#     on every level. On the baseline a tiny box's four points per head fall within one cell on
+#     strides 8 to 32 (88 to 99% of the weight there), the network stretches its raw offsets
+#     three-fold on stride 32 to compensate, and stride 32 is still worth 2 AP on tiny objects;
+#   enc_quality_source final: the encoder's VFL target is the IoU of the decoder's last layer's
+#     box of the matched query, not of its own proposal (see DFine-S-VisDrone-final-target.yml).
+# DFine-S-VisDrone-final-target.yml has the second alone; a run with the first alone is this
+# file with enc_quality_source: own.
+
+__include__: [
+  './DFine-S-VisDrone.yml',
+]
+
+output_dir: ./outputs/dfine_s_visdrone_cells_final
+
+DFINETransformer:
+  min_sample_cells: 1
+
+DomeCriterion:
+  enc_quality_source: final
+  dec_quality_source: own
