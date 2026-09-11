@@ -105,7 +105,10 @@ class SetStack(NamedTuple):
     sets, which carry FDR's edge distributions (``None`` when none does); the distillation
     teacher of those sets, if any, with ``has_teacher`` / ``is_teacher`` per set (a set is its own
     teacher in the denoising stack; its distillation loss is zero); the loss suffix per set;
-    ``q_valid`` (``None``: every query is real); and whether the sets are denoising ones.
+    ``q_valid`` (``None``: every query is real); whether the sets are denoising ones; the
+    quality metric of the stack's matched pairs; and ``quality_source``, the box the quality is
+    measured on (``own``: the set's own box of the pair's query, ``final``: the decoder's last
+    layer's box of that query, ``max``: the larger of the two).
     """
 
     logits: Tensor
@@ -120,9 +123,10 @@ class SetStack(NamedTuple):
     q_valid: Tensor | None
     is_dn: bool
     quality: str | None = None  # the quality metric of this stack's matched pairs; None: the criterion's
+    quality_source: str = "own"
 
     @classmethod
-    def build(cls, sets, suffixes, q_valid, is_dn=False, quality=None):
+    def build(cls, sets, suffixes, q_valid, is_dn=False, quality=None, quality_source="own"):
         logits = torch.stack([s["pred_logits"] for s in sets])
         boxes = torch.stack([s["pred_boxes"] for s in sets])
         with_corners = [s for s in sets if "pred_corners" in s]
@@ -156,6 +160,7 @@ class SetStack(NamedTuple):
             q_valid,
             is_dn,
             quality,
+            quality_source,
         )
 
     @property
@@ -223,6 +228,15 @@ class DomeCriterion(nn.Module):
             The decoder's score must rank tight boxes first (IoU), while the encoder's only picks
             the tokens worth refining, where a near miss on a tiny box should still count for
             something: ``gaussian`` keeps a box one width off at 0.4 where IoU is already 0.
+        dec_quality_source, enc_quality_source: which box a matched pair's quality is measured
+            on, for the decoder's sets and for the encoder's: ``own``, the set's own box of the
+            pair's query (D-FINE: every layer is scored on what it has localized so far);
+            ``final``, the decoder's last layer's box of that query, so the score says how well
+            the query ends up localized rather than how well this set has it, the question the
+            encoder's selection needs answered (a query's index is the same in every set, so the
+            pair needs no match at the last layer); ``max``, the larger of the two, a floor for
+            the early epochs when the last layer's boxes are no better than anyone's. The matching
+            itself is unchanged. The denoising sets always use ``own``.
         boxes_weight_format: ``None``, ``iou`` or ``giou``: weight the GIoU loss and the VFL / MAL
             targets by the matched pairs' (G)IoU instead of the quality.
         defe_density_map_weight, density_recall_penalty: the density-map loss weight, and how
@@ -264,6 +278,8 @@ class DomeCriterion(nn.Module):
         dec_quality="iou",
         nwd_c=0.016,
         enc_quality=None,
+        dec_quality_source="own",
+        enc_quality_source="own",
         boxes_weight_format=None,
         defe_density_map_weight=4,
         density_recall_penalty=0.3,
@@ -293,6 +309,10 @@ class DomeCriterion(nn.Module):
         assert enc_quality in (None, "iou", "giou", "nwd", "gaussian"), enc_quality
         self.dec_quality = dec_quality
         self.enc_quality = enc_quality
+        assert dec_quality_source in ("own", "final", "max"), dec_quality_source
+        assert enc_quality_source in ("own", "final", "max"), enc_quality_source
+        self.dec_quality_source = dec_quality_source
+        self.enc_quality_source = enc_quality_source
         self.nwd_c = nwd_c
         self.boxes_weight_format = boxes_weight_format
         self.alpha = alpha
@@ -315,6 +335,7 @@ class DomeCriterion(nn.Module):
         # stack, and the matched pairs' boxes and quality, gathered once per (stack, pairs)
         self.num_pos, self.num_neg = None, None
         self.matched = {}
+        self.final_boxes = None  # the decoder's last layer's boxes [B, Q, 4], for quality_source final / max
 
     # ------------------------------------------------------------------ matched pairs
 
@@ -327,6 +348,11 @@ class DomeCriterion(nn.Module):
             target_boxes = targets.boxes.reshape(-1, 4)[pairs.batch_idx * targets.boxes.shape[1] + pairs.target_idx]
             with torch.no_grad():
                 quality = self._matched_quality(src_boxes, target_boxes, stack.quality)
+                if stack.quality_source != "own":
+                    # the same query at the decoder's last layer, whatever that layer matched it to
+                    final_boxes = self.final_boxes.reshape(-1, 4)[pairs.batch_idx * q + pairs.query_idx]
+                    final = self._matched_quality(final_boxes, target_boxes, stack.quality)
+                    quality = final if stack.quality_source == "final" else torch.maximum(quality, final)
             self.matched[key] = (src_boxes, target_boxes, quality)
         return self.matched[key]
 
@@ -667,6 +693,7 @@ class DomeCriterion(nn.Module):
         batch_queries_num = outputs.get("batch_queries_num")
         num_queries = outputs["pred_logits"].shape[1]
         self._clear_cache()
+        self.final_boxes = outputs["pred_boxes"].detach()
         padded = padded_targets(targets, num_queries, batch_queries_num)
         fdr = {"up": outputs.get("up"), "reg_scale": outputs.get("reg_scale"), "min_unit": outputs.get("fdr_min_unit")}
 
@@ -697,13 +724,17 @@ class DomeCriterion(nn.Module):
         num_boxes = self._average_over_ranks(sum(padded.num_gt), device)
 
         # the decoder's sets: their own matches for the classification losses, the union for the boxes
-        stack = SetStack.build(sets, suffixes, padded.q_valid)
+        stack = SetStack.build(sets, suffixes, padded.q_valid, quality_source=self.dec_quality_source)
         shared = Pairs.from_flat(union).tiled(stack.num_sets)
         losses = self._stack_losses(stack, padded, self.losses, own, shared, num_boxes, num_go, ("boxes", "local"), fdr)
 
         # the encoder sets: their own losses, and outside the union their own matches and pair counts
         enc_stack = SetStack.build(
-            enc_sets, [f"_enc_{i}" for i in range(len(enc_sets))], padded.q_valid, quality=self.enc_quality
+            enc_sets,
+            [f"_enc_{i}" for i in range(len(enc_sets))],
+            padded.q_valid,
+            quality=self.enc_quality,
+            quality_source=self.enc_quality_source,
         )
         enc_losses = self.losses if self.enc_losses is None else self.enc_losses
         if self.enc_in_uni_set:
