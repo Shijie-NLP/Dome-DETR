@@ -1,0 +1,20 @@
+# D-FINE-S on VisDrone2019-DET with the encoder scored on the outcome: DFine-S-VisDrone as it
+# is, except that the encoder set's VFL target is the IoU of the decoder's last layer's box of
+# the matched query, not of the encoder's own proposal. The encoder's score only picks the
+# tokens worth refining, so it should say how well a token ends up localized: the probes on the
+# baseline put tiny objects' proposals at IoU 0.49 against 0.70 after the decoder, and a token
+# scored on its proposal is held down for what the decoder repairs. The matching is unchanged
+# (the proposal's own cost); only the positives' target score moves. The decoder's layers keep
+# their own IoU (dec_quality_source: own).
+
+__include__: [
+  './DFine-S-VisDrone.yml',
+]
+
+output_dir: ./outputs/dfine_s_visdrone_final_target
+
+DomeCriterion:
+  # own: D-FINE, the set's own box; final: the last layer's box of the same query; max: the
+  # larger of the two (a floor for the early epochs, when the last layer is no better)
+  enc_quality_source: final
+  dec_quality_source: own
