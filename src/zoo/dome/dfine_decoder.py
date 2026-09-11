@@ -237,6 +237,9 @@ class DFINETransformer(nn.Module):
             selection, gets an anchor or is scored, so the selection and the losses are those of
             the encoder levels alone. ``num_points`` then has one more entry, its first for the
             fine level. 0 (default): no fine level.
+        null_point: every cross-attention head gets a softmax entry that samples nothing and
+            carries a learned vector instead (``MSDeformableAttention``), so a head with nothing
+            useful at its points can abstain rather than return a full-magnitude mixture of them.
     """
 
     __share__ = ["num_classes", "eval_spatial_size"]
@@ -275,6 +278,7 @@ class DFINETransformer(nn.Module):
         anchor_grid_size=0.05,
         anchor_cells=0,
         fine_channels=0,
+        null_point=False,
     ):
         super().__init__()
         assert len(feat_channels) <= num_levels
@@ -334,6 +338,7 @@ class DFINETransformer(nn.Module):
             cross_attn_method=cross_attn_method,
             min_sample_cells=min_sample_cells,
             fine_dim=fine_channels,
+            null_point=null_point,
         )
         decoder_layer = TransformerDecoderLayer(**layer_args)
         decoder_layer_wide = TransformerDecoderLayer(**layer_args, layer_scale=layer_scale)

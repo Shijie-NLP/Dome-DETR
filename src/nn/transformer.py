@@ -145,6 +145,7 @@ class TransformerDecoderLayer(nn.Module):
         layer_scale=None,
         min_sample_cells=0.0,
         fine_dim=0,
+        null_point=False,
     ):
         super().__init__()
         if layer_scale is not None:
@@ -165,6 +166,7 @@ class TransformerDecoderLayer(nn.Module):
             method=cross_attn_method,
             min_sample_cells=min_sample_cells,
             fine_dim=fine_dim,
+            null_point=null_point,
         )
         self.dropout2 = nn.Dropout(dropout)
 
