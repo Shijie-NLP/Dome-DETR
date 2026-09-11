@@ -88,6 +88,13 @@ class MSDeformableAttention(nn.Module):
     then still spreads its sampling points over its surroundings on every level instead of
     reading the same cell with all of them. With ``method='discrete'`` the sampling offsets are
     frozen.
+
+    ``fine_dim`` (0: off) makes the first level a raw one: a ``fine_dim``-channel map (not
+    ``embed_dim``, not split across heads) that every head samples whole at its own points; the
+    weighted sum of a head's samples is then lifted to the head's width by a per-head linear
+    and added to what the head read from the other levels. Sampling before projecting keeps
+    the dense map at ``fine_dim`` channels (its fp32 copy and the dense gradient buffers of
+    ``grid_sample``'s backward pass shrink with it) and runs the projection on the samples only.
     """
 
     def __init__(
@@ -99,6 +106,7 @@ class MSDeformableAttention(nn.Module):
         method="default",
         offset_scale=0.5,
         min_sample_cells=0.0,
+        fine_dim=0,
     ):
         super().__init__()
         self.embed_dim = embed_dim
@@ -128,6 +136,14 @@ class MSDeformableAttention(nn.Module):
         self.sampling_offsets = nn.Linear(embed_dim, self.total_points * 2)
         self.attention_weights = nn.Linear(embed_dim, self.total_points)
 
+        self.fine_dim = fine_dim
+        if fine_dim > 0:
+            assert method == "default", "a raw fine level needs bilinear sampling"
+            # per head: fine_dim -> head_dim, on the weighted sum of the head's fine samples
+            # (no bias: the output projection's covers it, and a bias here would not commute with
+            # the zero padding outside the map and the attention weights' sum below 1)
+            self.fine_lift = nn.Parameter(torch.empty(num_heads, fine_dim, self.head_dim))
+
         self.ms_deformable_attn_core = functools.partial(ms_deformable_attention_core, method=self.method)
 
         self._reset_parameters()
@@ -149,6 +165,30 @@ class MSDeformableAttention(nn.Module):
 
         init.constant_(self.attention_weights.weight, 0)
         init.constant_(self.attention_weights.bias, 0)
+
+        if self.fine_dim > 0:
+            for head in range(self.num_heads):
+                init.xavier_uniform_(self.fine_lift.data[head])
+
+    def _read_fine(self, value, hw, sampling_locations, attention_weights):
+        """
+        Every head's weighted sum of its samples of the raw fine level ``value`` ``[bs, fine_dim,
+        h * w]`` at ``sampling_locations`` ``[bs, len_q, heads, P, 2]`` (in [0, 1]) with
+        ``attention_weights`` ``[bs, len_q, heads, P]``, lifted per head to ``[bs, len_q, C]``.
+        The map is sampled once for all heads: the heads' points are one long grid.
+        """
+        bs, len_q, heads, p, _ = sampling_locations.shape
+        h, w = hw
+        grid = (2 * sampling_locations - 1).reshape(bs, len_q * heads * p, 1, 2)
+        samples = F.grid_sample(
+            value.reshape(bs, self.fine_dim, h, w), grid, mode="bilinear", padding_mode="zeros", align_corners=False
+        )  # [bs, fine_dim, len_q * heads * P, 1]
+        samples = samples.view(bs, self.fine_dim, len_q, heads, p)
+        read = torch.einsum(
+            "bcqhp,bqhp->bqhc", samples, attention_weights.to(samples.dtype)
+        )  # [bs, len_q, heads, fine_dim]
+        lifted = torch.einsum("bqhc,hcd->bqhd", read, self.fine_lift.to(read.dtype))
+        return lifted.reshape(bs, len_q, heads * self.head_dim)
 
     def forward(self, query: torch.Tensor, reference_points: torch.Tensor, value, value_spatial_shapes):
         """
@@ -186,6 +226,20 @@ class MSDeformableAttention(nn.Module):
         offset = sampling_offsets * num_points_scale * wh * self.offset_scale
         sampling_locations = reference_points[:, :, None, :, :2] + offset
 
-        return self.ms_deformable_attn_core(
-            value, value_spatial_shapes, sampling_locations, attention_weights, self.num_points_list
+        if self.fine_dim == 0:
+            return self.ms_deformable_attn_core(
+                value, value_spatial_shapes, sampling_locations, attention_weights, self.num_points_list
+            )
+        # the raw fine level's points come first; the other levels go through the core
+        p = self.num_points_list[0]
+        fine = self._read_fine(
+            value[0], value_spatial_shapes[0], sampling_locations[:, :, :, :p], attention_weights[..., :p]
         )
+        rest = self.ms_deformable_attn_core(
+            value[1:],
+            value_spatial_shapes[1:],
+            sampling_locations[:, :, :, p:],
+            attention_weights[..., p:],
+            self.num_points_list[1:],
+        )
+        return rest + fine.to(rest.dtype)
