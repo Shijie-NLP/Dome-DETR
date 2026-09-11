@@ -105,3 +105,22 @@ python tools/analysis/fdr_refinement.py <run> --checkpoint best_stg1.pth --num-i
 `--checkpoint` defaults to `best_stg2.pth`, then `best_stg1.pth`, then `last.pth`; `--image` is a
 row index or a unique part of the image id; `--match-iou` (default 0.5) is the final IoU a query
 needs to be a candidate for an object; the highest-scoring candidate is taken.
+
+## analysis/deformable_attention.py
+
+Where the decoder's deformable cross-attention looks, layer by layer. A run's checkpoint is
+run on validation images with every layer's sampling locations and attention weights
+captured (the attention core is wrapped, so the points are exactly the ones sampled), and each
+ground-truth object is followed through its detection's query, the same query
+`fdr_refinement.py` follows, so the two tools' `object_<k>.png` show the same objects. Written
+to `<run>/attention/`: `object_<k>.png` (one panel per layer: the crop, the box the layer starts
+from, the ground truth, and every sampling point of all heads, coloured by feature level and
+sized by attention weight) and `trend.png` / `trend.md` (over a sample of images, per object
+size and layer: the attention-weighted density of sampling points in ground-truth box units,
+the share of weight inside the box and within one box size, the weighted reach, and the share
+of weight per feature level).
+
+```
+python tools/analysis/deformable_attention.py outputs/dfine_s_visdrone/2026-09-09_17-13-58
+python tools/analysis/deformable_attention.py <run> --image 0000001_02999_d_0000005 --objects 8 --num-images 100
+```
