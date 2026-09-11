@@ -1,5 +1,5 @@
 # D-FINE-S on VisDrone2019-DET with our method switched on: DFine-S-VisDrone as it is, plus the
-# three changes the 2026-09-11 decoder probes led to. Each is one switch here, so the ablations
+# four changes the 2026-09-11 probes led to. Each is one switch here, so the ablations
 # are this file with one of them reset to the baseline's value.
 #
 # 1. A stride-2 fine level for the decoder's cross-attention (values only): HGNetv2's stem
@@ -18,6 +18,12 @@
 #    box of the matched query rather than of its own proposal. The encoder's score only picks
 #    the tokens worth refining, so it should say how well a token ends up localized (tiny
 #    proposals: IoU 0.49, after the decoder 0.70). The matching is unchanged.
+# 4. anchor_cells 10: the anchors are 10 cells of their level (40 px at stride 4), square in
+#    pixels whatever the input, instead of 0.05 of the image (67x40 px at 1333x800). On the
+#    square training crops this is the baseline exactly; at validation it is the difference
+#    between AP collapsing above the training extent and not: the baseline checkpoint scores
+#    35.3 / 31.9 / 22.5 at short sides 800 / 960 / 1120 with fraction anchors and 36.4 / 36.0 /
+#    33.3 with cell anchors, with no retraining.
 
 __include__: [
   './DFine-S-VisDrone.yml',
@@ -41,6 +47,8 @@ DFINETransformer:
   num_points: [4, 6, 4, 3, 3]
   # 2. the sampling radius floor (0: the baseline)
   min_sample_cells: 1
+  # 4. anchors in cells of their level (0: the baseline's fraction of the image)
+  anchor_cells: 10
 
 DomeCriterion:
   # 3. the encoder's quality target (own: the baseline)
