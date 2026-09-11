@@ -37,6 +37,11 @@ def release_cached_memory() -> None:
         torch.cuda.empty_cache()
 
 
+def total_loss(loss_dict: dict[str, torch.Tensor]) -> torch.Tensor:
+    """The sum of the loss terms, as one stack and one reduction rather than a chain of adds."""
+    return torch.stack(list(loss_dict.values())).sum()
+
+
 def to_device(targets: list[dict], device) -> list[dict]:
     """The per-image target dicts with every tensor moved to ``device`` (asynchronously from pinned memory)."""
     return [{k: v.to(device, non_blocking=True) for k, v in t.items()} for t in targets]
@@ -94,18 +99,21 @@ def train_one_epoch(
 
         with torch.autocast(device_type=device_type, enabled=use_amp, cache_enabled=True):
             outputs = model(samples, targets=targets)
-
-        if not torch.isfinite(outputs["pred_boxes"]).all():
-            # keep the weights that produced the non-finite boxes, for a post-mortem
-            print(outputs["pred_boxes"])
-            state = dist_utils.remove_module_prefix(model.state_dict())
-            dist_utils.save_on_master({"model": state}, "./NaN.pth")
+        boxes_finite = torch.isfinite(outputs["pred_boxes"]).all()  # read after the step: no sync here
 
         # the loss is always computed in full precision
         loss_dict = criterion(outputs, targets, **metas)
-        loss: torch.Tensor = sum(loss_dict.values())
+        loss = total_loss(loss_dict)
         optimizer_step(loss, model, optimizer, scaler, max_norm)
         selection = query_stats(model, outputs)
+
+        if not boxes_finite:
+            # the weights just after the step that saw non-finite boxes, for a post-mortem (the
+            # GradScaler skips the step on a non-finite gradient, so they are the ones that
+            # produced them)
+            print(outputs["pred_boxes"])
+            state = dist_utils.remove_module_prefix(model.state_dict())
+            dist_utils.save_on_master({"model": state}, "./NaN.pth")
 
         if ema is not None:
             ema.update(model)
@@ -114,7 +122,10 @@ def train_one_epoch(
             lr_warmup_scheduler.step()
 
         loss_dict_reduced = dist_utils.reduce_dict(loss_dict)
-        loss_value = sum(loss_dict_reduced.values())
+        # every term and the total reach the host in one copy (an .item() per meter is a copy each)
+        keys = list(loss_dict_reduced)
+        values = torch.stack([total_loss(loss_dict_reduced), *loss_dict_reduced.values()]).tolist()
+        loss_value, loss_dict_reduced = values[0], dict(zip(keys, values[1:]))
 
         if not math.isfinite(loss_value):
             print(f"Loss is {loss_value}, stopping training")
@@ -125,11 +136,11 @@ def train_one_epoch(
         metric_logger.update(lr=optimizer.param_groups[0]["lr"], **selection)
 
         if writer and dist_utils.is_main_process() and global_step % 10 == 0:
-            writer.add_scalar("Loss/total", loss_value.item(), global_step)
+            writer.add_scalar("Loss/total", loss_value, global_step)
             for j, pg in enumerate(optimizer.param_groups):
                 writer.add_scalar(f"Lr/pg_{j}", pg["lr"], global_step)
             for k, v in loss_dict_reduced.items():
-                writer.add_scalar(f"Loss/{k}", v.item(), global_step)
+                writer.add_scalar(f"Loss/{k}", v, global_step)
             for k, v in selection.items():
                 writer.add_scalar(f"Queries/{k}", v, global_step)
 
