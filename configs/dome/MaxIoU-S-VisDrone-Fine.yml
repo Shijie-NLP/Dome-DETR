@@ -1,0 +1,33 @@
+# MaxIoU-S on VisDrone2019-DET with a stride-2 fine level for the decoder's cross-attention:
+# MaxIoU-S-VisDrone as it is, plus a map one stride finer than the pyramid that every decoder
+# layer's deformable attention reads as its finest level, and nothing else reads.
+#
+# The map: HGNetv2's stem computes a stride-2 tensor on its way to stride 4 (B0: 32 channels)
+# and now returns it; the encoder adds the stride-4 pyramid level's semantics (a 1x1, upsampled)
+# and runs two depthwise 3x3 / 1x1 pairs at 64 channels; the decoder projects it to hidden_dim.
+# It is values only: no token of it enters the query selection, gets an anchor or is scored, so
+# the selection, the objectness loss and the matching are those of the four encoder levels, as
+# in MaxIoU-S-VisDrone. What changes is what a query reads: at stride 2 a 12 px object spans
+# six cells, so a tiny box's sampling points land on distinct pixels of it rather than on one
+# or two stride-4 cells. The value tensor of the fine level is the cost (four times the
+# stride-4 level's).
+
+__include__: [
+  './MaxIoU-S-VisDrone.yml',
+]
+
+output_dir: ./outputs/maxiou_s_visdrone_fine
+
+HGNetv2:
+  return_stem: True
+
+HybridEncoder:
+  fine_in_channels: 32   # B0's stem: twice its middle width of 16
+  fine_dim: 64
+  fine_blocks: 2
+
+MaxIoUTransformer:
+  fine_channels: 64
+  # sampling points per cross-attention level: the fine level (stride 2) first, then strides
+  # 4, 8, 16, 32 as in MaxIoU-S-VisDrone
+  num_points: [4, 6, 4, 3, 3]
