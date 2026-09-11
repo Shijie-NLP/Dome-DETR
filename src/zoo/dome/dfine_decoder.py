@@ -188,8 +188,9 @@ class CountHead(nn.Module):
     the scores. Under a hundred thousand parameters.
     """
 
-    def __init__(self, in_channels, num_buckets, hidden=64):
+    def __init__(self, in_channels, num_buckets, hidden=64, soft_count=True):
         super().__init__()
+        self.soft_count = soft_count
         self.convs = nn.Sequential(
             nn.Conv2d(in_channels, hidden, 1),
             nn.ReLU(inplace=True),
@@ -198,11 +199,13 @@ class CountHead(nn.Module):
             nn.Conv2d(hidden, hidden, 3, padding=4, dilation=4),
             nn.ReLU(inplace=True),
         )
-        self.fc = nn.Linear(hidden + 1, num_buckets)
+        self.fc = nn.Linear(hidden + (1 if soft_count else 0), num_buckets)
 
     def forward(self, feat, soft_count):
         pooled = self.convs(feat).mean((2, 3))
-        return self.fc(torch.cat([pooled, torch.log1p(soft_count.detach().float())[:, None].to(pooled.dtype)], 1))
+        if self.soft_count:
+            pooled = torch.cat([pooled, torch.log1p(soft_count.detach().float())[:, None].to(pooled.dtype)], 1)
+        return self.fc(pooled)
 
 
 class DecoderInput(NamedTuple):
@@ -281,7 +284,11 @@ class DFINETransformer(nn.Module):
             budget comes from the ground-truth count's bucket (``count_train_budget`` ``gt``: the
             head trains alongside on ``loss_count`` and only decides at inference; ``max``: the
             larger of the head's and the ground truth's, so the decoder also sees the budgets the
-            head hands out). Classifying the count is stable where regressing it is not (DQ-DETR),
+            head hands out). ``count_soft_feature`` (default on) also feeds the head the encoder's
+            soft count, the sum of every token's best class score, detached: a number that grows
+            with the objects whatever their count, so the head extrapolates to the dense images it
+            has hardly seen and only has to calibrate; off, the head reads the features alone.
+            Classifying the count is stable where regressing it is not (DQ-DETR),
             and the head's target is the count itself, so the budget does not drift with the
             scores' calibration. The criterion trains the head (``loss_count``). The images of a
             batch are padded to the largest budget; the padded queries are masked out of the
@@ -331,6 +338,7 @@ class DFINETransformer(nn.Module):
         count_budgets=(300, 400, 500, 800, 1500),
         count_quantile=0.9,
         count_train_budget="gt",
+        count_soft_feature=True,
     ):
         super().__init__()
         assert query_budget in ("fixed", "bucket"), query_budget
@@ -371,7 +379,9 @@ class DFINETransformer(nn.Module):
             self.num_count_buckets = len(self.count_budgets)
             self.register_buffer("count_edges_t", torch.tensor(self.count_edges), persistent=False)
             self.register_buffer("count_budgets_t", torch.tensor(self.count_budgets), persistent=False)
-            self.count_head = CountHead(feat_channels[count_level], self.num_count_buckets)
+            self.count_head = CountHead(
+                feat_channels[count_level], self.num_count_buckets, soft_count=count_soft_feature
+            )
         self.cross_attn_method = cross_attn_method
         self.query_select_method = query_select_method
         self.local_attn_k = local_attn_k
