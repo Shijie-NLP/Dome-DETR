@@ -179,7 +179,8 @@ class DomeTransformer(DFINETransformer):
         batch_queries_num = selected.sum(1).tolist()
         max_total = max(batch_queries_num)
         order = torch.sort((~selected).to(torch.int8), dim=1, stable=True).indices[:, :max_total]
-        real = torch.arange(max_total, device=device)[None, :] < torch.tensor(batch_queries_num, device=device)[:, None]
+        counts = torch.tensor(batch_queries_num).to(device, non_blocking=True)  # no host sync
+        real = torch.arange(max_total, device=device)[None, :] < counts[:, None]
 
         def take(x):
             x = x.gather(1, order[..., None].expand(-1, -1, x.shape[-1])).float()

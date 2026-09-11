@@ -204,6 +204,21 @@ class MSDeformableAttention(nn.Module):
             lifted = torch.matmul(read.permute(0, 3, 2, 1), self.fine_lift)  # [bs, heads, len_q, head_dim]
         return lifted.transpose(1, 2).reshape(bs, len_q, heads * self.head_dim)
 
+    def _min_cells(self, value_spatial_shapes, dtype, device) -> torch.Tensor:
+        """
+        The ``[P, 2]`` floor of the offsets' unit ``wh``: the unit whose ``offset_scale`` half is a
+        radius of ``min_sample_cells`` cells of the point's level. Built once per (shapes, dtype,
+        device): multi-scale training draws a handful of shapes, and every layer asks.
+        """
+        key = (tuple(tuple(int(x) for x in hw) for hw in value_spatial_shapes), dtype, str(device))
+        cache = self.__dict__.setdefault("_min_cells_cache", {})  # a plain attribute: not a buffer, not saved
+        if key not in cache:
+            if len(cache) >= 64:
+                cache.clear()
+            hw = torch.tensor(value_spatial_shapes, dtype=dtype).to(device, non_blocking=True)  # [L, 2]
+            cache[key] = (self.min_sample_cells / self.offset_scale / hw.flip(-1))[self.point_level]
+        return cache[key]
+
     def forward(self, query: torch.Tensor, reference_points: torch.Tensor, value, value_spatial_shapes):
         """
         Args:
@@ -236,10 +251,7 @@ class MSDeformableAttention(nn.Module):
         num_points_scale = self.num_points_scale.to(dtype=query.dtype).unsqueeze(-1)
         wh = reference_points[:, :, None, :, 2:]  # [bs, len_q, 1, 1, 2], the offsets' unit
         if self.min_sample_cells > 0:
-            hw = torch.tensor(value_spatial_shapes, dtype=wh.dtype).to(wh.device, non_blocking=True)  # [L, 2]
-            # the unit whose offset_scale half is a radius of min_sample_cells cells of the point's level
-            cells = (self.min_sample_cells / self.offset_scale / hw.flip(-1))[self.point_level]  # [P, 2]
-            wh = torch.maximum(wh, cells)
+            wh = torch.maximum(wh, self._min_cells(value_spatial_shapes, wh.dtype, wh.device))
         offset = sampling_offsets * num_points_scale * wh * self.offset_scale
         sampling_locations = reference_points[:, :, None, :, :2] + offset
 

@@ -173,6 +173,19 @@ class SetStack(NamedTuple):
         return 0 if self.corners is None else self.corners.shape[0]
 
 
+def _flat_index(shape, *indices: Tensor) -> Tensor:
+    """
+    The flat (row-major) index into a tensor of ``shape`` of the entries ``indices``, one index
+    tensor per dim. For ``index_fill_`` on the flat view: ``x[i, j] = scalar`` (an index put of a
+    Python scalar) syncs the host, ``x.view(-1).index_fill_(0, flat, scalar)`` does not.
+    """
+    assert len(indices) == len(shape), (len(indices), shape)
+    flat = indices[0]
+    for size, idx in zip(shape[1:], indices[1:]):
+        flat = flat * size + idx
+    return flat
+
+
 def _per_set_sum(values: Tensor, counts: list[int]) -> Tensor:
     """The sum of ``values`` (one per pair, sorted by set) within each set, ``[S]``."""
     if len(set(counts)) == 1:
@@ -488,19 +501,20 @@ class DomeCriterion(nn.Module):
         logits = stack.logits.float()  # the weights are built in fp32 under autocast too
         s, b, q = pairs.set_idx, pairs.batch_idx, pairs.query_idx
         cls = targets.labels[b, pairs.target_idx] if logits.shape[-1] > 1 else torch.zeros_like(q)
-        pos = torch.zeros_like(logits, dtype=torch.bool)
-        pos[s, b, q, cls] = True
+        # index_fill_ on the flat view: an index put of a Python scalar syncs the host
+        flat = _flat_index(logits.shape, s, b, q, cls)
+        pos = torch.zeros_like(logits, dtype=torch.bool).view(-1).index_fill_(0, flat, True).view_as(logits)
         target = torch.zeros_like(logits)
         if self.enc_obj_target == "quality":
             target[s, b, q, cls] = self._matched(stack, pairs, targets)[2].to(target.dtype)
         else:
-            target[s, b, q, cls] = 1.0
+            target.view(-1).index_fill_(0, flat, 1.0)
         if self.enc_obj_loss == "plain":
             loss = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
             return {"loss_obj": self._reduce_query_loss(loss, stack, num_boxes)}
 
         share = torch.zeros(logits.shape[:3], device=logits.device)  # each positive query's share of the positive half
-        share[s, b, q] = 1.0
+        share.view(-1).index_fill_(0, _flat_index(logits.shape[:3], s, b, q), 1.0)
         if self.enc_obj_quality_weight:
             share[s, b, q] = self._matched(stack, pairs, targets)[2].to(share.dtype)
         keep = torch.ones_like(logits, dtype=torch.bool)
@@ -563,8 +577,9 @@ class DomeCriterion(nn.Module):
         # matched queries are weighted by their quality, the others by the teacher's confidence
         weight = stack.teacher_logits.sigmoid().max(dim=-1)[0].expand(num_sets, -1, -1).clone()
         weight[pairs.set_idx, pairs.batch_idx, pairs.query_idx] = quality.to(weight.dtype)
-        mask = torch.zeros(num_sets, b, q, dtype=torch.bool, device=weight.device)
-        mask[pairs.set_idx, pairs.batch_idx, pairs.query_idx] = True
+        flat = _flat_index((num_sets, b, q), pairs.set_idx, pairs.batch_idx, pairs.query_idx)
+        mask = torch.zeros(num_sets * b * q, dtype=torch.bool, device=weight.device).index_fill_(0, flat, True)
+        mask = mask.view(num_sets, b, q)
         weight, mask = weight[..., None].expand(-1, -1, -1, 4).detach(), mask[..., None].expand(-1, -1, -1, 4)
 
         kl = nn.KLDivLoss(reduction="none")(
@@ -582,7 +597,7 @@ class DomeCriterion(nn.Module):
         loss_neg = (loss_match_local * ~mask).sum((1, 2, 3)) / (~mask).sum((1, 2, 3)).clamp(min=1)
         loss = (loss_pos * self.num_pos + loss_neg * self.num_neg) / (self.num_pos + self.num_neg)
         # a set that is its own teacher (the last denoising layer) distils nothing
-        own = torch.tensor([0.0 if t else 1.0 for t in stack.is_teacher], device=loss.device)
+        own = torch.tensor([0.0 if t else 1.0 for t in stack.is_teacher]).to(loss.device, non_blocking=True)
         return loss * own
 
     @staticmethod

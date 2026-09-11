@@ -586,7 +586,7 @@ class DFINETransformer(nn.Module):
         cdf = count_logits.float().softmax(-1).cumsum(-1)
         bucket = (cdf >= self.count_quantile - 1e-6).int().argmax(-1)  # the first bucket reaching the quantile
         if self.training and targets is not None:
-            gt = torch.tensor([len(t["labels"]) for t in targets], device=bucket.device)
+            gt = torch.tensor([len(t["labels"]) for t in targets]).to(bucket.device, non_blocking=True)
             gt_bucket = torch.bucketize(gt, self.count_edges_t, right=True)  # edges [100, ...]: 100 falls in bucket 1
             bucket = gt_bucket if self.count_train_budget == "gt" else torch.maximum(bucket, gt_bucket)
         return self.count_budgets_t[bucket].tolist()
