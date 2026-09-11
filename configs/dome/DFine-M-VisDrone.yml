@@ -1,0 +1,21 @@
+# D-FINE-M baseline on VisDrone2019-DET: DFine-S-VisDrone at the M scale (include/scale_m.yml),
+# the same recipe and queries.
+
+__include__: [
+  '../dataset/visdrone_detection.yml',
+  '../runtime.yml',
+  './include/dataloader.yml',
+  './include/optimizer.yml',
+  './include/dome_hgnetv2.yml',
+  './include/scale_m.yml',
+  './include/recipe_160.yml',
+]
+
+output_dir: ./outputs/dfine_m_visdrone
+
+DOME:
+  encoder: HybridEncoder
+  decoder: DFINETransformer
+
+DFINETransformer:
+  num_queries: 500

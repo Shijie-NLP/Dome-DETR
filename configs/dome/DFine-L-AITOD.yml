@@ -1,0 +1,22 @@
+# D-FINE-L baseline on AI-TOD-v2: the plain HybridEncoder and the D-FINE decoder at the L scale
+# (include/scale_l.yml) on the shared 160-epoch recipe. 1500 queries: the tiles are dense and the
+# evaluator keeps 1500 detections per image.
+
+__include__: [
+  '../dataset/aitod_detection.yml',
+  '../runtime.yml',
+  './include/dataloader.yml',
+  './include/optimizer.yml',
+  './include/dome_hgnetv2.yml',
+  './include/scale_l.yml',
+  './include/recipe_160.yml',
+]
+
+output_dir: ./outputs/dfine_l_aitod
+
+DOME:
+  encoder: HybridEncoder
+  decoder: DFINETransformer
+
+DFINETransformer:
+  num_queries: 1500

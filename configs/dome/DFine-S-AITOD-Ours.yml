@@ -1,0 +1,9 @@
+# D-FINE-S on AI-TOD-v2 with our method switched on: DFine-S-AITOD plus include/ours.yml. The
+# tiles are square, so the cell anchors equal the baseline's here; the other four switches act.
+
+__include__: [
+  './DFine-S-AITOD.yml',
+  './include/ours.yml',
+]
+
+output_dir: ./outputs/dfine_s_aitod_ours
