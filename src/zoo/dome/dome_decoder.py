@@ -64,7 +64,6 @@ class DomeTransformer(DFINETransformer):
         min_refine_cells=0.0,
         anchor_grid_size=0.05,
         fine_channels=0,
-        fine_proj_at="map",
     ):
         super().__init__(
             num_classes=num_classes,
@@ -95,7 +94,6 @@ class DomeTransformer(DFINETransformer):
             min_refine_cells=min_refine_cells,
             anchor_grid_size=anchor_grid_size,
             fine_channels=fine_channels,
-            fine_proj_at=fine_proj_at,
         )
         self.min_num_select = min_num_select
         self.max_num_select = max_num_select

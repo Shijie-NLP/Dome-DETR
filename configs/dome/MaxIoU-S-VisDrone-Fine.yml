@@ -4,13 +4,17 @@
 #
 # The map: HGNetv2's stem computes a stride-2 tensor on its way to stride 4 (B0: 32 channels)
 # and now returns it; the encoder adds the stride-4 pyramid level's semantics (a 1x1, upsampled)
-# and runs two depthwise 3x3 / 1x1 pairs at 64 channels; the decoder projects it to hidden_dim.
-# It is values only: no token of it enters the query selection, gets an anchor or is scored, so
-# the selection, the objectness loss and the matching are those of the four encoder levels, as
-# in MaxIoU-S-VisDrone. What changes is what a query reads: at stride 2 a 12 px object spans
-# six cells, so a tiny box's sampling points land on distinct pixels of it rather than on one
-# or two stride-4 cells. The value tensor of the fine level is the cost (four times the
-# stride-4 level's).
+# and runs two depthwise 3x3 / 1x1 pairs at 64 channels. The decoder samples that 64-channel
+# map as it is and lifts each head's weighted sum of its samples with a per-head linear (the
+# projection to hidden_dim commuted past the sampling: the same function, with the dense map
+# and the sampling's gradient buffers 64 channels wide rather than 256). It is values only: no
+# token of it enters the query selection, gets an anchor or is scored, so the selection, the
+# objectness loss and the matching are those of the four encoder levels, as in
+# MaxIoU-S-VisDrone. What changes is what a query reads: at stride 2 a 12 px object spans six
+# cells, so a tiny box's sampling points land on distinct pixels of it rather than on one or
+# two stride-4 cells. Cost on the 5090 in bf16: training at 4 x 800x800 from 87 to about
+# 105 ms a step and 4.65 to 6.0 GB peak (5.1 with checkpoint_fusion); inference at 1344x800
+# from 22 to about 24 ms an image.
 
 __include__: [
   './MaxIoU-S-VisDrone.yml',

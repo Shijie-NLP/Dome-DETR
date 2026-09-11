@@ -221,19 +221,17 @@ class DFINETransformer(nn.Module):
             first level wants 0.025 for the same ratio). Must exceed ``eps``, or the border test
             marks every token invalid.
         fine_channels: with a value above 0, the encoder's ``fine`` map (``HybridEncoder``'s
-            fine level, so many channels wide, one stride finer than its first level) is
-            projected to ``hidden_dim`` and read by every decoder layer's deformable
-            cross-attention as its first, finest level. It is values only: no token of it enters
-            the query selection, gets an anchor or is scored, so the selection and the losses
-            are those of the encoder levels alone. ``num_points`` then has one more entry, its
-            first for the fine level. 0 (default): no fine level.
-        fine_proj_at: where the fine level is projected to ``hidden_dim``: ``map`` (a 1x1
-            conv-BN on the whole map before sampling, so the cross-attention reads it like any
-            level) or ``samples`` (the raw map is sampled and each head's weighted sum is lifted
-            by a per-head linear, ``MSDeformableAttention(fine_dim)``: the same linear map
-            commuted past the bilinear sampling, with the dense map, its fp32 copy and the
-            gradient buffers of the sampling's backward pass at ``fine_channels`` rather than
-            ``hidden_dim`` channels).
+            fine level, so many channels wide, one stride finer than its first level) is read
+            by every decoder layer's deformable cross-attention as its first, finest level,
+            raw: each head samples the map at its points and a per-head linear lifts the
+            weighted sum of its samples to the head's width (``MSDeformableAttention``'s
+            ``fine_dim``). Projecting the samples rather than the map reads the same function
+            class (a linear map commutes with bilinear sampling) and keeps the dense map, its
+            fp32 copy and the gradient buffers of the sampling's backward pass ``fine_channels``
+            wide rather than ``hidden_dim``. It is values only: no token of it enters the query
+            selection, gets an anchor or is scored, so the selection and the losses are those of
+            the encoder levels alone. ``num_points`` then has one more entry, its first for the
+            fine level. 0 (default): no fine level.
     """
 
     __share__ = ["num_classes", "eval_spatial_size"]
@@ -271,11 +269,9 @@ class DFINETransformer(nn.Module):
         min_refine_cells=0.0,
         anchor_grid_size=0.05,
         fine_channels=0,
-        fine_proj_at="map",
     ):
         super().__init__()
         assert len(feat_channels) <= num_levels
-        assert fine_proj_at in ("map", "samples"), fine_proj_at
         assert anchor_grid_size > eps, f"anchor_grid_size {anchor_grid_size} must exceed eps {eps}"
         assert len(feat_strides) == len(feat_channels)
         assert query_select_method in ("default", "one2many", "agnostic"), query_select_method
@@ -305,8 +301,6 @@ class DFINETransformer(nn.Module):
         self.attn_logn_base = attn_logn_base or num_queries
         self.min_refine_cells = min_refine_cells
         self.fine_channels = fine_channels
-        self.fine_proj_at = fine_proj_at
-        fine_dim = fine_channels if fine_proj_at == "samples" else 0  # the raw fine level's width
         # the cross-attention's levels: the fine level, if any, then the encoder levels
         self.num_value_levels = num_levels + (1 if fine_channels > 0 else 0)
         if isinstance(num_points, (list, tuple)):
@@ -332,7 +326,7 @@ class DFINETransformer(nn.Module):
             n_points=num_points,
             cross_attn_method=cross_attn_method,
             min_sample_cells=min_sample_cells,
-            fine_dim=fine_dim,
+            fine_dim=fine_channels,
         )
         decoder_layer = TransformerDecoderLayer(**layer_args)
         decoder_layer_wide = TransformerDecoderLayer(**layer_args, layer_scale=layer_scale)
@@ -347,7 +341,7 @@ class DFINETransformer(nn.Module):
             self.up,
             eval_idx,
             layer_scale,
-            fine_dim=fine_dim,
+            fine_dim=fine_channels,
         )
 
         # denoising
@@ -410,8 +404,6 @@ class DFINETransformer(nn.Module):
         for m, in_channels in zip(self.input_proj, feat_channels):
             if in_channels != self.hidden_dim:
                 init.xavier_uniform_(m[0].weight)
-        if hasattr(self, "fine_proj") and self.fine_channels != self.hidden_dim:
-            init.xavier_uniform_(self.fine_proj[0].weight)
 
     def _proj(self, in_channels, kernel_size, stride):
         """A conv-BN projection to ``hidden_dim`` (nothing, for a 1x1 from ``hidden_dim``)."""
@@ -421,17 +413,12 @@ class DFINETransformer(nn.Module):
         return nn.Sequential(OrderedDict([("conv", conv), ("norm", nn.BatchNorm2d(self.hidden_dim))]))
 
     def _build_input_proj_layer(self, feat_channels):
-        """
-        A projection per level; extra levels downsample the last one with stride 2. The fine
-        level, if any, gets its own when it is projected as a map.
-        """
+        """A projection per level; extra levels downsample the last one with stride 2."""
         self.input_proj = nn.ModuleList(self._proj(c, 1, 1) for c in feat_channels)
         in_channels = feat_channels[-1]
         for _ in range(self.num_levels - len(feat_channels)):
             self.input_proj.append(self._proj(in_channels, 3, 2))
             in_channels = self.hidden_dim
-        if self.fine_channels > 0 and self.fine_proj_at == "map":
-            self.fine_proj = self._proj(self.fine_channels, 1, 1)
 
     def _get_encoder_input(self, feats: list[torch.Tensor]):
         """
@@ -536,13 +523,11 @@ class DFINETransformer(nn.Module):
         img_inputs = encoder_out["img_inputs"]
 
         proj_feats, memory, spatial_shapes = self._get_encoder_input(feats)
-        # the cross-attention's levels: the fine level first, if any; the selection, the anchors
-        # and the FDR unit below stay on the encoder levels
+        # the cross-attention's levels: the raw fine level first, if any; the selection, the
+        # anchors and the FDR unit below stay on the encoder levels
         value_feats, value_shapes = proj_feats, spatial_shapes
         if self.fine_channels > 0:
             fine = encoder_out["fine"]
-            if self.fine_proj_at == "map":
-                fine = self.fine_proj(fine)
             value_feats, value_shapes = [fine, *proj_feats], [list(fine.shape[2:]), *spatial_shapes]
 
         dec_in = self._get_decoder_input(memory, spatial_shapes, encoder_out, targets)
