@@ -274,10 +274,11 @@ class DFINETransformer(nn.Module):
             count, ``count_bucket`` wide (0 .. 100, 100 .. 200, ..., the last open); bucket ``b``
             is worth ``count_base + b * count_bucket`` queries, and the image gets the budget of
             the bucket where the predicted distribution first reaches ``count_quantile`` (an
-            unsure head rounds up), within ``min_queries`` .. ``max_queries``. In training at
-            least the budget of the ground-truth count's bucket, so no ground truth is left
-            without a query for want of a budget while the decoder still sees the budgets the
-            head hands out. Classifying the count is stable where regressing it is not (DQ-DETR),
+            unsure head rounds up), within ``min_queries`` .. ``max_queries``. In training the
+            budget comes from the ground-truth count's bucket (``count_train_budget`` ``gt``: the
+            head trains alongside on ``loss_count`` and only decides at inference; ``max``: the
+            larger of the head's and the ground truth's, so the decoder also sees the budgets the
+            head hands out). Classifying the count is stable where regressing it is not (DQ-DETR),
             and the head's target is the count itself, so the budget does not drift with the
             scores' calibration. The criterion trains the head (``loss_count``). The images of a
             batch are padded to the largest budget; the padded queries are masked out of the
@@ -328,9 +329,11 @@ class DFINETransformer(nn.Module):
         count_bucket=100,
         count_base=300,
         count_quantile=0.9,
+        count_train_budget="gt",
     ):
         super().__init__()
         assert query_budget in ("fixed", "bucket"), query_budget
+        assert count_train_budget in ("gt", "max"), count_train_budget
         assert len(feat_channels) <= num_levels
         assert anchor_grid_size > eps, f"anchor_grid_size {anchor_grid_size} must exceed eps {eps}"
         assert len(feat_strides) == len(feat_channels)
@@ -362,6 +365,7 @@ class DFINETransformer(nn.Module):
         self.count_bucket = count_bucket
         self.count_base = count_base
         self.count_quantile = count_quantile
+        self.count_train_budget = count_train_budget
         if query_budget == "bucket":
             assert count_base <= max_queries and count_bucket > 0
             self.num_count_buckets = (max_queries - count_base) // count_bucket + 1
@@ -563,14 +567,16 @@ class DFINETransformer(nn.Module):
     def _bucket_budgets(self, count_logits, targets):
         """
         Per image, the number of queries under ``query_budget='bucket'``: the budget of the bucket
-        where the predicted count distribution reaches ``count_quantile``, in training at least
-        the ground-truth count's bucket's, within ``min_queries`` .. ``max_queries``. On the host.
+        where the predicted count distribution reaches ``count_quantile``; in training the
+        ground-truth count's bucket's (``count_train_budget`` ``gt``) or the larger of the two
+        (``max``); within ``min_queries`` .. ``max_queries``. On the host.
         """
         cdf = count_logits.float().softmax(-1).cumsum(-1)
         bucket = (cdf >= self.count_quantile - 1e-6).int().argmax(-1)  # the first bucket reaching the quantile
         if self.training and targets is not None:
             gt = torch.tensor([len(t["labels"]) for t in targets], device=bucket.device)
-            bucket = torch.maximum(bucket, (gt // self.count_bucket).clamp(max=self.num_count_buckets - 1))
+            gt_bucket = (gt // self.count_bucket).clamp(max=self.num_count_buckets - 1)
+            bucket = gt_bucket if self.count_train_budget == "gt" else torch.maximum(bucket, gt_bucket)
         budget = self.count_base + bucket * self.count_bucket
         return budget.clamp(self.min_queries, self.max_queries).tolist()
 
