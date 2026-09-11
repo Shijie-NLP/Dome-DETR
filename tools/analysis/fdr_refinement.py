@@ -12,7 +12,10 @@ Written into ``<run>/fdr/``:
   the four edge distributions of every layer (expectation and the ground-truth edge marked).
 * ``image.png``: the image with ground truth, final detections and the objects that got a figure.
 * ``trend.png`` and ``trend.md``: over a sample of images, per object size, how IoU with the
-  ground truth, edge movement, distribution sharpness and score move from stage to stage.
+  ground truth, edge movement, distribution sharpness and score move from stage to stage; then
+  the geometry of the edge range: how far the ground-truth edges are from the anchor's against
+  how far the distributions can reach, the finest bin against the last layer's edge error, and
+  what a floor of the edge unit (``min_refine_cells``) would change, without retraining.
 
     python tools/analysis/fdr_refinement.py outputs/dfine_s_visdrone/2026-09-09_17-13-58
     python tools/analysis/fdr_refinement.py outputs/dfine_s_visdrone/2026-09-09_17-13-58 --image 12 --objects 8 --num-images 100
@@ -136,6 +139,132 @@ def gt_distances(anchor, gt_xyxy, reg_scale, min_unit):
     right = (gt_xyxy[:, 2] - anchor[:, 0] - 0.5 * anchor[:, 2]) / unit[:, 0]
     bottom = (gt_xyxy[:, 3] - anchor[:, 1] - 0.5 * anchor[:, 3]) / unit[:, 1]
     return torch.stack([left, top, right, bottom], -1), unit
+
+
+FLOORS = [0, 1, 2, 4]  # min_refine_cells values the what-if table evaluates
+
+
+def range_stats(sample, q, g, floor_px=0.0):
+    """
+    The edge range of query ``q``'s anchor against ground truth ``g``, in input px: the shift each
+    edge needs, the furthest the distributions reach (``W(reg_max)`` units), the finest bin, and
+    the last layer's edge error. ``floor_px`` floors the anchor size in the unit as
+    ``min_refine_cells`` would (0: the run's own floor, if any).
+    """
+    anchor = sample.boxes_norm[1, q][None]
+    gt_norm = sample.gt[g][None] / sample.size.repeat(2)
+    min_unit = sample.out["min_unit"]
+    if floor_px > 0:
+        min_unit = torch.tensor([floor_px, floor_px]) / sample.size
+    needed, unit = gt_distances(anchor, gt_norm, sample.reg_scale, min_unit)
+    needed, unit_px = needed[0], (unit[0] * sample.size).repeat(2)  # [4] W units, [4] px per unit (x, y, x, y)
+    weights = sample.weights
+    max_w, mid = float(weights[-1]), len(weights) // 2
+    finest_px = float(weights[mid + 1] - weights[mid]) * unit_px
+    beyond = needed.abs() > max_w
+    expectation = (sample.probs[-1, q] * torch.from_numpy(weights)).sum(-1)  # [4]
+    err_px = (expectation - needed).abs() * unit_px
+    return {
+        "anchor_iou": float(box_iou(sample.boxes[1, q][None], sample.gt[g][None])[0][0, 0]),
+        "needed_px": float((needed.abs() * unit_px).mean()),
+        "reach_px": float((max_w * unit_px).mean()),
+        "ratio": float((needed.abs() / max_w).max()),
+        "beyond": float(beyond.float().mean()),
+        "any_beyond": float(beyond.any()),
+        "finest_px": float(finest_px.mean()),
+        "err_px": float(err_px.mean()),
+        "err_below_bin": float((err_px < finest_px).float().mean()),
+    }
+
+
+def range_records_of(sample, iou_threshold, finest_stride):
+    """
+    One record per ground-truth box: its size bucket, the range statistics through its
+    detection's query (``det``, None when it is not detected) and, for every floor of ``FLOORS``
+    in cells of ``finest_stride``, through the query whose anchor overlaps it most (``floors``).
+    """
+    if len(sample.gt) == 0:
+        return []
+    detected = {g: q for g, q, _ in sample.match(iou_threshold)}
+    iou, _ = box_iou(sample.gt, sample.boxes[1])  # [G, Q] against the anchors
+    best_iou, best_q = iou.max(1)
+    gt_centre = (sample.gt[:, :2] + sample.gt[:, 2:]) / 2
+    anchor_centre = (sample.boxes[1][:, :2] + sample.boxes[1][:, 2:]) / 2
+    nearest = torch.cdist(gt_centre, anchor_centre).argmin(1)
+    records = []
+    for g in range(len(sample.gt)):
+        q = int(best_q[g]) if best_iou[g] > 0 else int(nearest[g])
+        records.append(
+            {
+                "bucket": bucket_of(sample.gt_size(g)),
+                "det": range_stats(sample, detected[g], g) if g in detected else None,
+                "floors": {k: range_stats(sample, q, g, k * finest_stride) for k in FLOORS},
+            }
+        )
+    return records
+
+
+def range_table(records, finest_stride):
+    lines = []
+    names = [b[0] for b in SIZE_BUCKETS] + ["all"]
+
+    def rows_of(name):
+        return records if name == "all" else [r for r in records if r["bucket"] == name]
+
+    for title, pick in (
+        ("Edge reach of the anchor, detected objects (through their detection's query)", lambda r: r["det"]),
+        (
+            "Edge reach of the anchor, all ground truth (through the query whose anchor overlaps most)",
+            lambda r: r["floors"][0],
+        ),
+    ):
+        lines.append(f"### {title}\n")
+        lines.append(
+            "| size | n | anchor IoU | needed shift px | reach px | needed/reach p50 | p90 | edges beyond reach | objects with an edge beyond reach |"
+        )
+        lines.append("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
+        for name in names:
+            st = [pick(r) for r in rows_of(name) if pick(r) is not None]
+            if not st:
+                continue
+            ratios = np.array([x["ratio"] for x in st])
+            lines.append(
+                f"| {name} | {len(st)} | {np.mean([x['anchor_iou'] for x in st]):.2f} | {np.mean([x['needed_px'] for x in st]):.1f} "
+                f"| {np.mean([x['reach_px'] for x in st]):.1f} | {np.median(ratios):.2f} | {np.percentile(ratios, 90):.2f} "
+                f"| {np.mean([x['beyond'] for x in st]):.1%} | {np.mean([x['any_beyond'] for x in st]):.1%} |"
+            )
+        lines.append("")
+
+    lines.append("### Resolution at the last layer, detected objects\n")
+    lines.append("| size | n | finest bin px | final edge error px | edges with an error below the finest bin |")
+    lines.append("| --- | ---: | ---: | ---: | ---: |")
+    for name in names:
+        st = [r["det"] for r in rows_of(name) if r["det"] is not None]
+        if not st:
+            continue
+        lines.append(
+            f"| {name} | {len(st)} | {np.mean([x['finest_px'] for x in st]):.2f} | {np.mean([x['err_px'] for x in st]):.2f} "
+            f"| {np.mean([x['err_below_bin'] for x in st]):.0%} |"
+        )
+    lines.append("")
+
+    lines.append(
+        f"### A floor of the edge unit at k cells of stride {finest_stride} (min_refine_cells), all ground truth\n"
+    )
+    lines.append("| size | n | k | reach px | finest bin px | edges beyond reach | objects with an edge beyond reach |")
+    lines.append("| --- | ---: | ---: | ---: | ---: | ---: | ---: |")
+    for name in names:
+        rows = rows_of(name)
+        if not rows:
+            continue
+        for k in FLOORS:
+            st = [r["floors"][k] for r in rows]
+            lines.append(
+                f"| {name} | {len(rows)} | {k} | {np.mean([x['reach_px'] for x in st]):.1f} | {np.mean([x['finest_px'] for x in st]):.2f} "
+                f"| {np.mean([x['beyond'] for x in st]):.1%} | {np.mean([x['any_beyond'] for x in st]):.1%} |"
+            )
+    lines.append("")
+    return "\n".join(lines)
 
 
 def value_to_bin(values, weights):
@@ -499,6 +628,7 @@ def main():
     dataset, collate = loader.dataset, loader.collate_fn
     names = dict(getattr(dataset, "CATEGORIES", []))
     stages = ["proposal", "anchor"] + [f"layer {i}" for i in range(decoder.num_layers)]
+    finest_stride = int(model.decoder.feat_strides[0])
     print(
         f"decoder: {decoder.num_layers} layers, reg_max {decoder.reg_max}, eval_idx {decoder.eval_idx}; {len(dataset)} validation images"
     )
@@ -526,10 +656,11 @@ def main():
     if args.num_images > 0:
         rng = random.Random(args.seed)
         indices = rng.sample(range(len(dataset)), min(args.num_images, len(dataset)))
-        records = []
+        records, range_records = [], []
         for i, idx in enumerate(indices):
             s = sample if idx == index else Sample(dataset, collate, idx, model, decoder, args.device)
             records += records_of(s, args.match_iou)
+            range_records += range_records_of(s, args.match_iou, finest_stride)
             if (i + 1) % 10 == 0:
                 print(f"  {i + 1}/{len(indices)} images, {len(records)} objects")
         if records:
@@ -539,7 +670,13 @@ def main():
                 f"{len(records)} ground-truth objects of {len(indices)} validation images, each followed through the query whose "
                 f"final box reaches IoU {args.match_iou} with it and scores highest. Stages: the encoder proposal, the first layer's plain box "
                 f"(the anchor of the distributions), then the FDR box of every layer. Sizes are square-root areas in original pixels.\n\n"
-                f"![trend](trend.png)\n\n" + trend_table(records, stages)
+                f"![trend](trend.png)\n\n" + trend_table(records, stages) + "\n"
+                f"The range tables are geometry: every edge distribution spans W(0) .. W({decoder.reg_max}) units of the anchor "
+                f"size / reg_scale, so 'reach' is the furthest an edge can move from the anchor's, 'needed shift' how far the "
+                f"ground-truth edge is, and 'beyond reach' a ground-truth edge no distribution can express. The finest bin is "
+                f"W(1) - W(0) around zero in px; the expectation can land between bins. The floor table recomputes the "
+                f"geometry with the unit floored as min_refine_cells would, on this model's anchors.\n\n"
+                + range_table(range_records, finest_stride)
             )
             with open(os.path.join(out_dir, "trend.md"), "w", encoding="utf-8") as f:
                 f.write(text)

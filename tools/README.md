@@ -94,7 +94,9 @@ box of every layer, whose four edges are expectations over the `reg_max + 1` bin
 Written to `<run>/fdr/`: `object_<k>.png` (one object: the stages' boxes on a crop and the edge
 distributions of every layer), `image.png` (where those objects are), and `trend.png` /
 `trend.md` (over a sample of images, per object size: IoU, edge movement, distribution
-sharpness and score per stage).
+sharpness and score per stage; then the geometry of the edge range: the shift the ground-truth
+edges need against how far the distributions reach from the anchor, the finest bin against the
+last layer's edge error, and what a floor of the edge unit, `min_refine_cells`, would change).
 
 ```
 python tools/analysis/fdr_refinement.py outputs/dfine_s_visdrone/2026-09-09_17-13-58
