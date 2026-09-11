@@ -181,7 +181,11 @@ class CountHead(nn.Module):
     """
     A distribution over buckets of an image's object count from one encoder level: a 1x1
     reduction, two dilated 3x3 convolutions (a wide receptive field on a small map), global
-    average pooling and a linear layer. Under a hundred thousand parameters.
+    average pooling and a linear layer over the pooled features and the encoder's soft count
+    (the sum of every token's best class score, as ``log(1 + n)``). The soft count grows with
+    the objects whatever their number, so the head extrapolates to the dense images it has
+    hardly seen and only has to calibrate; it is detached, the counting loss does not train
+    the scores. Under a hundred thousand parameters.
     """
 
     def __init__(self, in_channels, num_buckets, hidden=64):
@@ -194,10 +198,11 @@ class CountHead(nn.Module):
             nn.Conv2d(hidden, hidden, 3, padding=4, dilation=4),
             nn.ReLU(inplace=True),
         )
-        self.fc = nn.Linear(hidden, num_buckets)
+        self.fc = nn.Linear(hidden + 1, num_buckets)
 
-    def forward(self, feat):
-        return self.fc(self.convs(feat).mean((2, 3)))
+    def forward(self, feat, soft_count):
+        pooled = self.convs(feat).mean((2, 3))
+        return self.fc(torch.cat([pooled, torch.log1p(soft_count.detach().float())[:, None].to(pooled.dtype)], 1))
 
 
 class DecoderInput(NamedTuple):
@@ -590,7 +595,14 @@ class DFINETransformer(nn.Module):
         if self.query_budget == "fixed":
             batch_queries_num = [self.num_queries] * b
         else:
-            count_logits = self.count_head(encoder_out["feats"][self.count_level])  # [B, buckets]
+            # the soft count: every valid token's best class score, summed
+            scores = F.sigmoid(
+                enc_outputs_logits.squeeze(-1)
+                if self.query_select_method == "agnostic"
+                else enc_outputs_logits.max(-1).values
+            )
+            soft_count = scores.masked_fill(~valid_mask[..., 0].expand(b, -1), 0.0).sum(1)  # [B]
+            count_logits = self.count_head(encoder_out["feats"][self.count_level], soft_count)  # [B, buckets]
             batch_queries_num = self._bucket_budgets(count_logits, targets)
             if self.training:
                 extra["count_logits"] = count_logits

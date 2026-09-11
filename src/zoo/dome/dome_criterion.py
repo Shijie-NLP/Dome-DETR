@@ -268,6 +268,11 @@ class DomeCriterion(nn.Module):
             ``query_budget='bucket'``) is the ground-truth count's bucket, with this much of the
             probability moved to each neighbouring bucket (ordinal smoothing: a bucket off is a
             smaller error than ten off); cross-entropy, weighted by ``loss_count``.
+        count_logit_adjust: logit adjustment against the buckets' imbalance (93% of AI-TOD's
+            tiles are in the first bucket, a few dozen in the last): the cross-entropy is taken
+            on the logits plus this many times the log of the buckets' running frequency, so the
+            head is trained to output balanced logits and the budget rule reads them unadjusted.
+            0 turns it off. The frequency is accumulated over the run from the batches seen.
     """
 
     __share__ = ["num_classes"]
@@ -302,9 +307,12 @@ class DomeCriterion(nn.Module):
         enc_obj_pos_weight=1.0,
         rank_delta=0.5,
         count_smooth=0.1,
+        count_logit_adjust=1.0,
     ):
         super().__init__()
         self.count_smooth = count_smooth
+        self.count_logit_adjust = count_logit_adjust
+        self.count_hist = None  # the ground-truth buckets seen so far, for the logit adjustment
         self.rank_delta = rank_delta
         self.num_classes = num_classes
         self.matcher = matcher
@@ -455,11 +463,17 @@ class DomeCriterion(nn.Module):
         """Cross-entropy of the counting head against each image's ground-truth count bucket, smoothed to its neighbours."""
         n = meta["num_buckets"]
         bucket = (torch.tensor(num_gt, device=logits.device) // meta["bucket"]).clamp(max=n - 1)
+        logits = logits.float()
+        if self.count_logit_adjust > 0:
+            if self.count_hist is None or self.count_hist.numel() != n:
+                self.count_hist = torch.ones(n, device=logits.device)  # one pseudo-count per bucket
+            self.count_hist += torch.bincount(bucket, minlength=n).float()
+            logits = logits + self.count_logit_adjust * (self.count_hist / self.count_hist.sum()).log()
         target = F.one_hot(bucket, n).float() * (1 - 2 * self.count_smooth)
         target[:, 1:] += self.count_smooth * F.one_hot(bucket, n).float()[:, :-1]  # the bucket above
         target[:, :-1] += self.count_smooth * F.one_hot(bucket, n).float()[:, 1:]  # the bucket below
         target = target / target.sum(-1, keepdim=True)  # the edges keep their mass
-        return -(target * F.log_softmax(logits.float(), -1)).sum(-1).mean()
+        return -(target * F.log_softmax(logits, -1)).sum(-1).mean()
 
     def loss_obj(self, stack, pairs, num_boxes, targets, **kwargs):
         """
