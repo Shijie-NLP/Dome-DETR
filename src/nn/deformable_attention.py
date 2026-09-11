@@ -175,20 +175,21 @@ class MSDeformableAttention(nn.Module):
         Every head's weighted sum of its samples of the raw fine level ``value`` ``[bs, fine_dim,
         h * w]`` at ``sampling_locations`` ``[bs, len_q, heads, P, 2]`` (in [0, 1]) with
         ``attention_weights`` ``[bs, len_q, heads, P]``, lifted per head to ``[bs, len_q, C]``.
-        The map is sampled once for all heads: the heads' points are one long grid.
+        Eight kernels, no einsum: the map is sampled once for all heads (their points are one
+        long grid, written out contiguously by the scaling), the weighted sum is a multiply and
+        a reduction as in the core, and the lift is one batched matmul in fp32 like the sampling
+        (with the one transposition copy it needs) and a copy into the output layout.
         """
         bs, len_q, heads, p, _ = sampling_locations.shape
         h, w = hw
         grid = (2 * sampling_locations - 1).reshape(bs, len_q * heads * p, 1, 2)
         samples = F.grid_sample(
-            value.reshape(bs, self.fine_dim, h, w), grid, mode="bilinear", padding_mode="zeros", align_corners=False
-        )  # [bs, fine_dim, len_q * heads * P, 1]
-        samples = samples.view(bs, self.fine_dim, len_q, heads, p)
-        read = torch.einsum(
-            "bcqhp,bqhp->bqhc", samples, attention_weights.to(samples.dtype)
-        )  # [bs, len_q, heads, fine_dim]
-        lifted = torch.einsum("bqhc,hcd->bqhd", read, self.fine_lift.to(read.dtype))
-        return lifted.reshape(bs, len_q, heads * self.head_dim)
+            value.view(bs, self.fine_dim, h, w), grid, mode="bilinear", padding_mode="zeros", align_corners=False
+        ).view(bs, self.fine_dim, len_q, heads, p)
+        read = (samples * attention_weights.unsqueeze(1)).sum(-1)  # [bs, fine_dim, len_q, heads]
+        with torch.autocast(device_type=read.device.type, enabled=False):
+            lifted = torch.matmul(read.permute(0, 3, 2, 1), self.fine_lift)  # [bs, heads, len_q, head_dim]
+        return lifted.transpose(1, 2).reshape(bs, len_q, heads * self.head_dim)
 
     def forward(self, query: torch.Tensor, reference_points: torch.Tensor, value, value_spatial_shapes):
         """
@@ -242,4 +243,4 @@ class MSDeformableAttention(nn.Module):
             attention_weights[..., p:],
             self.num_points_list[1:],
         )
-        return rest + fine.to(rest.dtype)
+        return rest + fine
