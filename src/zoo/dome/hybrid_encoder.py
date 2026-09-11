@@ -45,8 +45,9 @@ class HybridEncoder(nn.Module):
             with its inner width halved to ``hidden_dim``) or ``light`` (``blocks.LightFusion``:
             a 1x1 fuse, a depthwise 3x3 and a 1x1, a quarter of the ELAN block's FLOPs).
         use_hybrid: run the top-down / bottom-up pyramid; off, the projected levels are returned.
-        checkpoint_fusion: in training, recompute the fusion blocks' activations in the backward
-            pass instead of keeping them (the stride-4 level's are most of the encoder's memory).
+        checkpoint_fusion: in training, recompute the fusion blocks' (and the fine level's
+            blocks') activations in the backward pass instead of keeping them (the stride-4
+            level's are most of the encoder's memory).
         eval_spatial_size: (h, w) at evaluation, to precompute the position embeddings; unset,
             they are built for whatever size arrives.
         fine_in_channels / fine_dim / fine_blocks: the fine level, a map one stride finer than
@@ -205,7 +206,10 @@ class HybridEncoder(nn.Module):
     def _fine(self, stem: torch.Tensor, finest: torch.Tensor) -> torch.Tensor:
         """The fine level from the stem map and the finest pyramid level (upsampled to the stem map's size)."""
         semantics = F.interpolate(self.fine_top_down(finest), size=stem.shape[2:], mode="bilinear", align_corners=True)
-        return self.fine_blocks(self.fine_lateral(stem) + semantics)
+        x = self.fine_lateral(stem) + semantics
+        if self.checkpoint_fusion and self.training and torch.is_grad_enabled():
+            return checkpoint_module(self.fine_blocks, x)
+        return self.fine_blocks(x)
 
     def forward(self, feats, img_inputs, targets=None):
         stem = None
