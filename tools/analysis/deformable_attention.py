@@ -67,7 +67,10 @@ class SamplingRecorder:
     def __init__(self, decoder):
         self.decoder = decoder
         self.records = []
+        self.raw = []  # per layer: (raw offsets [B, Q, H, P, 2] as the linear layer outputs them, reference boxes [B, Q, 4])
+        self.null = []  # per layer: the weight of every head's null entry [B, Q, H], or None without null_point
         self.originals = []
+        self.handles = []
 
     def __enter__(self):
         for layer in self.decoder.layers:
@@ -87,11 +90,25 @@ class SamplingRecorder:
 
             attn.ms_deformable_attn_core = wrapped
             self.originals.append((attn, original))
+
+            def hook(module, args, output, _raw=self.raw, _null=self.null):
+                query, reference_points = args[0], args[1]
+                raw = module.sampling_offsets(query).reshape(*query.shape[:2], module.num_heads, -1, 2)
+                _raw.append((raw.detach().float().cpu(), reference_points[:, :, 0].detach().float().cpu()))
+                if getattr(module, "null_point", False):
+                    logits = module.attention_weights(query).reshape(*query.shape[:2], module.num_heads, -1)
+                    _null.append(logits.softmax(-1)[..., -1].detach().float().cpu())
+                else:
+                    _null.append(None)
+
+            self.handles.append(attn.register_forward_hook(hook))
         return self
 
     def __exit__(self, *exc):
         for attn, original in self.originals:
             attn.ms_deformable_attn_core = original
+        for handle in self.handles:
+            handle.remove()
 
 
 def sample_with_attention(dataset, collate, index, model, decoder, device):
@@ -100,6 +117,8 @@ def sample_with_attention(dataset, collate, index, model, decoder, device):
     if len(recorder.records) != decoder.num_layers:
         raise RuntimeError(f"recorded {len(recorder.records)} cross-attention calls for {decoder.num_layers} layers")
     sample.attention = recorder.records
+    sample.raw_offsets = recorder.raw
+    sample.null_weights = recorder.null
     return sample
 
 
@@ -150,18 +169,49 @@ def cell_stats(sample, layer, q, strides):
     w = weights[0, q]  # [H, P]
     box = entering_box(sample, layer, q)  # xyxy input px
     half_px = (box[2:] - box[:2]) / 2  # [2]
-    half_cells, spread, collapsed = [], [], []
+    half_cells, spread, collapsed, effective = [], [], [], []
     for lv in range(int(level.max()) + 1):
         m = level == lv
         pts = points[:, m]  # [H, n, 2]
         wl = w[:, m].sum(-1)  # [H] the level's weight per head
+        prob = w[:, m] / wl.clamp_min(1e-12)[:, None]  # [H, n] the head's weights within the level
+        entropy = -(prob * prob.clamp_min(1e-12).log()).sum(-1)  # [H]
         distance = (pts[:, :, None] - pts[:, None]).abs().max(-1).values  # [H, n, n] Chebyshev, px
         s = distance.flatten(1).max(-1).values / strides[lv]  # [H] cells
         total = float(wl.sum())
         half_cells.append(float(half_px.mean() / strides[lv]))
         spread.append(float((wl * s).sum() / total) if total > 0 else 0.0)
         collapsed.append(float(wl[s < 1.0].sum() / total) if total > 0 else 0.0)
-    return {"half_cells": half_cells, "spread": spread, "collapsed": collapsed}
+        effective.append(float((wl * entropy.exp()).sum() / total) if total > 0 else 0.0)
+    return {"half_cells": half_cells, "spread": spread, "collapsed": collapsed, "effective": effective}
+
+
+INIT_OFFSET = (
+    2.5  # the mean Chebyshev magnitude of the initial raw offsets (points at 1, 2, 3, 4 along a head's direction)
+)
+
+
+def offset_records_of(sample, score_threshold):
+    """
+    One record per detection (a query whose final score reaches ``score_threshold``): its size
+    bucket by its final box, and per layer and level the mean Chebyshev magnitude of the raw
+    offsets (the linear layer's output, before the box scaling) relative to the initialization.
+    The queries need no ground truth: the question is whether the network asks for larger raw
+    offsets when the box is small.
+    """
+    keep = torch.where(sample.scores[-1] >= score_threshold)[0]
+    if len(keep) == 0:
+        return []
+    boxes = sample.boxes[-1, keep]  # xyxy px
+    sizes = ((boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])).clamp_min(0).sqrt() * sample.orig_scale
+    level = sample.attention[0][2]
+    num_levels = int(level.max()) + 1
+    per_layer = []
+    for raw, _ in sample.raw_offsets:
+        magnitude = raw[0, keep].abs().max(-1).values  # [n, H, P] Chebyshev, in the unit of the initialization
+        per_layer.append(torch.stack([magnitude[:, :, level == lv].mean(dim=(1, 2)) for lv in range(num_levels)], -1))
+    gain = torch.stack(per_layer, 1) / INIT_OFFSET  # [n, L, levels]
+    return [{"bucket": bucket_of(float(sizes[i])), "gain": gain[i].tolist()} for i in range(len(keep))]
 
 
 # --------------------------------------------------------------------------------------------
@@ -314,6 +364,11 @@ def trend_table(records, num_layers, strides):
         ("half_cells", "Half-size of the box the layer starts from, in cells of the level", "{:.2f}"),
         ("spread", "Weighted spread of a head's points of the level, in cells (largest Chebyshev distance)", "{:.2f}"),
         ("collapsed", "Share of the level's weight on heads whose points all lie within one cell", "{:.0%}"),
+        (
+            "effective",
+            "Effective points of a head at the level (exp of the entropy of its weights there, 1 to 4)",
+            "{:.2f}",
+        ),
     ):
         lines.append(f"### {title}\n")
         lines.append("| size | n | layer | " + " | ".join(f"stride {s}" for s in strides) + " |")
@@ -329,18 +384,59 @@ def trend_table(records, num_layers, strides):
     return "\n".join(lines)
 
 
+def null_table(records, num_layers):
+    """The weight on the null entry per object size and layer (mean over heads); empty without the option."""
+    if not records or any(np.isnan(records[0]["null"])):
+        return ""
+    names = [b[0] for b in SIZE_BUCKETS] + ["all"]
+    lines = [
+        "### Weight on the null entry (a head abstaining), mean over heads\n",
+        "| size | n | " + " | ".join(f"layer {i}" for i in range(num_layers)) + " |",
+        "| --- | ---: | " + " | ".join("---:" for _ in range(num_layers)) + " |",
+    ]
+    for name in names:
+        rows = records if name == "all" else [r for r in records if r["bucket"] == name]
+        if not rows:
+            continue
+        values = np.array([r["null"] for r in rows]).mean(0)
+        lines.append(f"| {name} | {len(rows)} | " + " | ".join(f"{v:.1%}" for v in values) + " |")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def offset_table(records, num_layers, strides, score_threshold):
+    names = [b[0] for b in SIZE_BUCKETS] + ["all"]
+    lines = [
+        f"### Raw offset magnitude relative to the initialization, detections scoring at least {score_threshold} (by their own box)\n",
+        "| size | n | layer | " + " | ".join(f"stride {s}" for s in strides) + " |",
+        "| --- | ---: | ---: | " + " | ".join("---:" for _ in strides) + " |",
+    ]
+    for name in names:
+        rows = records if name == "all" else [r for r in records if r["bucket"] == name]
+        if not rows:
+            continue
+        for layer in range(num_layers):
+            values = np.array([r["gain"][layer] for r in rows]).mean(0)
+            lines.append(f"| {name} | {len(rows)} | {layer} | " + " | ".join(f"{v:.2f}" for v in values) + " |")
+    lines.append("")
+    return "\n".join(lines)
+
+
 def records_of(sample, iou_threshold, strides):
     records = []
     num_layers = len(sample.attention)
     for g, q, _ in sample.match(iou_threshold):
         stats = [object_stats(sample, layer, q, g) for layer in range(num_layers)]
         cells = [cell_stats(sample, layer, q, strides) for layer in range(num_layers)]
+        null = [float(n[0, q].mean()) if n is not None else float("nan") for n in sample.null_weights]
         records.append(
             {
                 "bucket": bucket_of(sample.gt_size(g)),
+                "null": null,
                 "half_cells": [c["half_cells"] for c in cells],
                 "spread": [c["spread"] for c in cells],
                 "collapsed": [c["collapsed"] for c in cells],
+                "effective": [c["effective"] for c in cells],
                 "inside": [s["inside"] for s in stats],
                 "within_1": [s["within_1"] for s in stats],
                 "reach_units": [s["reach_units"] for s in stats],
@@ -372,6 +468,12 @@ def main():
         type=float,
         default=0.5,
         help="final IoU a query needs to be a candidate for an object; the highest-scoring one is taken (default 0.5)",
+    )
+    parser.add_argument(
+        "--score",
+        type=float,
+        default=0.3,
+        help="score a query needs to count as a detection in the raw offset table (default 0.3)",
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -413,10 +515,11 @@ def main():
     if args.num_images > 0:
         rng = random.Random(args.seed)
         indices = rng.sample(range(len(dataset)), min(args.num_images, len(dataset)))
-        records = []
+        records, offset_records = [], []
         for i, idx in enumerate(indices):
             s = sample if idx == index else sample_with_attention(dataset, collate, idx, model, decoder, args.device)
             records += records_of(s, args.match_iou, strides)
+            offset_records += offset_records_of(s, args.score)
             if (i + 1) % 10 == 0:
                 print(f"  {i + 1}/{len(indices)} images, {len(records)} objects")
         if records:
@@ -429,8 +532,14 @@ def main():
                 f"Reach is the Chebyshev distance of a sampling point from the box centre, in box sizes or input pixels. "
                 f"The per-level tables measure the box a layer starts from (the proposal for layer 0, else the previous "
                 f"layer's box) and each head's {attn.num_points_list[0]} points of a level in cells of that level; points "
-                f"within one cell read the same bilinear neighbourhood. Sizes are square-root areas in original pixels."
-                f"\n\n![trend](trend.png)\n\n" + trend_table(records, decoder.num_layers, strides)
+                f"within one cell read the same bilinear neighbourhood. The raw offset table looks at the sampling offsets "
+                f"before they are scaled by the box (a Chebyshev magnitude of 1.0 is the initialization's star of points at "
+                f"1, 2, 3, 4), over every detection rather than matched objects. Sizes are square-root areas in original pixels."
+                f"\n\n![trend](trend.png)\n\n"
+                + trend_table(records, decoder.num_layers, strides)
+                + "\n"
+                + offset_table(offset_records, decoder.num_layers, strides, args.score)
+                + null_table(records, decoder.num_layers)
             )
             with open(os.path.join(out_dir, "trend.md"), "w", encoding="utf-8") as f:
                 f.write(text)
