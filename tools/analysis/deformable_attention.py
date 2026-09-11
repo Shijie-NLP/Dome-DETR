@@ -13,7 +13,9 @@ Written into ``<run>/attention/``:
 * ``trend.png`` and ``trend.md``: over a sample of images, per object size and layer, the
   attention-weighted density of sampling points in ground-truth box units (where the model
   reads relative to the object), the share of weight per feature level, the share inside the
-  box, and how far out the points reach.
+  box, and how far out the points reach; then per level the box the layer starts from in cells,
+  how far apart each head's points of that level land in cells, and the weight carried by heads
+  whose points all fall within one cell (the coarse-level collapse ``min_sample_cells`` floors).
 
     python tools/analysis/deformable_attention.py outputs/dfine_s_visdrone/2026-09-09_17-13-58
     python tools/analysis/deformable_attention.py <run> --image 0000001_02999_d_0000005 --objects 8 --num-images 100
@@ -135,6 +137,31 @@ def object_stats(sample, layer, q, g):
         "rel": rel,
         "weights": weights / total,
     }
+
+
+def cell_stats(sample, layer, q, strides):
+    """
+    Per level: the half-size of the box the layer starts from in cells of that level, the
+    attention-weighted spread (largest Chebyshev distance between a head's points of the level,
+    in cells) and the share of the level's weight on heads whose points all lie within one cell.
+    """
+    locations, weights, level, _ = sample.attention[layer]
+    points = locations[0, q] * sample.size  # [H, P, 2] input px
+    w = weights[0, q]  # [H, P]
+    box = entering_box(sample, layer, q)  # xyxy input px
+    half_px = (box[2:] - box[:2]) / 2  # [2]
+    half_cells, spread, collapsed = [], [], []
+    for lv in range(int(level.max()) + 1):
+        m = level == lv
+        pts = points[:, m]  # [H, n, 2]
+        wl = w[:, m].sum(-1)  # [H] the level's weight per head
+        distance = (pts[:, :, None] - pts[:, None]).abs().max(-1).values  # [H, n, n] Chebyshev, px
+        s = distance.flatten(1).max(-1).values / strides[lv]  # [H] cells
+        total = float(wl.sum())
+        half_cells.append(float(half_px.mean() / strides[lv]))
+        spread.append(float((wl * s).sum() / total) if total > 0 else 0.0)
+        collapsed.append(float(wl[s < 1.0].sum() / total) if total > 0 else 0.0)
+    return {"half_cells": half_cells, "spread": spread, "collapsed": collapsed}
 
 
 # --------------------------------------------------------------------------------------------
@@ -283,17 +310,37 @@ def trend_table(records, num_layers, strides):
             values = np.array([r["level_share"][layer] for r in rows]).mean(0)
             lines.append(f"| {name} | {len(rows)} | {layer} | " + " | ".join(f"{v:.0%}" for v in values) + " |")
     lines.append("")
+    for key, title, fmt in (
+        ("half_cells", "Half-size of the box the layer starts from, in cells of the level", "{:.2f}"),
+        ("spread", "Weighted spread of a head's points of the level, in cells (largest Chebyshev distance)", "{:.2f}"),
+        ("collapsed", "Share of the level's weight on heads whose points all lie within one cell", "{:.0%}"),
+    ):
+        lines.append(f"### {title}\n")
+        lines.append("| size | n | layer | " + " | ".join(f"stride {s}" for s in strides) + " |")
+        lines.append("| --- | ---: | ---: | " + " | ".join("---:" for _ in strides) + " |")
+        for name in names:
+            rows = records if name == "all" else [r for r in records if r["bucket"] == name]
+            if not rows:
+                continue
+            for layer in range(num_layers):
+                values = np.array([r[key][layer] for r in rows]).mean(0)
+                lines.append(f"| {name} | {len(rows)} | {layer} | " + " | ".join(fmt.format(v) for v in values) + " |")
+        lines.append("")
     return "\n".join(lines)
 
 
-def records_of(sample, iou_threshold):
+def records_of(sample, iou_threshold, strides):
     records = []
     num_layers = len(sample.attention)
     for g, q, _ in sample.match(iou_threshold):
         stats = [object_stats(sample, layer, q, g) for layer in range(num_layers)]
+        cells = [cell_stats(sample, layer, q, strides) for layer in range(num_layers)]
         records.append(
             {
                 "bucket": bucket_of(sample.gt_size(g)),
+                "half_cells": [c["half_cells"] for c in cells],
+                "spread": [c["spread"] for c in cells],
+                "collapsed": [c["collapsed"] for c in cells],
                 "inside": [s["inside"] for s in stats],
                 "within_1": [s["within_1"] for s in stats],
                 "reach_units": [s["reach_units"] for s in stats],
@@ -369,7 +416,7 @@ def main():
         records = []
         for i, idx in enumerate(indices):
             s = sample if idx == index else sample_with_attention(dataset, collate, idx, model, decoder, args.device)
-            records += records_of(s, args.match_iou)
+            records += records_of(s, args.match_iou, strides)
             if (i + 1) % 10 == 0:
                 print(f"  {i + 1}/{len(indices)} images, {len(records)} objects")
         if records:
@@ -380,8 +427,10 @@ def main():
                 f"(the highest-scoring query whose final box reaches IoU {args.match_iou}). Every layer samples "
                 f"{attn.num_heads} heads x {sum(attn.num_points_list)} points; weights are softmaxed per head and pooled over heads. "
                 f"Reach is the Chebyshev distance of a sampling point from the box centre, in box sizes or input pixels. "
-                f"Sizes are square-root areas in original pixels.\n\n![trend](trend.png)\n\n"
-                + trend_table(records, decoder.num_layers, strides)
+                f"The per-level tables measure the box a layer starts from (the proposal for layer 0, else the previous "
+                f"layer's box) and each head's {attn.num_points_list[0]} points of a level in cells of that level; points "
+                f"within one cell read the same bilinear neighbourhood. Sizes are square-root areas in original pixels."
+                f"\n\n![trend](trend.png)\n\n" + trend_table(records, decoder.num_layers, strides)
             )
             with open(os.path.join(out_dir, "trend.md"), "w", encoding="utf-8") as f:
                 f.write(text)

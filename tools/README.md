@@ -117,8 +117,9 @@ to `<run>/attention/`: `object_<k>.png` (one panel per layer: the crop, the box 
 from, the ground truth, and every sampling point of all heads, coloured by feature level and
 sized by attention weight) and `trend.png` / `trend.md` (over a sample of images, per object
 size and layer: the attention-weighted density of sampling points in ground-truth box units,
-the share of weight inside the box and within one box size, the weighted reach, and the share
-of weight per feature level).
+the share of weight inside the box and within one box size, the weighted reach, the share of
+weight per feature level, and per level the box the layer starts from, the spread of a head's
+points and the weight on heads whose points all lie within one cell, in cells of the level).
 
 ```
 python tools/analysis/deformable_attention.py outputs/dfine_s_visdrone/2026-09-09_17-13-58
