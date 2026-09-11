@@ -182,11 +182,34 @@ class YAMLConfig(BaseConfig):
         return total_batch_size // world_size
 
     def build_dataloader(self, name: str):
+        """
+        The loader of ``name``. ``group_by_count`` in its yaml (``True``, or the arguments of
+        ``GroupedBatchSampler``: ``width``, ``last``, ``drop_last``) batches images of similar
+        object counts, so a per-image query budget pads nothing; the sampler handles the ranks.
+        """
         bs = self.get_rank_batch_size(self.yaml_cfg[name])
         global_cfg = self.global_cfg
-        # total_batch_size is ours, not DataLoader's
+        # total_batch_size and group_by_count are ours, not DataLoader's
         global_cfg[name].pop("total_batch_size", None)
+        grouping = global_cfg[name].pop("group_by_count", False)
         print(f"building {name} with batch_size={bs}...")
         loader = create(name, global_cfg, batch_size=bs)
         loader.shuffle = self.yaml_cfg[name].get("shuffle", False)
+        if grouping:
+            from ..data import DataLoader, GroupedBatchSampler
+
+            sampler = GroupedBatchSampler(
+                loader.dataset, bs, shuffle=loader.shuffle, **(grouping if isinstance(grouping, dict) else {})
+            )
+            print(f"  grouped by object count: {sampler.summary()}")
+            grouped = DataLoader(
+                loader.dataset,
+                batch_sampler=sampler,
+                collate_fn=loader.collate_fn,
+                pin_memory=loader.pin_memory,
+                num_workers=loader.num_workers,
+                persistent_workers=loader.persistent_workers,
+            )
+            grouped.shuffle = loader.shuffle
+            loader = grouped
         return loader

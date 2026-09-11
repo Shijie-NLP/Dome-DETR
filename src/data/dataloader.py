@@ -51,6 +51,8 @@ class DataLoader(data.DataLoader, EpochAware):
         super().set_epoch(epoch)
         self.dataset.set_epoch(epoch)
         self.collate_fn.set_epoch(epoch)
+        if hasattr(self.batch_sampler, "set_epoch"):  # a GroupedBatchSampler reshuffles per epoch
+            self.batch_sampler.set_epoch(epoch)
 
     @property
     def shuffle(self) -> bool:

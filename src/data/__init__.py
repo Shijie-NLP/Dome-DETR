@@ -7,14 +7,17 @@ from . import dataset, transforms
 from ._misc import convert_to_tv_tensor
 from .dataloader import BaseCollateFunction, BatchImageCollateFunction, DataLoader, generate_scales
 from .dataset import get_coco_api_from_dataset
+from .grouped_sampler import GroupedBatchSampler, object_counts
 
 __all__ = [
     "BaseCollateFunction",
     "BatchImageCollateFunction",
     "DataLoader",
+    "GroupedBatchSampler",
     "convert_to_tv_tensor",
     "dataset",
     "generate_scales",
     "get_coco_api_from_dataset",
+    "object_counts",
     "transforms",
 ]

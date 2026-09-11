@@ -52,8 +52,8 @@ class DetSolver(BaseSolver):
         start_time = time.time()
         for epoch in range(self.last_epoch + 1, cfg.epoches):
             self.train_dataloader.set_epoch(epoch)
-            if dist_utils.is_dist_available_and_initialized():
-                self.train_dataloader.sampler.set_epoch(epoch)
+            if dist_utils.is_dist_available_and_initialized() and hasattr(self.train_dataloader.sampler, "set_epoch"):
+                self.train_dataloader.sampler.set_epoch(epoch)  # a grouped loader's sampler got it from set_epoch above
             stage2 = epoch >= stage2_start
 
             if epoch == stage2_start:

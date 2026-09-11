@@ -152,10 +152,15 @@ def de_model(model):
 
 
 def warp_loader(loader, shuffle=False):
-    """The loader rebuilt around a DistributedSampler when running distributed; unchanged otherwise."""
+    """
+    The loader rebuilt around a DistributedSampler when running distributed; unchanged otherwise,
+    and unchanged when its batch sampler already deals its batches to the ranks (``GroupedBatchSampler``).
+    """
     if is_dist_available_and_initialized():
-        from ..data import DataLoader  # here, not at module level: data imports misc
+        from ..data import DataLoader, GroupedBatchSampler  # here, not at module level: data imports misc
 
+        if isinstance(loader.batch_sampler, GroupedBatchSampler):
+            return loader
         sampler = DistributedSampler(loader.dataset, shuffle=shuffle)
         loader = DataLoader(
             loader.dataset,
