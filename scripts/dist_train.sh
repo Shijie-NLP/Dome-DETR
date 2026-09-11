@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # Distributed training.
-#   bash dist_train.sh <config.yml> [num_gpus] [extra train.py args...]
+#   bash scripts/dist_train.sh <config.yml> [num_gpus] [extra train.py args...]
 # e.g.
-#   CUDA_VISIBLE_DEVICES=0,1 bash dist_train.sh configs/dome/DFine-S-VisDrone.yml 2
-#   CUDA_VISIBLE_DEVICES=0,1,2,3 bash dist_train.sh configs/dome/Dome-S-VisDrone.yml 4 --use-amp
+#   CUDA_VISIBLE_DEVICES=0,1 bash scripts/dist_train.sh configs/dome/DFine-S-VisDrone.yml 2
+#   CUDA_VISIBLE_DEVICES=0,1,2,3 bash scripts/dist_train.sh configs/dome/Dome-S-VisDrone.yml 4 --use-amp
 # The log goes to logs/<config name>-<timestamp>.log. MASTER_PORT defaults to 7789.
 set -euo pipefail
+cd "$(dirname "$0")/.."
 
-CONFIG=${1:?usage: bash dist_train.sh <config.yml> [num_gpus] [extra train.py args...]}
+CONFIG=${1:?usage: bash scripts/dist_train.sh <config.yml> [num_gpus] [extra train.py args...]}
 NGPU=${2:-2}
 shift $(($# >= 2 ? 2 : 1))
 
