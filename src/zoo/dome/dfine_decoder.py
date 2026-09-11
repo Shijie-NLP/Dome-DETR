@@ -220,6 +220,11 @@ class DFINETransformer(nn.Module):
             it doubles per level (D-FINE's 0.05 is 5 cells of a stride-8 first level; a stride-4
             first level wants 0.025 for the same ratio). Must exceed ``eps``, or the border test
             marks every token invalid.
+        anchor_cells: with a value above 0, the anchor box of every level's tokens is so many
+            cells of that level instead, square in pixels (``anchor_cells * stride``) whatever
+            the input's size or aspect. A fraction of the image grows with the input: at 1333x800
+            the 0.05 anchors are 67x40 px against the 40x40 of the 800x800 training crops, one
+            reason AP collapses above the training extent. 10 reproduces 0.05 on 800x800 inputs.
         fine_channels: with a value above 0, the encoder's ``fine`` map (``HybridEncoder``'s
             fine level, so many channels wide, one stride finer than its first level) is read
             by every decoder layer's deformable cross-attention as its first, finest level,
@@ -268,6 +273,7 @@ class DFINETransformer(nn.Module):
         min_sample_cells=0.0,
         min_refine_cells=0.0,
         anchor_grid_size=0.05,
+        anchor_cells=0,
         fine_channels=0,
     ):
         super().__init__()
@@ -289,6 +295,7 @@ class DFINETransformer(nn.Module):
         self.num_classes = num_classes
         self.eps = eps
         self.anchor_grid_size = anchor_grid_size
+        self.anchor_cells = anchor_cells
         self.num_layers = num_layers
         self.eval_spatial_size = eval_spatial_size
         self.aux_loss = aux_loss
@@ -436,8 +443,9 @@ class DFINETransformer(nn.Module):
 
     def _generate_anchors(self, spatial_shapes=None, dtype=torch.float32, device="cpu"):
         """
-        One anchor box (as logits) per token of every level, ``anchor_grid_size * 2 ** level`` wide;
-        boxes too close to the border are marked invalid. Cached per (shapes, device): a forward
+        One anchor box (as logits) per token of every level, ``anchor_grid_size * 2 ** level`` of
+        the image wide, or ``anchor_cells`` cells of the level; boxes too close to the border are
+        marked invalid. Cached per (shapes, device): a forward
         pays for them once per input size. (Built on the host as before: a CUDA division by a
         Python scalar rounds differently and flips border tokens' validity.)
         """
@@ -456,7 +464,10 @@ class DFINETransformer(nn.Module):
             grid_y, grid_x = torch.meshgrid(torch.arange(h), torch.arange(w), indexing="ij")
             grid_xy = torch.stack([grid_x, grid_y], dim=-1)
             grid_xy = (grid_xy.unsqueeze(0) + 0.5) / torch.tensor([w, h], dtype=dtype)
-            wh = torch.ones_like(grid_xy) * self.anchor_grid_size * (2.0**lvl)
+            if self.anchor_cells > 0:
+                wh = torch.ones_like(grid_xy) * self.anchor_cells / torch.tensor([w, h], dtype=dtype)
+            else:
+                wh = torch.ones_like(grid_xy) * self.anchor_grid_size * (2.0**lvl)
             anchors.append(torch.concat([grid_xy, wh], dim=-1).reshape(-1, h * w, 4))
 
         anchors = torch.concat(anchors, dim=1).to(device, non_blocking=True)
