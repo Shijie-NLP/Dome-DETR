@@ -123,14 +123,21 @@ class StemBlock(nn.Module):
         self.stem4 = ConvBNAct(mid_chs, out_chs, kernel_size=1, stride=1, use_lab=use_lab)
         self.pool = nn.MaxPool2d(kernel_size=2, stride=1, ceil_mode=True)
 
-    def forward(self, x):
+    def half(self, x):
+        """The stride-2 map, ``2 * mid_chs`` channels: the two branches concatenated, before the second strided conv."""
         x = self.stem1(x)
         # the 2x2 convs and the pool are padded by one on the bottom/right so they keep the size
         x = F.pad(x, (0, 1, 0, 1))
         x2 = self.stem2b(F.pad(self.stem2a(x), (0, 1, 0, 1)))
         x1 = self.pool(x)
-        x = torch.cat([x1, x2], dim=1)
-        return self.stem4(self.stem3(x))
+        return torch.cat([x1, x2], dim=1)
+
+    def finish(self, half):
+        """The stride-4 output from the stride-2 map."""
+        return self.stem4(self.stem3(half))
+
+    def forward(self, x):
+        return self.finish(self.half(x))
 
 
 class EseModule(nn.Module):
@@ -258,6 +265,9 @@ class HGNetv2(nn.Module):
         name: the architecture, ``B0`` .. ``B6``.
         use_lab: add a LearnableAffineBlock after every activation.
         return_idx: which stages (0-based) to return; stages after the last one are not built.
+        return_stem: also return the stem's stride-2 map (``stem_channels`` wide, twice the
+            stem's middle width) ahead of the stages, for an encoder that builds a finer level
+            from it; the stem computes it anyway.
         freeze_stem_only: with ``freeze_at >= 0``, freeze only the stem rather than the stem and
             stages ``0 .. freeze_at``.
         freeze_at: -1 freezes nothing; otherwise the stem (and stages, see above) stop training.
@@ -340,6 +350,7 @@ class HGNetv2(nn.Module):
         name,
         use_lab=False,
         return_idx=(1, 2, 3),
+        return_stem=False,
         freeze_stem_only=True,
         freeze_at=0,
         freeze_norm=True,
@@ -349,12 +360,14 @@ class HGNetv2(nn.Module):
         super().__init__()
         self.use_lab = use_lab
         self.return_idx = return_idx
+        self.return_stem = return_stem
 
         stem_channels = self.arch_configs[name]["stem_channels"]
         stage_config = self.arch_configs[name]["stage_config"]
 
         self._out_strides = [4, 8, 16, 32]
         self._out_channels = [cfg.out_channels for cfg in stage_config.values()]
+        self.stem_channels = 2 * stem_channels[1]  # the stride-2 map's width
 
         self.stem = StemBlock(
             in_chs=stem_channels[0], mid_chs=stem_channels[1], out_chs=stem_channels[2], use_lab=use_lab
@@ -429,8 +442,9 @@ class HGNetv2(nn.Module):
             p.requires_grad = False
 
     def forward(self, x):
-        x = self.stem(x)
-        outs = []
+        half = self.stem.half(x)
+        x = self.stem.finish(half)
+        outs = [half] if self.return_stem else []
         for idx, stage in enumerate(self.stages):
             x = stage(x)
             if idx in self.return_idx:
