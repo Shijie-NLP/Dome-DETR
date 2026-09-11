@@ -4,8 +4,7 @@ Copyright (c) 2025 The Dome-DETR Authors. All Rights Reserved.
 
 The Dome-DETR model: ``DOME`` wires a backbone, an encoder (``HybridEncoder``, the D-FINE
 baseline, or ``DomeHybridEncoder`` with DeFE and MWAS) and a decoder (``DFINETransformer``, fixed top-k
-queries, ``DomeTransformer`` with PAQI, or ``MaxIoUTransformer`` with ground-truth-claimed
-queries); ``DomeCriterion`` and ``HungarianMatcher`` train it
+queries, or ``DomeTransformer`` with PAQI); ``DomeCriterion`` and ``HungarianMatcher`` train it
 and ``DomePostProcessor`` turns its outputs into detections. Importing the package registers
 all of them for the configs.
 """
@@ -17,7 +16,6 @@ from .dome_decoder import DomeTransformer
 from .dome_encoder import DomeHybridEncoder
 from .hybrid_encoder import HybridEncoder
 from .matcher import HungarianMatcher
-from .maxiou_decoder import MaxIoUTransformer
 from .postprocessor import DomePostProcessor
 
 __all__ = [
@@ -29,5 +27,4 @@ __all__ = [
     "DomeTransformer",
     "HungarianMatcher",
     "HybridEncoder",
-    "MaxIoUTransformer",
 ]

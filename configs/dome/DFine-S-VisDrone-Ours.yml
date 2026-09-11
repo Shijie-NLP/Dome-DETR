@@ -7,7 +7,9 @@
 #    blocks at 64 channels, and every decoder layer samples it as its finest level. The query
 #    selection, anchors and losses stay on the four pyramid levels. On the baseline tiny objects'
 #    last-layer edges are still 1.2 px off while the FDR bins are 0.3 px wide: the queries lack
-#    the resolution, not the range. See MaxIoU-S-VisDrone-Fine.yml for the cost.
+#    the resolution, not the range. Cost on the 5090 in bf16: training at 4 x 800x800 from 87
+#    to about 105 ms a step and 4.65 to 6.0 GB peak (5.1 with checkpoint_fusion); inference at
+#    1344x800 from 22 to about 24 ms an image.
 # 2. min_sample_cells 1: the sampling radius is floored at one cell on every level. On the
 #    baseline a tiny box's four points per head fall within one cell on strides 8 to 32, the
 #    network stretches its raw offsets three-fold on stride 32 to compensate, and stride 32 is
