@@ -1,5 +1,5 @@
 # D-FINE-S on VisDrone2019-DET with our method switched on: DFine-S-VisDrone as it is, plus the
-# four changes the 2026-09-11 probes led to. Each is one switch here, so the ablations
+# five changes the 2026-09-11 probes led to. Each is one switch here, so the ablations
 # are this file with one of them reset to the baseline's value.
 #
 # 1. A stride-2 fine level for the decoder's cross-attention (values only): HGNetv2's stem
@@ -24,6 +24,11 @@
 #    between AP collapsing above the training extent and not: the baseline checkpoint scores
 #    35.3 / 31.9 / 22.5 at short sides 800 / 960 / 1120 with fraction anchors and 36.4 / 36.0 /
 #    33.3 with cell anchors, with no retraining.
+# 5. null_point: every cross-attention head gets a softmax entry that samples nothing and adds a
+#    learned vector instead, so a head whose points read nothing useful can abstain. On the
+#    baseline the weights are nearly flat over a head's points (2.7 to 3.7 effective of 4) while
+#    those points collapse into one cell for tiny objects: a full-magnitude mixture of the same
+#    background value that the output projection then has to cancel.
 
 __include__: [
   './DFine-S-VisDrone.yml',
@@ -49,6 +54,8 @@ DFINETransformer:
   min_sample_cells: 1
   # 4. anchors in cells of their level (0: the baseline's fraction of the image)
   anchor_cells: 10
+  # 5. the null entry of every cross-attention head (False: the baseline)
+  null_point: True
 
 DomeCriterion:
   # 3. the encoder's quality target (own: the baseline)
