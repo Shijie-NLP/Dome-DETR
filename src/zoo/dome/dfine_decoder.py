@@ -54,12 +54,14 @@ class TransformerDecoder(nn.Module):
         up,
         eval_idx=-1,
         layer_scale=2,
+        fine_dim=0,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
         self.layer_scale = layer_scale
         self.num_head = num_head
+        self.fine_dim = fine_dim  # > 0: the first level is the raw fine map, so many channels wide
         self.eval_idx = eval_idx if eval_idx >= 0 else num_layers + eval_idx
         self.up, self.reg_scale, self.reg_max = up, reg_scale, reg_max
         self.layers = nn.ModuleList(
@@ -74,12 +76,16 @@ class TransformerDecoder(nn.Module):
         ``[bs, heads, c, h * w]`` tensor per level: a view of the level, cast to fp32 (the
         precision ``grid_sample`` runs at under autocast) once for every layer, so no layer
         copies or casts them again and the backward pass keeps one copy. ``value_scale`` (the
-        wider training-only layers) interpolates the channels to it.
+        wider training-only layers) interpolates the channels to it. A raw fine level
+        (``fine_dim``) stays ``[bs, fine_dim, h * w]``, whole for every head and every width.
         """
         values = []
-        for feat in feats:
+        for level, feat in enumerate(feats):
             bs, _, h, w = feat.shape
             value = feat.flatten(2)  # [bs, C, h * w]
+            if level == 0 and self.fine_dim > 0:
+                values.append(value.float())
+                continue
             if value_scale is not None:
                 value = F.interpolate(value.transpose(1, 2), size=value_scale).transpose(1, 2)
             values.append(value.float().reshape(bs, self.num_head, -1, h * w))
@@ -221,6 +227,13 @@ class DFINETransformer(nn.Module):
             the query selection, gets an anchor or is scored, so the selection and the losses
             are those of the encoder levels alone. ``num_points`` then has one more entry, its
             first for the fine level. 0 (default): no fine level.
+        fine_proj_at: where the fine level is projected to ``hidden_dim``: ``map`` (a 1x1
+            conv-BN on the whole map before sampling, so the cross-attention reads it like any
+            level) or ``samples`` (the raw map is sampled and each head's weighted sum is lifted
+            by a per-head linear, ``MSDeformableAttention(fine_dim)``: the same linear map
+            commuted past the bilinear sampling, with the dense map, its fp32 copy and the
+            gradient buffers of the sampling's backward pass at ``fine_channels`` rather than
+            ``hidden_dim`` channels).
     """
 
     __share__ = ["num_classes", "eval_spatial_size"]
@@ -258,9 +271,11 @@ class DFINETransformer(nn.Module):
         min_refine_cells=0.0,
         anchor_grid_size=0.05,
         fine_channels=0,
+        fine_proj_at="map",
     ):
         super().__init__()
         assert len(feat_channels) <= num_levels
+        assert fine_proj_at in ("map", "samples"), fine_proj_at
         assert anchor_grid_size > eps, f"anchor_grid_size {anchor_grid_size} must exceed eps {eps}"
         assert len(feat_strides) == len(feat_channels)
         assert query_select_method in ("default", "one2many", "agnostic"), query_select_method
@@ -290,6 +305,8 @@ class DFINETransformer(nn.Module):
         self.attn_logn_base = attn_logn_base or num_queries
         self.min_refine_cells = min_refine_cells
         self.fine_channels = fine_channels
+        self.fine_proj_at = fine_proj_at
+        fine_dim = fine_channels if fine_proj_at == "samples" else 0  # the raw fine level's width
         # the cross-attention's levels: the fine level, if any, then the encoder levels
         self.num_value_levels = num_levels + (1 if fine_channels > 0 else 0)
         if isinstance(num_points, (list, tuple)):
@@ -315,6 +332,7 @@ class DFINETransformer(nn.Module):
             n_points=num_points,
             cross_attn_method=cross_attn_method,
             min_sample_cells=min_sample_cells,
+            fine_dim=fine_dim,
         )
         decoder_layer = TransformerDecoderLayer(**layer_args)
         decoder_layer_wide = TransformerDecoderLayer(**layer_args, layer_scale=layer_scale)
@@ -329,6 +347,7 @@ class DFINETransformer(nn.Module):
             self.up,
             eval_idx,
             layer_scale,
+            fine_dim=fine_dim,
         )
 
         # denoising
@@ -391,7 +410,7 @@ class DFINETransformer(nn.Module):
         for m, in_channels in zip(self.input_proj, feat_channels):
             if in_channels != self.hidden_dim:
                 init.xavier_uniform_(m[0].weight)
-        if self.fine_channels > 0 and self.fine_channels != self.hidden_dim:
+        if hasattr(self, "fine_proj") and self.fine_channels != self.hidden_dim:
             init.xavier_uniform_(self.fine_proj[0].weight)
 
     def _proj(self, in_channels, kernel_size, stride):
@@ -404,14 +423,14 @@ class DFINETransformer(nn.Module):
     def _build_input_proj_layer(self, feat_channels):
         """
         A projection per level; extra levels downsample the last one with stride 2. The fine
-        level, if any, gets its own.
+        level, if any, gets its own when it is projected as a map.
         """
         self.input_proj = nn.ModuleList(self._proj(c, 1, 1) for c in feat_channels)
         in_channels = feat_channels[-1]
         for _ in range(self.num_levels - len(feat_channels)):
             self.input_proj.append(self._proj(in_channels, 3, 2))
             in_channels = self.hidden_dim
-        if self.fine_channels > 0:
+        if self.fine_channels > 0 and self.fine_proj_at == "map":
             self.fine_proj = self._proj(self.fine_channels, 1, 1)
 
     def _get_encoder_input(self, feats: list[torch.Tensor]):
@@ -521,7 +540,9 @@ class DFINETransformer(nn.Module):
         # and the FDR unit below stay on the encoder levels
         value_feats, value_shapes = proj_feats, spatial_shapes
         if self.fine_channels > 0:
-            fine = self.fine_proj(encoder_out["fine"])
+            fine = encoder_out["fine"]
+            if self.fine_proj_at == "map":
+                fine = self.fine_proj(fine)
             value_feats, value_shapes = [fine, *proj_feats], [list(fine.shape[2:]), *spatial_shapes]
 
         dec_in = self._get_decoder_input(memory, spatial_shapes, encoder_out, targets)
