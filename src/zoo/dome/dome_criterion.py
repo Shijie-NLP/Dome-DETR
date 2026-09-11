@@ -25,6 +25,7 @@ from ...misc.box_ops import (
 )
 from .fdr import bbox2distance
 from .matcher import FlatMatches, PaddedTargets, padded_targets, topk_matching_flat
+from .rank_sort import rank_sort_loss
 
 __all__ = ["DomeCriterion"]
 
@@ -201,7 +202,8 @@ class DomeCriterion(nn.Module):
         matcher: the Hungarian matcher (injected from the config).
         weight_dict: weight per loss term; terms not listed are dropped.
         losses: which of ``vfl`` / ``focal`` / ``mal`` / ``obj`` (classification), ``boxes`` (L1 +
-            GIoU) and ``local`` (FDR's fine-grained localization and distillation losses) to
+            GIoU), ``local`` (FDR's fine-grained localization and distillation losses) and
+            ``rank`` (the Rank & Sort loss on the last layer's scores, see ``loss_rank``) to
             compute.
         enc_losses: the losses of the encoder sets instead (``None``: ``losses``); e.g.
             ``['obj', 'boxes']`` trains the encoder's class logits as plain 0/1 objectness.
@@ -261,6 +263,7 @@ class DomeCriterion(nn.Module):
             boundary (recall), but a positive whose box is well off its ground truth pushes less.
         enc_obj_pos_weight: ``balanced`` only: how much more the positive half weighs than the
             negative half; the boundary moves to a likelihood ratio of its inverse.
+        rank_delta: the half-width of the Rank & Sort loss's smoothed step (0.5 in the paper).
     """
 
     __share__ = ["num_classes"]
@@ -293,8 +296,10 @@ class DomeCriterion(nn.Module):
         enc_obj_loss="plain",
         enc_obj_quality_weight=False,
         enc_obj_pos_weight=1.0,
+        rank_delta=0.5,
     ):
         super().__init__()
+        self.rank_delta = rank_delta
         self.num_classes = num_classes
         self.matcher = matcher
         self.weight_dict = weight_dict
@@ -416,6 +421,29 @@ class DomeCriterion(nn.Module):
         weight = neg_weight * pred_score.pow(self.gamma) * (1 - target) + target
         loss = F.binary_cross_entropy_with_logits(src_logits, target_score, weight=weight, reduction="none")
         return {"loss_mal": self._reduce_query_loss(loss, stack, num_boxes)}
+
+    def loss_rank(self, stack, pairs, num_boxes, targets, **kwargs):
+        """
+        The Rank & Sort loss (``rank_sort.py``) over the stack's first set, the decoder's last
+        layer, whose scores rank the detections at inference: over the batch's (query, class)
+        entries, the matched queries' ground-truth classes are positives with their pair's
+        quality as target and everything else is negative, and the loss asks for the positives
+        above the negatives and sorted by quality. Padded queries are left out; the denoising
+        sets and the other layers get nothing. On the encoder stack (``enc_losses`` unset) the
+        same applies to the encoder's scores, whose ranking picks the queries.
+        """
+        if stack.is_dn:
+            return {}
+        logits = stack.logits[0]  # [B, Q, C]
+        first = pairs.set_idx == 0
+        _, _, quality = self._matched(stack, pairs, targets)
+        target = torch.zeros_like(logits, dtype=torch.float32)
+        labels = targets.labels[pairs.batch_idx[first], pairs.target_idx[first]]
+        target[pairs.batch_idx[first], pairs.query_idx[first], labels] = quality[first].float().clamp_min(1e-4)
+        if stack.q_valid is not None:
+            keep = stack.q_valid[:, :, None].expand_as(logits)
+            logits, target = logits[keep], target[keep]
+        return {"loss_rank": rank_sort_loss(logits.flatten(), target.flatten(), self.rank_delta)[None]}
 
     def loss_obj(self, stack, pairs, num_boxes, targets, **kwargs):
         """
@@ -579,6 +607,7 @@ class DomeCriterion(nn.Module):
             "mal": self.loss_labels_mal,
             "obj": self.loss_obj,
             "local": self.loss_local,
+            "rank": self.loss_rank,
         }
         assert loss in loss_map, f"do you really want to compute {loss} loss?"
         return loss_map[loss](stack, pairs, num_boxes, targets, **kwargs)
