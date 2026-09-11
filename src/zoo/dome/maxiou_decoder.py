@@ -89,7 +89,7 @@ class MaxIoUTransformer(DFINETransformer):
         infer_rule: ``objectness`` (the tokens that pass, per-image count) or ``topk``
             (``num_queries`` best by objectness).
         local_attn_k / attn_logn_scale / attn_logn_base / min_sample_cells / min_refine_cells /
-            anchor_grid_size: see ``DFINETransformer``.
+            anchor_grid_size / fine_channels: see ``DFINETransformer``.
     """
 
     def __init__(
@@ -130,6 +130,7 @@ class MaxIoUTransformer(DFINETransformer):
         min_sample_cells=0.0,
         min_refine_cells=0.0,
         anchor_grid_size=0.05,
+        fine_channels=0,
     ):
         super().__init__(
             num_classes=num_classes,
@@ -162,6 +163,7 @@ class MaxIoUTransformer(DFINETransformer):
             min_sample_cells=min_sample_cells,
             min_refine_cells=min_refine_cells,
             anchor_grid_size=anchor_grid_size,
+            fine_channels=fine_channels,
         )
         assert assign_metric in ("gaussian", "nwd", "giou", "iou"), assign_metric
         assert assign_k >= 1 and assign_radius >= 0

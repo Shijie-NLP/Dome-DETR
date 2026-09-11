@@ -214,6 +214,13 @@ class DFINETransformer(nn.Module):
             it doubles per level (D-FINE's 0.05 is 5 cells of a stride-8 first level; a stride-4
             first level wants 0.025 for the same ratio). Must exceed ``eps``, or the border test
             marks every token invalid.
+        fine_channels: with a value above 0, the encoder's ``fine`` map (``HybridEncoder``'s
+            fine level, so many channels wide, one stride finer than its first level) is
+            projected to ``hidden_dim`` and read by every decoder layer's deformable
+            cross-attention as its first, finest level. It is values only: no token of it enters
+            the query selection, gets an anchor or is scored, so the selection and the losses
+            are those of the encoder levels alone. ``num_points`` then has one more entry, its
+            first for the fine level. 0 (default): no fine level.
     """
 
     __share__ = ["num_classes", "eval_spatial_size"]
@@ -250,6 +257,7 @@ class DFINETransformer(nn.Module):
         min_sample_cells=0.0,
         min_refine_cells=0.0,
         anchor_grid_size=0.05,
+        fine_channels=0,
     ):
         super().__init__()
         assert len(feat_channels) <= num_levels
@@ -281,6 +289,15 @@ class DFINETransformer(nn.Module):
         self.attn_logn_scale = attn_logn_scale
         self.attn_logn_base = attn_logn_base or num_queries
         self.min_refine_cells = min_refine_cells
+        self.fine_channels = fine_channels
+        # the cross-attention's levels: the fine level, if any, then the encoder levels
+        self.num_value_levels = num_levels + (1 if fine_channels > 0 else 0)
+        if isinstance(num_points, (list, tuple)):
+            assert len(num_points) == self.num_value_levels, (
+                f"num_points needs one entry per cross-attention level ({self.num_value_levels}, "
+                f"the fine level first), got {list(num_points)}"
+            )
+            num_points = list(num_points)
 
         # backbone feature projection
         self._build_input_proj_layer(feat_channels)
@@ -294,7 +311,7 @@ class DFINETransformer(nn.Module):
             dim_feedforward=dim_feedforward,
             dropout=dropout,
             activation=activation,
-            n_levels=num_levels,
+            n_levels=self.num_value_levels,
             n_points=num_points,
             cross_attn_method=cross_attn_method,
             min_sample_cells=min_sample_cells,
@@ -374,24 +391,34 @@ class DFINETransformer(nn.Module):
         for m, in_channels in zip(self.input_proj, feat_channels):
             if in_channels != self.hidden_dim:
                 init.xavier_uniform_(m[0].weight)
+        if self.fine_channels > 0 and self.fine_channels != self.hidden_dim:
+            init.xavier_uniform_(self.fine_proj[0].weight)
+
+    def _proj(self, in_channels, kernel_size, stride):
+        """A conv-BN projection to ``hidden_dim`` (nothing, for a 1x1 from ``hidden_dim``)."""
+        if in_channels == self.hidden_dim and kernel_size == 1:
+            return nn.Identity()
+        conv = nn.Conv2d(in_channels, self.hidden_dim, kernel_size, stride, padding=kernel_size // 2, bias=False)
+        return nn.Sequential(OrderedDict([("conv", conv), ("norm", nn.BatchNorm2d(self.hidden_dim))]))
 
     def _build_input_proj_layer(self, feat_channels):
-        """A conv-BN projection to ``hidden_dim`` per level; extra levels downsample the last one with stride 2."""
-
-        def proj(in_channels, kernel_size, stride):
-            if in_channels == self.hidden_dim and kernel_size == 1:
-                return nn.Identity()
-            conv = nn.Conv2d(in_channels, self.hidden_dim, kernel_size, stride, padding=kernel_size // 2, bias=False)
-            return nn.Sequential(OrderedDict([("conv", conv), ("norm", nn.BatchNorm2d(self.hidden_dim))]))
-
-        self.input_proj = nn.ModuleList(proj(c, 1, 1) for c in feat_channels)
+        """
+        A projection per level; extra levels downsample the last one with stride 2. The fine
+        level, if any, gets its own.
+        """
+        self.input_proj = nn.ModuleList(self._proj(c, 1, 1) for c in feat_channels)
         in_channels = feat_channels[-1]
         for _ in range(self.num_levels - len(feat_channels)):
-            self.input_proj.append(proj(in_channels, 3, 2))
+            self.input_proj.append(self._proj(in_channels, 3, 2))
             in_channels = self.hidden_dim
+        if self.fine_channels > 0:
+            self.fine_proj = self._proj(self.fine_channels, 1, 1)
 
     def _get_encoder_input(self, feats: list[torch.Tensor]):
-        """The projected levels, and the same flattened to ``[b, sum(h*w), c]`` with their ``(h, w)``."""
+        """
+        The projected encoder levels (the query selection's tokens), and the same flattened to
+        ``[b, sum(h*w), c]`` with their ``(h, w)``. The fine level is not among them.
+        """
         proj_feats = [self.input_proj[i](feat) for i, feat in enumerate(feats)]
         for i in range(len(feats), self.num_levels):
             source = feats[-1] if i == len(feats) else proj_feats[-1]
@@ -490,6 +517,12 @@ class DFINETransformer(nn.Module):
         img_inputs = encoder_out["img_inputs"]
 
         proj_feats, memory, spatial_shapes = self._get_encoder_input(feats)
+        # the cross-attention's levels: the fine level first, if any; the selection, the anchors
+        # and the FDR unit below stay on the encoder levels
+        value_feats, value_shapes = proj_feats, spatial_shapes
+        if self.fine_channels > 0:
+            fine = self.fine_proj(encoder_out["fine"])
+            value_feats, value_shapes = [fine, *proj_feats], [list(fine.shape[2:]), *spatial_shapes]
 
         dec_in = self._get_decoder_input(memory, spatial_shapes, encoder_out, targets)
         init_ref_contents, init_ref_points_unact = dec_in.contents, dec_in.boxes_unact
@@ -534,8 +567,8 @@ class DFINETransformer(nn.Module):
         out_bboxes, out_logits, out_corners, out_refs, pre_bboxes, pre_logits = self.decoder(
             init_ref_contents,
             init_ref_points_unact,
-            proj_feats,
-            spatial_shapes,
+            value_feats,
+            value_shapes,
             self.dec_bbox_head,
             self.dec_score_head,
             self.query_pos_head,
@@ -592,7 +625,7 @@ class DFINETransformer(nn.Module):
                 out["dn_meta"] = dn_meta
 
         for key, value in encoder_out.items():
-            if key != "feats":
+            if key not in ("feats", "fine"):
                 out[key] = value
         out["batch_queries_num"] = batch_queries_num
         return out
