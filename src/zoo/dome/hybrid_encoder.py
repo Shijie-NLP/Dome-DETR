@@ -49,10 +49,17 @@ class HybridEncoder(nn.Module):
             pass instead of keeping them (the stride-4 level's are most of the encoder's memory).
         eval_spatial_size: (h, w) at evaluation, to precompute the position embeddings; unset,
             they are built for whatever size arrives.
+        fine_in_channels / fine_dim / fine_blocks: the fine level, a map one stride finer than
+            the pyramid built from the backbone's stem map (``HGNetv2(return_stem=True)``, the
+            first of ``feats``, ``fine_in_channels`` wide): a 1x1 on the stem map plus the
+            finest pyramid level's semantics (a 1x1, upsampled), then ``fine_blocks`` depthwise
+            3x3 / 1x1 pairs, ``fine_dim`` wide. It stays out of the pyramid and the encoder's
+            levels: the decoder reads it as values only (``DFINETransformer(fine_channels)``).
+            ``fine_in_channels`` 0 (default): no fine level.
 
     ``forward(feats, img_inputs, targets)`` returns a dict with ``feats`` (the pyramid, one
-    tensor per level) and ``img_inputs`` (the image, passed through for the decoder's dumps),
-    plus whatever ``enhance`` adds.
+    tensor per level), ``img_inputs`` (the image, passed through for the decoder's dumps) and,
+    with a fine level, ``fine``, plus whatever ``enhance`` adds.
     """
 
     __share__ = ["eval_spatial_size"]
@@ -76,6 +83,9 @@ class HybridEncoder(nn.Module):
         use_hybrid=True,
         checkpoint_fusion=False,
         fine_fusion="elan",
+        fine_in_channels=0,
+        fine_dim=64,
+        fine_blocks=2,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -93,6 +103,7 @@ class HybridEncoder(nn.Module):
         assert fine_fusion in ("elan", "slim", "light"), fine_fusion
         self.fine_fusion = fine_fusion
         self.dim_feedforward = dim_feedforward
+        self.fine_in_channels = fine_in_channels
 
         # channel projection
         self.input_proj = nn.ModuleList()
@@ -142,6 +153,21 @@ class HybridEncoder(nn.Module):
                 self.downsample_convs.append(nn.Sequential(SCDown(hidden_dim, hidden_dim, 3, 2)))
                 self.pan_blocks.append(RepNCSPELAN4(hidden_dim * 2, hidden_dim, **fusion))
 
+        # the fine level: the stem map and the finest pyramid level's semantics, summed, then
+        # depthwise 3x3 / 1x1 pairs (the maps are four times the stride-4 level's: nothing wide)
+        if fine_in_channels > 0:
+            self.fine_lateral = ConvNormLayerFuse(fine_in_channels, fine_dim, 1, 1)
+            self.fine_top_down = ConvNormLayerFuse(hidden_dim, fine_dim, 1, 1)
+            self.fine_blocks = nn.Sequential(
+                *(
+                    nn.Sequential(
+                        ConvNormLayerFuse(fine_dim, fine_dim, 3, 1, g=fine_dim, act=act),
+                        ConvNormLayerFuse(fine_dim, fine_dim, 1, 1, act=act),
+                    )
+                    for _ in range(fine_blocks)
+                )
+            )
+
         self._build_eval_pos_embeds()
 
     def _build_eval_pos_embeds(self):
@@ -176,7 +202,16 @@ class HybridEncoder(nn.Module):
             cache[key] = build_2d_sincos_position_embedding(w, h, self.hidden_dim, self.pe_temperature).to(device)
         return cache[key]
 
+    def _fine(self, stem: torch.Tensor, finest: torch.Tensor) -> torch.Tensor:
+        """The fine level from the stem map and the finest pyramid level (upsampled to the stem map's size)."""
+        semantics = F.interpolate(self.fine_top_down(finest), size=stem.shape[2:], mode="bilinear", align_corners=True)
+        return self.fine_blocks(self.fine_lateral(stem) + semantics)
+
     def forward(self, feats, img_inputs, targets=None):
+        stem = None
+        if self.fine_in_channels > 0:
+            stem, feats = feats[0], feats[1:]
+            assert stem.shape[1] == self.fine_in_channels, (stem.shape, self.fine_in_channels)
         assert len(feats) == len(self.in_channels)
         proj_feats = [self.input_proj[i](feat) for i, feat in enumerate(feats)]
         dump_feature_map("backbone_output_0", proj_feats[0])
@@ -198,6 +233,8 @@ class HybridEncoder(nn.Module):
 
         if not self.use_hybrid:
             out["feats"] = proj_feats
+            if stem is not None:
+                out["fine"] = self._fine(stem, proj_feats[0])
             return out
 
         def fuse(block, feats):
@@ -221,4 +258,6 @@ class HybridEncoder(nn.Module):
             outs.append(fuse(self.pan_blocks[i], [downsample_feat, inner_outs[i + 1]]))
 
         out["feats"] = outs
+        if stem is not None:
+            out["fine"] = self._fine(stem, outs[0])
         return out

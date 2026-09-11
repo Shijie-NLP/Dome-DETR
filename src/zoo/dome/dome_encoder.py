@@ -60,6 +60,9 @@ class DomeHybridEncoder(HybridEncoder):
         use_hybrid=True,
         checkpoint_fusion=False,
         fine_fusion="elan",
+        fine_in_channels=0,
+        fine_dim=64,
+        fine_blocks=2,
         defe_type="light",
         use_mwas=True,
         mwas_window_size=10,
@@ -82,6 +85,9 @@ class DomeHybridEncoder(HybridEncoder):
             use_hybrid=use_hybrid,
             checkpoint_fusion=checkpoint_fusion,
             fine_fusion=fine_fusion,
+            fine_in_channels=fine_in_channels,
+            fine_dim=fine_dim,
+            fine_blocks=fine_blocks,
         )
         self.defe_type = defe_type
         self.use_mwas = use_mwas
