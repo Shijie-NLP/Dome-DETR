@@ -25,6 +25,9 @@ class DetSolver(BaseSolver):
     a new best, it reloads ``best_stg1.pth`` again with a slightly smaller EMA decay and tries
     once more. A reload leaves the learning rate schedule where training is: restoring the
     checkpoint's schedulers would rewind the rate past its milestones, as upstream did.
+
+    Stage 1 validates every ``eval_freq`` epochs until ``eval_after`` and every epoch from there;
+    stage 2 validates every epoch, its patience counts them.
     """
 
     metric = "coco_eval_bbox"  # the evaluator's stats; AP@[.5:.95] is entry 0
@@ -85,6 +88,16 @@ class DetSolver(BaseSolver):
             if not stage2:
                 self._save_periodic_checkpoints(epoch)
 
+            log_stats = {
+                **{f"train_{k}": v for k, v in train_stats.items()},
+                "epoch": epoch,
+                "n_parameters": n_parameters,
+            }
+            if not self._evaluates(epoch, stage2):
+                print(f"Evaluation skipped until epoch {cfg.eval_after} (every {cfg.eval_freq} epochs)")
+                self._append_log(log_stats)
+                continue
+
             print("Evaluate state starting...")
             test_stats, coco_evaluator = self._evaluate()
             ap = test_stats[self.metric][0]
@@ -109,12 +122,7 @@ class DetSolver(BaseSolver):
                 else:
                     print(f"Tolerate undesirable result for patience: {not_improved} / {self.patience} ")
 
-            log_stats = {
-                **{f"train_{k}": v for k, v in train_stats.items()},
-                **{f"test_{k}": v for k, v in test_stats.items()},
-                "epoch": epoch,
-                "n_parameters": n_parameters,
-            }
+            log_stats.update({f"test_{k}": v for k, v in test_stats.items()})
             self._append_log(log_stats)
             self._dump_eval(coco_evaluator, epoch)
 
@@ -126,6 +134,11 @@ class DetSolver(BaseSolver):
         _, coco_evaluator = self._evaluate()
         if self.output_dir:
             dist_utils.save_on_master(coco_evaluator.coco_eval["bbox"].eval, self.output_dir / "eval.pth")
+
+    def _evaluates(self, epoch: int, stage2: bool) -> bool:
+        """Whether this epoch is validated: every ``eval_freq`` epochs until ``eval_after``, then every epoch."""
+        cfg = self.cfg
+        return stage2 or epoch >= cfg.eval_after or (epoch + 1) % cfg.eval_freq == 0 or epoch == cfg.epoches - 1
 
     def _save_checkpoint(self, name: str):
         if self.output_dir:
