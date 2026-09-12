@@ -19,6 +19,8 @@
 # into logs/<name>-<date>_<time>.log. A failing run stops the sequence.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+# python's stdout is block-buffered into the tee pipe below; without this the logs/ copy lags by pages
+export PYTHONUNBUFFERED=1
 
 # ------------------------------------------------------------------ the registry
 declare -A CONFIGS=(
