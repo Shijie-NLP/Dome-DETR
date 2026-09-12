@@ -18,4 +18,5 @@ export NOTIFY_URL=${NOTIFY_URL:-https://ntfy.sh/dfine-saturn}
 
 bash scripts/experiments.sh abl_aitod_2_fine dfine_l_visdrone dfine_l_aitod
 SEED=3 bash scripts/experiments.sh dfine_l_aitod
+SEED=4 bash scripts/experiments.sh dfine_l_aitod
 echo "card B queue done"
