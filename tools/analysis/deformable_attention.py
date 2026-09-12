@@ -61,7 +61,8 @@ class SamplingRecorder:
     Records what every decoder layer's cross-attention samples: per layer ``(locations
     [B, Q, H, P, 2] normalized to the input, weights [B, Q, H, P] softmaxed per head, level [P])``.
     Wraps the attention core, so the recorded locations are exactly the ones sampled, floors and
-    all.
+    all; with a fine level (``fine_dim`` > 0) its points go through ``_read_fine`` before the
+    core sees the rest, and the two are joined back in point order (the fine level first).
     """
 
     def __init__(self, decoder):
@@ -77,19 +78,36 @@ class SamplingRecorder:
             attn = layer.cross_attn
             original = attn.ms_deformable_attn_core
 
-            def wrapped(value, shapes, locations, weights, num_points_list, _original=original, _attn=attn):
+            pending = []  # the fine level's (shape, locations, weights) of the call in progress
+
+            def wrapped(value, shapes, locations, weights, num_points_list, _original=original, _attn=attn, _p=pending):
+                all_shapes, all_locations, all_weights = [tuple(s) for s in shapes], locations, weights
+                if _p:
+                    fine_shape, fine_locations, fine_weights = _p.pop()
+                    all_shapes = [fine_shape, *all_shapes]
+                    all_locations = torch.cat([fine_locations, locations], dim=-2)
+                    all_weights = torch.cat([fine_weights, weights], dim=-1)
                 self.records.append(
                     (
-                        locations.detach().float().cpu(),
-                        weights.detach().float().cpu(),
+                        all_locations.detach().float().cpu(),
+                        all_weights.detach().float().cpu(),
                         _attn.point_level.cpu(),
-                        [tuple(s) for s in shapes],
+                        all_shapes,
                     )
                 )
                 return _original(value, shapes, locations, weights, num_points_list)
 
             attn.ms_deformable_attn_core = wrapped
-            self.originals.append((attn, original))
+            self.originals.append((attn, "ms_deformable_attn_core", original))
+            if getattr(attn, "fine_dim", 0) > 0:
+                original_fine = attn._read_fine
+
+                def wrapped_fine(value, hw, locations, weights, _original=original_fine, _p=pending):
+                    _p.append((tuple(hw), locations, weights))
+                    return _original(value, hw, locations, weights)
+
+                attn._read_fine = wrapped_fine
+                self.originals.append((attn, "_read_fine", original_fine))
 
             def hook(module, args, output, _raw=self.raw, _null=self.null):
                 query, reference_points = args[0], args[1]
@@ -105,8 +123,8 @@ class SamplingRecorder:
         return self
 
     def __exit__(self, *exc):
-        for attn, original in self.originals:
-            attn.ms_deformable_attn_core = original
+        for attn, name, original in self.originals:
+            setattr(attn, name, original)
         for handle in self.handles:
             handle.remove()
 
@@ -489,6 +507,8 @@ def main():
     model = load_model(cfg, checkpoint, args.device)
     decoder = find_decoder(model)
     strides = list(model.decoder.feat_strides)
+    if getattr(model.decoder, "fine_channels", 0) > 0:  # the fine level, one stride finer, is the first value level
+        strides = [strides[0] // 2, *strides]
     loader = cfg.val_dataloader
     dataset, collate = loader.dataset, loader.collate_fn
     names = dict(getattr(dataset, "CATEGORIES", []))
