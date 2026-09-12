@@ -227,10 +227,12 @@ class Run:
         collate = (self.cfg.get("train_dataloader") or {}).get("collate_fn") or {}
         self.stage2_start = collate.get("stop_epoch")
         evaluator = (self.cfg.get("evaluator") or {}).get("type", "CocoEvaluator")
+        # an epoch the solver skipped the validation of (eval_freq / eval_after) has no test_ keys
         self.metric_key = next(
-            (k for k in ("test_coco_eval_bbox", "test_coco_eval_masks") if self.log and k in self.log[0]), None
+            (k for k in ("test_coco_eval_bbox", "test_coco_eval_masks") if any(k in row for row in self.log)), None
         )
-        n_stats = len(self.log[0][self.metric_key]) if self.metric_key else 0
+        self.evaluated = [row for row in self.log if self.metric_key in row] if self.metric_key else []
+        n_stats = len(self.evaluated[0][self.metric_key]) if self.evaluated else 0
         labels = METRIC_LABELS.get(evaluator, METRIC_LABELS["CocoEvaluator"])
         self.labels = labels if len(labels) == n_stats else [f"stat{i}" for i in range(n_stats)]
         self.evaluator = evaluator
@@ -238,22 +240,25 @@ class Run:
     # -- metrics ------------------------------------------------------------------------------
 
     def stats(self, row):
-        return row[self.metric_key] if self.metric_key else []
+        """The evaluator's entries of ``row``, empty for an epoch that was not validated."""
+        return row.get(self.metric_key, []) if self.metric_key else []
 
     def ap(self, row):
-        return self.stats(row)[0] if self.metric_key else float("nan")
+        stats = self.stats(row)
+        return stats[0] if stats else float("nan")
 
     def series(self, key):
         """``key`` per logged epoch, None where an epoch lacks it."""
         return [row.get(key) for row in self.log]
 
     def metric_series(self, label):
+        """The entry ``label`` per logged epoch, None where the epoch was not validated."""
         i = self.labels.index(label)
-        return [self.stats(row)[i] for row in self.log]
+        return [self.stats(row)[i] if self.stats(row) else None for row in self.log]
 
     def best(self, rows=None):
-        """The first row with the highest AP, as the solver's strict ``>`` keeps it."""
-        rows = self.log if rows is None else rows
+        """The first validated row with the highest AP, as the solver's strict ``>`` keeps it."""
+        rows = [r for r in (self.log if rows is None else rows) if self.stats(r)]
         if not rows:
             return None
         return max(rows, key=lambda r: (self.ap(r), -r["epoch"]))
@@ -471,7 +476,7 @@ def milestone_rows(run, every):
         rows.append(
             [
                 e,
-                *[fmt_pct(v) for v in run.stats(row)[:3]],
+                *[fmt_pct(v) for v in (run.stats(row) or [None] * 3)[:3]],
                 fmt_num(row.get("train_loss")),
                 fmt_num(row.get("train_lr"), 2),
                 fmt_duration(run.console["train_time"].get(e)),
@@ -527,10 +532,10 @@ def write_report(run, every, per_class, figure_name):
     if best is None:
         out.append("No evaluated epoch in `log.txt` yet.\n")
     else:
-        last = run.log[-1]
+        last = run.evaluated[-1]
         head = [
             ("status", run.status()),
-            ("epochs done", f"{len(run.epochs)} of {run.total_epochs} (last logged: {last['epoch']})"),
+            ("epochs done", f"{len(run.epochs)} of {run.total_epochs} (last logged: {run.log[-1]['epoch']})"),
             (
                 "best AP",
                 f"**{fmt_pct(run.ap(best))}** at epoch {best['epoch']} (AP50 {fmt_pct(run.stats(best)[1])}, AP75 {fmt_pct(run.stats(best)[2])})",
@@ -578,7 +583,7 @@ def write_report(run, every, per_class, figure_name):
 
     if best is not None:
         # metrics of the epochs that matter
-        named = [("best", best), ("last", run.log[-1])]
+        named = [("best", best), ("last", run.evaluated[-1])]
         if run.stage2_start is not None and best1 is not None and best1["epoch"] != best["epoch"]:
             named.insert(1, ("best stage 1", best1))
         out.append("## Metrics\n")
@@ -586,12 +591,13 @@ def write_report(run, every, per_class, figure_name):
         out.append(table(["epoch", "#", *run.labels], metrics_rows(run, named)) + "\n")
 
         # queries
-        q = run.log[-1].get("test_queries")
+        last = run.evaluated[-1]
+        q = last.get("test_queries")
         if q:
             out.append(
-                f"Queries per validation image at epoch {run.log[-1]['epoch']}: mean {q[0]:.1f}, min {q[1]}, max {q[2]}; "
+                f"Queries per validation image at epoch {last['epoch']}: mean {q[0]:.1f}, min {q[1]}, max {q[2]}; "
                 f"{100 * q[3]:.1f}% of images had at least as many queries as ground-truth boxes"
-                + (f". Training mean {run.log[-1]['train_queries']:.1f}." if "train_queries" in run.log[-1] else ".")
+                + (f". Training mean {last['train_queries']:.1f}." if "train_queries" in last else ".")
                 + "\n"
             )
 
