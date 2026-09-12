@@ -279,7 +279,12 @@ class DFINETransformer(nn.Module):
             ``count_budgets`` queries each (one more entry than the edges); the image gets the
             budget of the bucket where the predicted distribution first reaches
             ``count_quantile`` (an unsure head rounds up). Wide buckets where images are rare
-            (a few dozen AI-TOD tiles hold over 600 objects) keep every bucket learnable. In
+            (a few dozen AI-TOD tiles hold over 600 objects) keep every bucket learnable.
+            ``count_level`` defaults to 0, the finest encoder level (stride 4), as DQ-DETR's
+            counting module reads its highest-resolution map: the tiny objects are clearest
+            there. ``count_detach`` (default on) hands the head that level detached, so
+            ``loss_count`` trains the head alone and never pulls on the encoder's features;
+            off, the counting loss also acts as an auxiliary task on them. In
             training the
             budget comes from the ground-truth count's bucket (``count_train_budget`` ``gt``: the
             head trains alongside on ``loss_count`` and only decides at inference; ``max``: the
@@ -333,7 +338,8 @@ class DFINETransformer(nn.Module):
         fine_channels=0,
         null_point=False,
         query_budget="fixed",
-        count_level=2,
+        count_level=0,
+        count_detach=True,
         count_edges=(100, 200, 300, 600),
         count_budgets=(300, 400, 500, 800, 1500),
         count_quantile=0.9,
@@ -369,6 +375,7 @@ class DFINETransformer(nn.Module):
         self.num_queries = num_queries
         self.query_budget = query_budget
         self.count_level = count_level
+        self.count_detach = count_detach
         self.count_edges = list(count_edges)
         self.count_budgets = list(count_budgets)
         self.count_quantile = count_quantile
@@ -619,7 +626,10 @@ class DFINETransformer(nn.Module):
                 else enc_outputs_logits.max(-1).values
             )
             soft_count = scores.masked_fill(~valid_mask[..., 0].expand(b, -1), 0.0).sum(1)  # [B]
-            count_logits = self.count_head(encoder_out["feats"][self.count_level], soft_count)  # [B, buckets]
+            count_feat = encoder_out["feats"][self.count_level]
+            if self.count_detach:
+                count_feat = count_feat.detach()
+            count_logits = self.count_head(count_feat, soft_count)  # [B, buckets]
             batch_queries_num = self._bucket_budgets(count_logits, targets)
             if self.training:
                 extra["count_logits"] = count_logits
