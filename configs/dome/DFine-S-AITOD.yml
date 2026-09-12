@@ -16,11 +16,11 @@ __include__: [
 output_dir: ./outputs/dfine_s_aitod
 
 # the test split is 14k tiles scored at up to 1500 detections each, a validation costs 40% of an
-# epoch. Stage 1 is validated every 10 epochs only: the legacy runs' stage-1 AP rises monotonically
-# within 0.001, so best_stg1 is the last stage-1 epoch (119, a multiple of 10 minus one) whatever
-# the density of the validations in between; stage 2 (from 120) is validated every epoch anyway
-eval_freq: 10
-eval_after: 120
+# epoch. Stage 1 is validated from epoch 100 every 4 epochs (103, 107, 111, 115, 119) and not
+# before: the legacy runs' stage-1 AP rises monotonically within 0.001, so best_stg1 is the last
+# stage-1 epoch whatever the validations before it show; stage 2 (from 120) validates every epoch
+eval_freq: 4
+eval_after: 100
 
 DOME:
   encoder: HybridEncoder

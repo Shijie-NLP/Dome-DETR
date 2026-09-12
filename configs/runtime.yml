@@ -5,8 +5,9 @@ print_freq: 100
 # directory); `--output-dir` on the command line names the directory itself
 output_dir: './logs'
 checkpoint_freq: 12
-# validation every eval_freq epochs until eval_after, every epoch from there (and throughout
-# stage 2, whose patience counts evaluated epochs)
+# stage 1 is validated from epoch eval_after on, every eval_freq epochs (counted from epoch 0),
+# and on its last epoch whatever the two say; stage 2 validates every epoch, its patience counts
+# them
 eval_freq: 1
 eval_after: 0
 

@@ -131,8 +131,9 @@ class BaseConfig:
         self.seed: int = None
         self.print_freq: int = None
         self.checkpoint_freq: int = 1
-        # validation every eval_freq epochs until eval_after, then every epoch; stage 2 always
-        # evaluates every epoch, its patience counts them (see DetSolver)
+        # stage 1 is validated from epoch eval_after on, every eval_freq epochs, and on its last
+        # epoch whatever the two say; stage 2 validates every epoch, its patience counts them (see
+        # DetSolver)
         self.eval_freq: int = 1
         self.eval_after: int = 0
         self.output_dir: str = None
