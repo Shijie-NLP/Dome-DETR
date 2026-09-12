@@ -15,6 +15,11 @@ __include__: [
 
 output_dir: ./outputs/dfine_m_aitod
 
+# the test split is 14k tiles scored at up to 1500 detections each, a validation costs a good part
+# of an epoch: every 10 epochs until epoch 60, one by one from there
+eval_freq: 10
+eval_after: 60
+
 DOME:
   encoder: HybridEncoder
   decoder: DFINETransformer
