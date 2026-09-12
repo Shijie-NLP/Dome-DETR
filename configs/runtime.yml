@@ -7,9 +7,11 @@ output_dir: './logs'
 checkpoint_freq: 12
 # stage 1 is validated from epoch eval_after on, every eval_freq epochs (counted from epoch 0),
 # and on its last epoch whatever the two say; stage 2 validates every epoch, its patience counts
-# them
+# them. The first 100 epochs go unvalidated: stage-1 AP rises monotonically (the legacy runs'
+# within 0.001), so the epochs before the end of stage 1 only draw the curve, and on AI-TOD a
+# validation costs 40% of an epoch
 eval_freq: 1
-eval_after: 0
+eval_after: 100
 
 
 sync_bn: True
