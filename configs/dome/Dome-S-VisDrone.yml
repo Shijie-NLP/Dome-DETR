@@ -57,16 +57,16 @@ lr_scheduler:
   gamma: 0.8
 
 
-# 160 epochs; augmentation and multi-scale training stop at 150 and the last 10 epochs
+# 160 epochs; augmentation and multi-scale training stop at 120 and the last 40 epochs
 # train on clean images
 epoches: 160
 train_dataloader:
   dataset:
     transforms:
       policy:
-        epoch: 150
+        epoch: 120
   collate_fn:
-    stop_epoch: 150
+    stop_epoch: 120
 
 # Validation keeps the shared aspect-preserving protocol (1333x800), padded to a multiple of 80
 # rather than 32 so that the stride-8 map tiles into whole MWAS windows (mwas_window_size 10).

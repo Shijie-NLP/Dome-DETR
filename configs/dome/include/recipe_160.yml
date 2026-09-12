@@ -1,6 +1,7 @@
 # The training recipe of every D-FINE run here, whatever the scale or dataset: 160 epochs at
-# batch 8, AdamW with the backbone at a tenth of the rate, two decays of 0.8, and the last 10
-# epochs on clean images (augmentation and multi-scale off from epoch 150; stage 2 starts there).
+# batch 8, AdamW with the backbone at a tenth of the rate, two decays of 0.8, and the last 40
+# epochs on clean images (augmentation and multi-scale off from epoch 120, where the second
+# decay lands; stage 2 starts there).
 # Overrides the defaults of optimizer.yml and the datasets' stop_epoch.
 
 optimizer:
@@ -31,6 +32,6 @@ train_dataloader:
   dataset:
     transforms:
       policy:
-        epoch: 150
+        epoch: 120
   collate_fn:
-    stop_epoch: 150
+    stop_epoch: 120
