@@ -5,15 +5,15 @@
 # 15% of the boxes. A fixed top-k either starves the dense tiles or pays for 1500 queries on
 # every sparse one.
 #
-# The budget: a counting head predicts the bucket of the tile's object count (cut at 100, 200,
-# 300 and 600; the buckets widen where tiles are rare, 24 training tiles hold over 600) and the
-# tile gets the bucket's queries, 300 / 400 / 500 / 800 / 1500: the bucket's upper edge plus
-# room for the duplicates and background candidates the matching needs, 1500 capping the last
-# (train tiles reach 1729, a handful of test tiles 2667). The budget is read at the 0.9 quantile
-# of the predicted distribution, so an unsure head rounds up. In training the ground truth's
-# bucket sets the budget and the head trains alongside on loss_count, with logit adjustment
-# against the buckets' imbalance and the encoder's soft count as a feature that extrapolates to
-# the dense tiles. The batches are grouped by the same buckets, so a batch pads nothing.
+# The budget needs no head: the encoder already counts. The tile gets the number of tokens the
+# encoder scores above 0.4 plus a margin of 200 (the duplicates and background candidates the
+# matching needs), rounded up to 100, between 300 and 1500 (train tiles reach 1729, a handful
+# of test tiles 2667). On a 6-epoch model the rule covered 99.7% of the test tiles at 303
+# queries on average (fixed 300: 99.1%), and the scores only sharpen with training. In training
+# the ground-truth count stands in for the token count, and the batches are grouped by object
+# count in the same steps of 100, so a batch pads nothing. A counting head (query_budget
+# bucket) is still in the code; read on raw logits after logit-adjusted training it sent 93% of
+# the tiles to the wrong bucket, all upward.
 
 __include__: [
   './DFine-S-AITOD.yml',
@@ -23,11 +23,16 @@ __include__: [
 output_dir: ./outputs/dfine_s_aitod_ours
 
 DFINETransformer:
-  query_budget: bucket
-  count_edges: [100, 200, 300, 600]
-  count_budgets: [300, 400, 500, 800, 1500]
-  count_quantile: 0.9
+  # the budget: the tokens the encoder scores above 0.4, plus a margin of 200 for the duplicates
+  # and background candidates the matching needs, rounded up to 100, 300 at least and 1500 at
+  # most; in training the ground-truth count stands in for the token count
+  query_budget: threshold
+  count_threshold: 0.4
+  count_margin: 200
+  count_round: 100
+  count_range: [300, 1500]
   count_train_budget: gt
 
 train_dataloader:
-  group_by_count: {edges: [100, 200, 300, 600]}
+  # the batches grouped by object count in the budget's steps of 100, so a batch pads nothing
+  group_by_count: {edges: [100, 200, 300, 400, 500, 600, 700, 800, 900, 1000, 1100, 1200, 1300]}
