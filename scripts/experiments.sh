@@ -4,7 +4,7 @@
 #   bash scripts/experiments.sh --list                      # the names and their configs
 #   bash scripts/experiments.sh dfine_s_visdrone ours_s_aitod
 #   bash scripts/experiments.sh baselines                   # every D-FINE baseline (S, M, L x VisDrone, AI-TOD)
-#   bash scripts/experiments.sh ours                        # our method (S on VisDrone and AI-TOD)
+#   bash scripts/experiments.sh ours                        # our method (S, M, L x VisDrone, AI-TOD)
 #   bash scripts/experiments.sh all                         # baselines, then ours
 #   bash scripts/experiments.sh --dry-run all               # print the commands only
 #
@@ -28,10 +28,14 @@ declare -A CONFIGS=(
     [dfine_m_aitod]=configs/dome/DFine-M-AITOD.yml
     [dfine_l_aitod]=configs/dome/DFine-L-AITOD.yml
     [ours_s_visdrone]=configs/dome/DFine-S-VisDrone-Ours.yml
+    [ours_m_visdrone]=configs/dome/DFine-M-VisDrone-Ours.yml
+    [ours_l_visdrone]=configs/dome/DFine-L-VisDrone-Ours.yml
     [ours_s_aitod]=configs/dome/DFine-S-AITOD-Ours.yml
+    [ours_m_aitod]=configs/dome/DFine-M-AITOD-Ours.yml
+    [ours_l_aitod]=configs/dome/DFine-L-AITOD-Ours.yml
 )
 BASELINES=(dfine_s_visdrone dfine_m_visdrone dfine_l_visdrone dfine_s_aitod dfine_m_aitod dfine_l_aitod)
-OURS=(ours_s_visdrone ours_s_aitod)
+OURS=(ours_s_visdrone ours_m_visdrone ours_l_visdrone ours_s_aitod ours_m_aitod ours_l_aitod)
 
 GPUS=${GPUS:-1}
 SEED=${SEED:-0}
