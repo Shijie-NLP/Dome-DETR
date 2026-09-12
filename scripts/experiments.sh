@@ -6,6 +6,7 @@
 #   bash scripts/experiments.sh baselines                   # every D-FINE baseline (S, M, L x VisDrone, AI-TOD)
 #   bash scripts/experiments.sh ours                        # our method (S, M, L x VisDrone, AI-TOD)
 #   bash scripts/experiments.sh all                         # baselines, then ours
+#   bash scripts/experiments.sh ablation_aitod              # the AI-TOD ablation rows 2 to 5 (configs/dome/ablation)
 #   bash scripts/experiments.sh --dry-run all               # print the commands only
 #
 # Environment:
@@ -33,9 +34,15 @@ declare -A CONFIGS=(
     [ours_s_aitod]=configs/dome/DFine-S-AITOD-Ours.yml
     [ours_m_aitod]=configs/dome/DFine-M-AITOD-Ours.yml
     [ours_l_aitod]=configs/dome/DFine-L-AITOD-Ours.yml
+    # the AI-TOD ablation, one switch per row on the S baseline; rows 1 and 6 are dfine_s_aitod and ours_s_aitod
+    [abl_aitod_2_budget]=configs/dome/ablation/DFine-S-AITOD-2-budget.yml
+    [abl_aitod_3_fine]=configs/dome/ablation/DFine-S-AITOD-3-fine.yml
+    [abl_aitod_4_min_cells]=configs/dome/ablation/DFine-S-AITOD-4-min-cells.yml
+    [abl_aitod_5_enc_quality]=configs/dome/ablation/DFine-S-AITOD-5-enc-quality.yml
 )
 BASELINES=(dfine_s_visdrone dfine_m_visdrone dfine_l_visdrone dfine_s_aitod dfine_m_aitod dfine_l_aitod)
 OURS=(ours_s_visdrone ours_m_visdrone ours_l_visdrone ours_s_aitod ours_m_aitod ours_l_aitod)
+ABLATION_AITOD=(abl_aitod_2_budget abl_aitod_3_fine abl_aitod_4_min_cells abl_aitod_5_enc_quality)
 
 GPUS=${GPUS:-1}
 SEED=${SEED:-0}
@@ -47,7 +54,7 @@ DRY_RUN=0
 usage() { sed -n '2,/^set -euo/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; }
 
 list_experiments() {
-    for name in "${BASELINES[@]}" "${OURS[@]}"; do printf '  %-18s %s\n' "$name" "${CONFIGS[$name]}"; done
+    for name in "${BASELINES[@]}" "${OURS[@]}" "${ABLATION_AITOD[@]}"; do printf '  %-18s %s\n' "$name" "${CONFIGS[$name]}"; done
 }
 
 # the output_dir of a config, resolved through its includes, so the run's directory can be found afterwards
@@ -112,6 +119,7 @@ expand() {
         all) echo "${BASELINES[@]}" "${OURS[@]}" ;;
         baselines) echo "${BASELINES[@]}" ;;
         ours) echo "${OURS[@]}" ;;
+        ablation_aitod) echo "${ABLATION_AITOD[@]}" ;;
         *) echo "$1" ;;
     esac
 }

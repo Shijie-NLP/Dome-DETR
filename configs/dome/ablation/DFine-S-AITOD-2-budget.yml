@@ -1,0 +1,21 @@
+# AI-TOD ablation, row 2 of 6: the D-FINE-S baseline plus the per-image query budget (the bucket
+# head and the grouped batches of DFine-S-AITOD-Ours.yml). Rows 3 to 5 add the switches of
+# include/ours.yml one at a time on top of this file; row 6 is DFine-S-AITOD-Ours.yml. The budget
+# goes first because it lifts the query starvation of the dense tiles, which caps what the later
+# switches can show there. The cell anchors of ours.yml come in here as well: on the square tiles
+# they equal the baseline's at test time and differ by the multi-scale draw alone in training.
+
+__include__: ['../DFine-S-AITOD.yml']
+
+output_dir: ./outputs/ablation/aitod_s_2_budget
+
+DFINETransformer:
+  anchor_cells: 10
+  query_budget: bucket
+  count_edges: [100, 200, 300, 600]
+  count_budgets: [300, 400, 500, 800, 1500]
+  count_quantile: 0.9
+  count_train_budget: gt
+
+train_dataloader:
+  group_by_count: {edges: [100, 200, 300, 600]}
