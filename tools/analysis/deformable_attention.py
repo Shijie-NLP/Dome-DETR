@@ -10,12 +10,19 @@ Written into ``<run>/attention/``:
 * ``object_<k>.png``: one object, one panel per layer: the crop, the box the layer starts from,
   the ground truth, and every sampling point of the layer (all heads), coloured by feature
   level and sized by its attention weight.
+* ``cells_<k>.png``: the same object, layers as rows and levels as columns, with the level's
+  cell grid drawn, each head's points in its own colour, and per panel whether the head's
+  points sit in one cell or one bilinear footprint, how alike the features they read are, and
+  how alike the map itself is one cell over.
 * ``trend.png`` and ``trend.md``: over a sample of images, per object size and layer, the
   attention-weighted density of sampling points in ground-truth box units (where the model
   reads relative to the object), the share of weight per feature level, the share inside the
   box, and how far out the points reach; then per level the box the layer starts from in cells,
-  how far apart each head's points of that level land in cells, and the weight carried by heads
-  whose points all fall within one cell (the coarse-level collapse ``min_sample_cells`` floors).
+  how far apart each head's points of that level land in cells, the weight carried by heads
+  whose points all fall within one cell or one bilinear footprint (the coarse-level collapse
+  ``min_sample_cells`` floors), the cosine similarity between the features a head's points read
+  there, and the map's own similarity one and two cells over (the calibration: a collapse only
+  costs something where the map changes from cell to cell).
 
     python tools/analysis/deformable_attention.py outputs/dfine_s_visdrone/2026-09-09_17-13-58
     python tools/analysis/deformable_attention.py <run> --image 0000001_02999_d_0000005 --objects 8 --num-images 100
@@ -28,6 +35,7 @@ import sys
 
 import numpy as np
 import torch
+import torch.nn.functional as F  # noqa: N812
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -70,6 +78,7 @@ class SamplingRecorder:
         self.records = []
         self.raw = []  # per layer: (raw offsets [B, Q, H, P, 2] as the linear layer outputs them, reference boxes [B, Q, 4])
         self.null = []  # per layer: the weight of every head's null entry [B, Q, H], or None without null_point
+        self.reads = []  # per layer, per level: what the points read (see read_level), batch element 0
         self.originals = []
         self.handles = []
 
@@ -82,11 +91,19 @@ class SamplingRecorder:
 
             def wrapped(value, shapes, locations, weights, num_points_list, _original=original, _attn=attn, _p=pending):
                 all_shapes, all_locations, all_weights = [tuple(s) for s in shapes], locations, weights
+                reads = []
                 if _p:
-                    fine_shape, fine_locations, fine_weights = _p.pop()
+                    fine_shape, fine_locations, fine_weights, fine_value = _p.pop()
                     all_shapes = [fine_shape, *all_shapes]
                     all_locations = torch.cat([fine_locations, locations], dim=-2)
                     all_weights = torch.cat([fine_weights, weights], dim=-1)
+                    reads.append(read_level(fine_value[:1], fine_shape, fine_locations[:1], fine=True))
+                for level, n in enumerate(num_points_list):
+                    start = sum(num_points_list[:level])
+                    reads.append(
+                        read_level(value[level][:1], all_shapes[len(reads)], locations[:1, :, :, start : start + n])
+                    )
+                self.reads.append(reads)
                 self.records.append(
                     (
                         all_locations.detach().float().cpu(),
@@ -103,7 +120,7 @@ class SamplingRecorder:
                 original_fine = attn._read_fine
 
                 def wrapped_fine(value, hw, locations, weights, _original=original_fine, _p=pending):
-                    _p.append((tuple(hw), locations, weights))
+                    _p.append((tuple(hw), locations, weights, value))
                     return _original(value, hw, locations, weights)
 
                 attn._read_fine = wrapped_fine
@@ -129,6 +146,94 @@ class SamplingRecorder:
             handle.remove()
 
 
+def _bilinear(value, hw, locations):
+    """``value`` [N, C, h*w] sampled at ``locations`` [N, M, 2] in [0, 1], as the attention samples: [N, M, C]."""
+    h, w = hw
+    grid = (2 * locations - 1).reshape(locations.shape[0], -1, 1, 2)
+    out = F.grid_sample(
+        value.reshape(-1, value.shape[1], h, w), grid, mode="bilinear", padding_mode="zeros", align_corners=False
+    )
+    return out[..., 0].transpose(1, 2)
+
+
+def read_level(value, hw, locations, fine=False):
+    """
+    What every head's points read at one level, batch element 0. ``value`` is ``[1, H, c, h*w]``
+    (a raw fine level: ``[1, C, h*w]``, every head sampling the same map), ``locations``
+    ``[1, Q, H, P, 2]`` in [0, 1]. Returns, on the CPU:
+
+    * ``cos_within`` [Q, H]: the mean cosine similarity between a head's P samples (1: the
+      points read the same feature);
+    * ``same_footprint`` [Q, H]: whether all of a head's points fall in the same 2x2 bilinear
+      footprint (the same four cells, different weights: the reads are mixtures of one another);
+    * ``cos_shift`` [Q, H, P, 2]: the cosine between each point's sample and the sample one and
+      two cells to its right (the map's own smoothness: how different a neighbouring cell is).
+    """
+    _, q, heads, p, _ = locations.shape
+    h, w = hw
+    loc = locations[0].float()  # [Q, H, P, 2]
+    if fine:
+        v = value.float()  # [1, C, h*w]
+
+        def sample(l):
+            return _bilinear(v, hw, l.reshape(1, -1, 2)).reshape(q, heads, p, -1)
+
+    else:
+        v = value[0].float()  # [H, c, h*w]
+
+        def sample(l):
+            return (
+                _bilinear(v, hw, l.permute(1, 0, 2, 3).reshape(heads, -1, 2))
+                .reshape(heads, q, p, -1)
+                .permute(1, 0, 2, 3)
+            )
+
+    s = sample(loc)  # [Q, H, P, C]
+    shift = torch.tensor([1.0 / w, 0.0], device=loc.device)
+    s1, s2 = sample(loc + shift), sample(loc + 2 * shift)
+    n = F.normalize(s, dim=-1, eps=1e-8)
+    gram = n @ n.transpose(-1, -2)  # [Q, H, P, P]
+    off = 1 - torch.eye(p, device=gram.device)
+    cos_within = (gram * off).sum((-1, -2)) / max(p * (p - 1), 1)
+    cell = (
+        loc * torch.tensor([w, h], device=loc.device, dtype=loc.dtype) - 0.5
+    ).floor()  # the footprint's top-left cell
+    same_footprint = (cell == cell[:, :, :1]).all(-1).all(-1)
+    cos_shift = torch.stack(
+        [F.cosine_similarity(s, s1, dim=-1, eps=1e-8), F.cosine_similarity(s, s2, dim=-1, eps=1e-8)], -1
+    )
+    return {
+        "cos_within": cos_within.detach().cpu(),
+        "same_footprint": same_footprint.detach().cpu(),
+        "cos_shift": cos_shift.detach().cpu(),
+    }
+
+
+def read_stats(sample, layer, q):
+    """
+    Per level, weighted by the attention the query's heads put there: the mean cosine between a
+    head's samples, the share of weight on heads whose points share one bilinear footprint, and
+    the cosine between a sample and the map one and two cells away.
+    """
+    _, weights, level, _ = sample.attention[layer]
+    w = weights[0, q]  # [H, P]
+    out = {"cos_within": [], "same_footprint": [], "cos_shift1": [], "cos_shift2": []}
+    for lv, read in enumerate(sample.reads[layer]):
+        m = level == lv
+        wl = w[:, m].sum(-1)  # [H]
+        total = float(wl.sum())
+        if total <= 0:
+            for v in out.values():
+                v.append(0.0)
+            continue
+        wp = w[:, m]  # [H, n]
+        out["cos_within"].append(float((wl * read["cos_within"][q]).sum() / total))
+        out["same_footprint"].append(float(wl[read["same_footprint"][q]].sum() / total))
+        out["cos_shift1"].append(float((wp * read["cos_shift"][q][..., 0]).sum() / total))
+        out["cos_shift2"].append(float((wp * read["cos_shift"][q][..., 1]).sum() / total))
+    return out
+
+
 def sample_with_attention(dataset, collate, index, model, decoder, device):
     with SamplingRecorder(decoder) as recorder:
         sample = Sample(dataset, collate, index, model, decoder, device)
@@ -137,6 +242,7 @@ def sample_with_attention(dataset, collate, index, model, decoder, device):
     sample.attention = recorder.records
     sample.raw_offsets = recorder.raw
     sample.null_weights = recorder.null
+    sample.reads = recorder.reads
     return sample
 
 
@@ -302,6 +408,91 @@ def object_figure(sample, g, q, strides, path, names):
     plt.close(fig)
 
 
+HEAD_COLORS = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#7b52c9", "#008b8b", "#9c5b2f"]
+
+
+def cells_figure(sample, g, q, strides, path, names):
+    """
+    One object, layers as rows and levels as columns: the crop with the level's cell grid drawn
+    over it, every head's points of that level (one colour per head, area by attention weight),
+    the ground truth, and per panel the level's numbers: the head-weighted share of weight on
+    heads whose points share one bilinear footprint, the cosine between a head's samples, and the
+    map's own similarity one cell over. Whether the points of a head sit in one cell is then
+    visible, and whether that matters is next to it.
+    """
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+
+    num_layers, num_levels = len(sample.attention), len(strides)
+    gt = sample.gt[g]
+    size = float((gt[2:] - gt[:2]).max())
+    h, w = sample.image.shape[:2]
+    cx, cy = float((gt[0] + gt[2]) / 2), float((gt[1] + gt[3]) / 2)
+    label = names.get(int(sample.gt_labels[g]), str(int(sample.gt_labels[g])))
+    fig, axes = plt.subplots(
+        num_layers, num_levels, figsize=(3.4 * num_levels, 3.6 * num_layers), constrained_layout=True, squeeze=False
+    )
+    fig.patch.set_facecolor(SURFACE)
+    for layer in range(num_layers):
+        locations, weights, level, _ = sample.attention[layer]
+        points = locations[0, q] * sample.size  # [H, P, 2] input px
+        wq = weights[0, q]  # [H, P]
+        reads, cells = read_stats(sample, layer, q), cell_stats(sample, layer, q, strides)
+        for lv, ax in enumerate(axes[layer]):
+            stride = strides[lv]
+            margin = max(size, 2.5 * stride, 12.0)
+            x1, y1 = max(0, int(cx - margin)), max(0, int(cy - margin))
+            x2, y2 = min(w, int(cx + margin) + 1), min(h, int(cy + margin) + 1)
+            ax.imshow(np.clip(sample.image[y1:y2, x1:x2], 0, 1), extent=(x1, x2, y2, y1), interpolation="nearest")
+            for x in range(int(x1 // stride) * stride, x2 + stride, stride):
+                ax.axvline(x, color=GRID, linewidth=0.6, alpha=0.8)
+            for y in range(int(y1 // stride) * stride, y2 + stride, stride):
+                ax.axhline(y, color=GRID, linewidth=0.6, alpha=0.8)
+            m = level == lv
+            for head in range(points.shape[0]):
+                ax.scatter(
+                    points[head, m, 0],
+                    points[head, m, 1],
+                    s=6 + 250 * wq[head, m],
+                    c=HEAD_COLORS[head % len(HEAD_COLORS)],
+                    alpha=0.8,
+                    linewidths=0.4,
+                    edgecolors="white",
+                )
+            draw_box(ax, gt, GT, ":", 1.4)
+            ax.set_xlim(x1, x2)
+            ax.set_ylim(y2, y1)
+            ax.set_xticks([])
+            ax.set_yticks([])
+            share = float(wq[:, m].sum() / wq.sum())
+            ax.set_title(
+                f"layer {layer}, stride {stride}: {share:.0%} of the weight\n"
+                f"one cell {cells['collapsed'][lv]:.0%}, one footprint {reads['same_footprint'][lv]:.0%}\n"
+                f"cos within head {reads['cos_within'][lv]:.2f}, map 1 cell over {reads['cos_shift1'][lv]:.2f}",
+                fontsize=7,
+                color=INK,
+                loc="left",
+            )
+    fig.suptitle(
+        f"{sample.name}: query {q}, {label}, {sample.gt_size(g):.0f}px. Grid: the level's cells; one colour per head, "
+        f"marker area by attention weight; dotted: the ground truth",
+        fontsize=8,
+        color=INK,
+        x=0.01,
+        ha="left",
+    )
+    handles = [
+        Line2D([], [], marker="o", linestyle="", color=HEAD_COLORS[i], label=f"head {i}")
+        for i in range(points.shape[0])
+    ]
+    axes[0][0].legend(handles=handles, fontsize=6, frameon=False, loc="lower left", labelcolor=INK, ncol=2)
+    fig.savefig(path, dpi=140, bbox_inches="tight")
+    plt.close(fig)
+
+
 def trend_figure(records, num_layers, path):
     import matplotlib
 
@@ -384,9 +575,25 @@ def trend_table(records, num_layers, strides):
         ("collapsed", "Share of the level's weight on heads whose points all lie within one cell", "{:.0%}"),
         (
             "effective",
-            "Effective points of a head at the level (exp of the entropy of its weights there, 1 to 4)",
+            "Effective points of a head at the level (exp of the entropy of its weights there, 1 to the level's points)",
             "{:.2f}",
         ),
+        (
+            "same_footprint",
+            "Share of the level's weight on heads whose points all fall in the same 2x2 bilinear footprint (the same four cells)",
+            "{:.0%}",
+        ),
+        (
+            "cos_within",
+            "Mean cosine similarity between the features a head's points read at the level (1: the same feature)",
+            "{:.2f}",
+        ),
+        (
+            "cos_shift1",
+            "Cosine similarity between a point's feature and the map one cell to its right (the map's own smoothness)",
+            "{:.2f}",
+        ),
+        ("cos_shift2", "The same, two cells to the right", "{:.2f}"),
     ):
         lines.append(f"### {title}\n")
         lines.append("| size | n | layer | " + " | ".join(f"stride {s}" for s in strides) + " |")
@@ -446,6 +653,7 @@ def records_of(sample, iou_threshold, strides):
     for g, q, _ in sample.match(iou_threshold):
         stats = [object_stats(sample, layer, q, g) for layer in range(num_layers)]
         cells = [cell_stats(sample, layer, q, strides) for layer in range(num_layers)]
+        reads = [read_stats(sample, layer, q) for layer in range(num_layers)]
         null = [float(n[0, q].mean()) if n is not None else float("nan") for n in sample.null_weights]
         records.append(
             {
@@ -455,6 +663,10 @@ def records_of(sample, iou_threshold, strides):
                 "spread": [c["spread"] for c in cells],
                 "collapsed": [c["collapsed"] for c in cells],
                 "effective": [c["effective"] for c in cells],
+                "cos_within": [r["cos_within"] for r in reads],
+                "same_footprint": [r["same_footprint"] for r in reads],
+                "cos_shift1": [r["cos_shift1"] for r in reads],
+                "cos_shift2": [r["cos_shift2"] for r in reads],
                 "inside": [s["inside"] for s in stats],
                 "within_1": [s["within_1"] for s in stats],
                 "reach_units": [s["reach_units"] for s in stats],
@@ -528,6 +740,7 @@ def main():
     for k, i in enumerate(picks):
         g, q, iou = matched[i]
         object_figure(sample, g, q, strides, os.path.join(out_dir, f"object_{k}.png"), names)
+        cells_figure(sample, g, q, strides, os.path.join(out_dir, f"cells_{k}.png"), names)
         print(
             f"  object_{k}.png: gt {g} ({names.get(int(sample.gt_labels[g]), '?')}, {sample.gt_size(g):.0f}px), query {q}, final IoU {iou:.2f}"
         )
