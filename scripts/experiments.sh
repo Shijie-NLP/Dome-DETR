@@ -39,14 +39,14 @@ declare -A CONFIGS=(
     [ours_m_aitod]=configs/dome/DFine-M-AITOD-Ours.yml
     [ours_l_aitod]=configs/dome/DFine-L-AITOD-Ours.yml
     # the AI-TOD ablation, one switch per row on the S baseline; rows 1 and 6 are dfine_s_aitod and ours_s_aitod
-    [abl_aitod_2_budget]=configs/dome/ablation/DFine-S-AITOD-2-budget.yml
-    [abl_aitod_3_fine]=configs/dome/ablation/DFine-S-AITOD-3-fine.yml
-    [abl_aitod_4_min_cells]=configs/dome/ablation/DFine-S-AITOD-4-min-cells.yml
-    [abl_aitod_5_enc_quality]=configs/dome/ablation/DFine-S-AITOD-5-enc-quality.yml
+    [abl_aitod_2_fine]=configs/dome/ablation/DFine-S-AITOD-2-fine.yml
+    [abl_aitod_3_min_cells]=configs/dome/ablation/DFine-S-AITOD-3-min-cells.yml
+    [abl_aitod_4_enc_quality]=configs/dome/ablation/DFine-S-AITOD-4-enc-quality.yml
+    [abl_aitod_5_null_point]=configs/dome/ablation/DFine-S-AITOD-5-null-point.yml
 )
 BASELINES=(dfine_s_visdrone dfine_m_visdrone dfine_l_visdrone dfine_s_aitod dfine_m_aitod dfine_l_aitod)
 OURS=(ours_s_visdrone ours_m_visdrone ours_l_visdrone ours_s_aitod ours_m_aitod ours_l_aitod)
-ABLATION_AITOD=(abl_aitod_2_budget abl_aitod_3_fine abl_aitod_4_min_cells abl_aitod_5_enc_quality)
+ABLATION_AITOD=(abl_aitod_2_fine abl_aitod_3_min_cells abl_aitod_4_enc_quality abl_aitod_5_null_point)
 
 GPUS=${GPUS:-1}
 SEED=${SEED:-0}

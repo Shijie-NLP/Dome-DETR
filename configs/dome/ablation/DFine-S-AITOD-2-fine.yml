@@ -1,0 +1,24 @@
+# AI-TOD ablation, row 2 of 6: the D-FINE-S baseline plus the stride-2 fine level (switch 1 of
+# include/ours.yml). Rows 3 to 5 add the other switches one at a time on top of this file, all
+# at the baseline's fixed 300 queries; row 6, DFine-S-AITOD-Ours.yml, adds the per-image query
+# budget last, so the last step is the budget's own value and rows 2 to 5 train without the
+# dense tiles' 1500-query batches. The cell anchors of ours.yml come in here as well: on the
+# square tiles they equal the baseline's at test time and differ by the multi-scale draw alone
+# in training.
+
+__include__: ['../DFine-S-AITOD.yml']
+
+output_dir: ./outputs/ablation/aitod_s_2_fine
+
+HGNetv2:
+  return_stem: True
+
+HybridEncoder:
+  fine_in_channels: 32
+  fine_dim: 64
+  fine_blocks: 2
+
+DFINETransformer:
+  anchor_cells: 10
+  fine_channels: 64
+  num_points: [6, 6, 4, 4, 4]
