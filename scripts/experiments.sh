@@ -14,6 +14,8 @@
 #   SEED=0      the seed of every run
 #   EXTRA=...   more train.py arguments for every run, e.g. EXTRA="-u train_dataloader.num_workers=4"
 #   REPORT=1    after each run, write its RESULTS.md and curves.png with tools/analysis/run_report.py
+#   NOTIFY_URL=https://ntfy.sh/<topic>   POST a line there when a run finishes or fails and when the
+#               queue ends (ntfy: subscribe to the topic in the phone app; any URL taking a POST body works)
 #
 # Each run writes into its config's output_dir/<date>_<time> (train.py does that) and its console
 # into logs/<name>-<date>_<time>.log. A failing run stops the sequence.
@@ -50,6 +52,7 @@ GPUS=${GPUS:-1}
 SEED=${SEED:-0}
 EXTRA=${EXTRA:-}
 REPORT=${REPORT:-0}
+NOTIFY_URL=${NOTIFY_URL:-}
 DRY_RUN=0
 
 # ------------------------------------------------------------------ functions
@@ -93,6 +96,31 @@ train() {
     "${cmd[@]}" 2>&1 | tee "logs/${name}-${stamp}.log"
 }
 
+# one line to NOTIFY_URL, when set; a failure to deliver never stops the queue
+notify() {
+    [ -n "$NOTIFY_URL" ] || return 0
+    curl -fsS -m 20 -H "Title: $(hostname) gpu${CUDA_VISIBLE_DEVICES:-?}" -d "$1" "$NOTIFY_URL" >/dev/null 2>&1 || true
+}
+
+# the best AP of a config's newest run, from its RESULTS.md when there is one, else its log.txt
+best_ap_of() {
+    local run
+    run=$(latest_run_of "$1")
+    [ -n "$run" ] || return 0
+    if [ -f "$run/RESULTS.md" ]; then
+        grep -m1 '^| best AP' "$run/RESULTS.md" | sed 's/[|*]//g; s/  */ /g; s/^ //'
+    elif [ -f "$run/log.txt" ]; then
+        python - "$run/log.txt" <<'PY'
+import json, sys
+rows = [json.loads(l) for l in open(sys.argv[1]) if l.strip()]
+rows = [r for r in rows if "test_coco_eval_bbox" in r]
+if rows:
+    best = max(rows, key=lambda r: r["test_coco_eval_bbox"][0])
+    print(f"best AP {100 * best['test_coco_eval_bbox'][0]:.1f} at epoch {best['epoch']} ({len(rows)} evaluated epochs)")
+PY
+    fi
+}
+
 # summarize the newest run of a config into RESULTS.md and curves.png
 report() {
     local run
@@ -111,8 +139,14 @@ run_experiment() {
         list_experiments >&2
         exit 2
     fi
-    train "$name" "$config"
-    if [ "$REPORT" = 1 ] && [ "$DRY_RUN" = 0 ]; then report "$config"; fi
+    if ! train "$name" "$config"; then
+        notify "FAILED $name; the queue stops (${names[*]})"
+        exit 1
+    fi
+    if [ "$DRY_RUN" = 0 ]; then
+        if [ "$REPORT" = 1 ]; then report "$config"; fi
+        notify "finished $name: $(best_ap_of "$config")"
+    fi
 }
 
 # a name, or a group of names, to the names it stands for
@@ -157,3 +191,4 @@ fi
 echo "runs, in order: ${names[*]}  (gpus $GPUS, seed $SEED${EXTRA:+, extra: $EXTRA})"
 for name in "${names[@]}"; do run_experiment "$name"; done
 echo "done: ${names[*]}"
+if [ "$DRY_RUN" = 0 ]; then notify "queue done: ${names[*]}"; fi
