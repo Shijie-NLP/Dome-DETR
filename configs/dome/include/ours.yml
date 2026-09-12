@@ -35,7 +35,7 @@ HGNetv2:
   return_stem: True
 
 HybridEncoder:
-  fine_in_channels: 32   # the stem's width: 32 for B0 and B2, 48 for B4
+  fine_in_channels: 32   # the stem map's width, twice the stem's mid channels: 32 for B0, 48 for B2, 64 for B4
   fine_dim: 64
   fine_blocks: 2
 

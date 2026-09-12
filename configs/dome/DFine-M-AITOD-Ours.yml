@@ -1,0 +1,23 @@
+# D-FINE-M on AI-TOD-v2 with our method switched on: DFine-S-AITOD-Ours at the M scale, i.e.
+# DFine-M-AITOD plus include/ours.yml and the per-image query budget (the buckets, budgets and
+# grouped batches are explained in DFine-S-AITOD-Ours.yml). The B2 stem map is 48 channels wide.
+
+__include__: [
+  './DFine-M-AITOD.yml',
+  './include/ours.yml',
+]
+
+output_dir: ./outputs/dfine_m_aitod_ours
+
+HybridEncoder:
+  fine_in_channels: 48
+
+DFINETransformer:
+  query_budget: bucket
+  count_edges: [100, 200, 300, 600]
+  count_budgets: [300, 400, 500, 800, 1500]
+  count_quantile: 0.9
+  count_train_budget: gt
+
+train_dataloader:
+  group_by_count: {edges: [100, 200, 300, 600]}

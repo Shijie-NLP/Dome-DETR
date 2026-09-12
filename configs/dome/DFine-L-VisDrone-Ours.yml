@@ -1,0 +1,13 @@
+# D-FINE-L on VisDrone2019-DET with our method switched on: DFine-L-VisDrone as it is, plus the
+# switches of include/ours.yml (the fine level, the sampling floor, the outcome-scored encoder,
+# cell anchors, the null entry). The B4 stem map is 64 channels wide.
+
+__include__: [
+  './DFine-L-VisDrone.yml',
+  './include/ours.yml',
+]
+
+output_dir: ./outputs/dfine_l_visdrone_ours
+
+HybridEncoder:
+  fine_in_channels: 64
